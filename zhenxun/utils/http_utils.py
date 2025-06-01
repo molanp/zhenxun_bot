@@ -23,6 +23,22 @@ from zhenxun.utils.user_agent import get_user_agent
 
 # from .browser import get_browser
 
+def get_async_client(proxies=None, **kwargs):
+    from httpx._config import create_ssl_context
+    context = create_ssl_context(
+        verify=kwargs.get("verify", True),
+        cert=kwargs.get("cert"),
+        trust_env=kwargs.get("trust_env", True),
+    )
+    context.set_ciphers("DEFAULT")
+    kwargs["verify"] = context
+    try:
+        return httpx.AsyncClient(proxies=proxies, **kwargs)
+    except TypeError:
+        return httpx.AsyncClient(mounts={
+            "http://": httpx.AsyncHTTPTransport(proxy=proxies.get("http")) if proxies else None,
+            "https://": httpx.AsyncHTTPTransport(proxy=proxies.get("https")) if proxies else None
+        }, **kwargs)
 
 class AsyncHttpx:
     proxy: ClassVar[dict[str, str | None]] = {
@@ -103,7 +119,7 @@ class AsyncHttpx:
         if not headers:
             headers = get_user_agent()
         _proxy = proxy or (cls.proxy if use_proxy else None)
-        async with httpx.AsyncClient(proxies=_proxy, verify=verify) as client:  # type: ignore
+        async with get_async_client(proxies=_proxy, verify=verify) as client:  # type: ignore
             return await client.get(
                 url,
                 params=params,
@@ -142,7 +158,7 @@ class AsyncHttpx:
         if not headers:
             headers = get_user_agent()
         _proxy = proxy or (cls.proxy if use_proxy else None)
-        async with httpx.AsyncClient(proxies=_proxy, verify=verify) as client:  # type: ignore
+        async with get_async_client(proxies=_proxy, verify=verify) as client:  # type: ignore
             return await client.head(
                 url,
                 params=params,
@@ -189,7 +205,7 @@ class AsyncHttpx:
         if not headers:
             headers = get_user_agent()
         _proxy = proxy or (cls.proxy if use_proxy else None)
-        async with httpx.AsyncClient(proxies=_proxy, verify=verify) as client:  # type: ignore
+        async with get_async_client(proxies=_proxy, verify=verify) as client:  # type: ignore
             return await client.post(
                 url,
                 content=content,
@@ -269,7 +285,7 @@ class AsyncHttpx:
                             if not headers:
                                 headers = get_user_agent()
                             _proxy = proxy or (cls.proxy if use_proxy else None)
-                            async with httpx.AsyncClient(
+                            async with get_async_client(
                                 proxies=_proxy,  # type: ignore
                                 verify=verify,
                             ) as client:
