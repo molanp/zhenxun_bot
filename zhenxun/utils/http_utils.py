@@ -25,33 +25,16 @@ from zhenxun.utils.user_agent import get_user_agent
 
 
 def get_async_client(proxies=None, **kwargs):
-    from httpx._config import create_ssl_context
-
-    context = create_ssl_context(
-        verify=kwargs.get("verify", True),
-        cert=kwargs.get("cert"),
-        trust_env=kwargs.get("trust_env", True),
-    )
-    context.set_ciphers("DEFAULT")
-    kwargs["verify"] = context
+    transport = httpx.AsyncHTTPTransport(verify=False)
     try:
-        return httpx.AsyncClient(proxies=proxies, **kwargs)
+        return httpx.AsyncClient(proxies=proxies, transport=transport, **kwargs)
     except TypeError:
-        return httpx.AsyncClient(
-            mounts={
-                k: v
-                for k, v in {
-                    "http://": httpx.AsyncHTTPTransport(proxy=proxies.get("http"))
-                    if proxies
-                    else None,
-                    "https://": httpx.AsyncHTTPTransport(proxy=proxies.get("https"))
-                    if proxies
-                    else None,
-                }.items()
-                if v is not None
-            },
-            **kwargs,
-        )
+        return httpx.AsyncClient(mounts={
+            k: v for k, v in {
+                "http://": httpx.AsyncHTTPTransport(proxy=proxies.get("http")) if proxies else None,
+                "https://": httpx.AsyncHTTPTransport(proxy=proxies.get("https")) if proxies else None
+            }.items() if v is not None
+        }, transport=transport, **kwargs)
 
 
 class AsyncHttpx:
