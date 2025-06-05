@@ -29,12 +29,22 @@ def get_async_client(proxies=None, **kwargs):
     try:
         return httpx.AsyncClient(proxies=proxies, transport=transport, **kwargs)
     except TypeError:
-        return httpx.AsyncClient(mounts={
-            k: v for k, v in {
-                "http://": httpx.AsyncHTTPTransport(proxy=proxies.get("http")) if proxies else None,
-                "https://": httpx.AsyncHTTPTransport(proxy=proxies.get("https")) if proxies else None
-            }.items() if v is not None
-        }, transport=transport, **kwargs)
+        return httpx.AsyncClient(
+            mounts={
+                k: v
+                for k, v in {
+                    "http://": httpx.AsyncHTTPTransport(proxy=proxies.get("http"))
+                    if proxies
+                    else None,
+                    "https://": httpx.AsyncHTTPTransport(proxy=proxies.get("https"))
+                    if proxies
+                    else None,
+                }.items()
+                if v is not None
+            },
+            transport=transport,
+            **kwargs,
+        )
 
 
 class AsyncHttpx:
