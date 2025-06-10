@@ -150,7 +150,7 @@ poetry run python bot.py
 
 1.在 .env.dev 文件中填写你的机器人配置项
 
-2.在 configs/config.yaml 文件中修改你需要修改的插件配置项
+2.在 data/config.yaml 文件中修改你需要修改的插件配置项
 
 <details>
 <summary>数据库地址（DB_URL）配置说明</summary>
