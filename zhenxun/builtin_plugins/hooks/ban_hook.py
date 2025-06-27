@@ -74,11 +74,12 @@ async def _(
                 and _flmt.check(user_id)
             ):
                 _flmt.start_cd(user_id)
-                await MessageUtils.build_message(
-                    [
-                        At(flag="user", target=user_id),
-                        f"{ban_result}\n在..在 {time_str} 后才会理你喔",
-                    ]
-                ).send()
+                if Config.get_config("hook", "IS_SEND_TIP_MESSAGE"):
+                    await MessageUtils.build_message(
+                        [
+                            At(flag="user", target=user_id),
+                            f"{ban_result}\n在..在 {time_str} 后才会理你喔",
+                        ]
+                    ).send()
             logger.debug("用户处于黑名单中...", "ban_hook")
             raise IgnoredException("用户处于黑名单中...")
