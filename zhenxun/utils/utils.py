@@ -1,4 +1,5 @@
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 import os
 from pathlib import Path
@@ -6,11 +7,22 @@ import time
 from typing import Any
 
 import httpx
+from nonebot_plugin_uninfo import Uninfo
 import pypinyin
 import pytz
 
 from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
+
+
+@dataclass
+class EntityIDs:
+    user_id: str
+    """用户id"""
+    group_id: str | None
+    """群组id"""
+    channel_id: str | None
+    """频道id"""
 
 
 class ResourceDirManager:
@@ -228,6 +240,27 @@ def is_valid_date(date_text: str, separator: str = "-") -> bool:
         return True
     except ValueError:
         return False
+
+
+def get_entity_ids(session: Uninfo) -> EntityIDs:
+    """获取用户id，群组id，频道id
+
+    参数:
+        session: Uninfo
+
+    返回:
+        EntityIDs: 用户id，群组id，频道id
+    """
+    user_id = session.user.id
+    group_id = None
+    channel_id = None
+    if session.group:
+        if session.group.parent:
+            group_id = session.group.parent.id
+            channel_id = session.group.id
+        else:
+            group_id = session.group.id
+    return EntityIDs(user_id=user_id, group_id=group_id, channel_id=channel_id)
 
 
 def is_number(text: str) -> bool:

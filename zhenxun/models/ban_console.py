@@ -1,10 +1,12 @@
 import time
+from typing import ClassVar
 from typing_extensions import Self
 
 from tortoise import fields
 
 from zhenxun.services.db_context import Model
 from zhenxun.services.log import logger
+from zhenxun.utils.enum import CacheType, DbLockType
 from zhenxun.utils.exception import UserAndGroupIsNone
 
 
@@ -27,6 +29,12 @@ class BanConsole(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "ban_console"
         table_description = "封禁人员/群组数据表"
+        unique_together = ("user_id", "group_id")
+
+    cache_type = CacheType.BAN
+    """缓存类型"""
+    enable_lock: ClassVar[list[DbLockType]] = [DbLockType.CREATE]
+    """开启锁"""
 
     @classmethod
     async def _get_data(cls, user_id: str | None, group_id: str | None) -> Self | None:

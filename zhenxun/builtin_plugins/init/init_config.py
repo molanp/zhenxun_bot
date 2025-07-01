@@ -11,6 +11,7 @@ from zhenxun.configs.config import Config
 from zhenxun.configs.path_config import DATA_PATH
 from zhenxun.configs.utils import RegisterConfig
 from zhenxun.services.log import logger
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 
 _yaml = YAML(pure=True)
 _yaml.allow_unicode = True
@@ -57,7 +58,7 @@ def _generate_simple_config(exists_module: list[str]):
     生成简易配置
 
     异常:
-        AttributeError: _description_
+        AttributeError: AttributeError
     """
     # 读取用户配置
     _data = {}
@@ -73,7 +74,9 @@ def _generate_simple_config(exists_module: list[str]):
                 if _data.get(module) and k in _data[module].keys():
                     Config.set_config(module, k, _data[module][k])
                 if f"{module}:{k}".lower() in exists_module:
-                    _tmp_data[module][k] = Config.get_config(module, k)
+                    _tmp_data[module][k] = Config.get_config(
+                        module, k, build_model=False
+                    )
             except AttributeError as e:
                 raise AttributeError(f"{e}\n可能为config.yaml配置文件填写不规范") from e
         if not _tmp_data[module]:
@@ -102,7 +105,7 @@ def _generate_simple_config(exists_module: list[str]):
         temp_file.unlink()
 
 
-@driver.on_startup
+@PriorityLifecycle.on_startup(priority=0)
 def _():
     """
     初始化插件数据配置
@@ -125,3 +128,4 @@ def _():
         with plugins2config_file.open("w", encoding="utf8") as wf:
             _yaml.dump(_data, wf)
     _generate_simple_config(exists_module)
+    Config.reload()

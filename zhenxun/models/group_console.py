@@ -1,4 +1,4 @@
-from typing import Any, cast, overload
+from typing import Any, ClassVar, cast, overload
 from typing_extensions import Self
 
 from tortoise import fields
@@ -6,8 +6,9 @@ from tortoise.backends.base.client import BaseDBAsyncClient
 
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.task_info import TaskInfo
+from zhenxun.services.cache import CacheRoot
 from zhenxun.services.db_context import Model
-from zhenxun.utils.enum import PluginType
+from zhenxun.utils.enum import CacheType, DbLockType, PluginType
 
 
 def add_disable_marker(name: str) -> str:
@@ -41,7 +42,7 @@ def convert_module_format(data: str | list[str]) -> str | list[str]:
         str | list[str]: 根据输入类型返回转换后的数据。
     """
     if isinstance(data, str):
-        return [item.strip(",") for item in data.split("<") if item.strip()]
+        return [item.strip(",") for item in data.split("<") if item]
     else:
         return "".join(add_disable_marker(item) for item in data)
 
@@ -87,6 +88,11 @@ class GroupConsole(Model):
         table_description = "群组信息表"
         unique_together = ("group_id", "channel_id")
 
+    cache_type = CacheType.GROUPS
+    """缓存类型"""
+    enable_lock: ClassVar[list[DbLockType]] = [DbLockType.CREATE]
+    """开启锁"""
+
     @classmethod
     async def _get_task_modules(cls, *, default_status: bool) -> list[str]:
         """获取默认禁用的任务模块
@@ -117,6 +123,7 @@ class GroupConsole(Model):
         )
 
     @classmethod
+    @CacheRoot.listener(CacheType.GROUPS)
     async def create(
         cls, using_db: BaseDBAsyncClient | None = None, **kwargs: Any
     ) -> Self:
@@ -180,9 +187,14 @@ class GroupConsole(Model):
         if task_modules or plugin_modules:
             await cls._update_modules(group, task_modules, plugin_modules, using_db)
 
+        if is_create:
+            if cache := await CacheRoot.get_cache(CacheType.GROUPS):
+                await cache.update(group.group_id, group)
+
         return group, is_create
 
     @classmethod
+    @CacheRoot.listener(CacheType.GROUPS)
     async def update_or_create(
         cls,
         defaults: dict | None = None,

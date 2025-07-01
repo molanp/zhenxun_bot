@@ -26,6 +26,10 @@ async def get_fastest_raw_formats() -> list[str]:
         "https://mirror.ghproxy.com/": f"https://mirror.ghproxy.com/{RAW_CONTENT_FORMAT}",
         "https://gh-proxy.com/": f"https://gh-proxy.com/{RAW_CONTENT_FORMAT}",
         "https://cdn.jsdelivr.net/": "https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}",
+        #"https://raw.gitcode.com/": "https://raw.gitcode.com/qq_41605780/{repo}/raw/{branch}/{path}",  # ✅ 新增 GitCode raw 格式
+        #"https://raw.gitcode.com/": "https://raw.gitcode.com/ATTomato/{repo}/raw/{branch}/{path}"
+        #"https://raw.gitcode.com/": "https://raw.gitcode.com/{owner}/{repo}/raw/{branch}/{path}"
+
     }
     return await __get_fastest_formats(formats)
 
