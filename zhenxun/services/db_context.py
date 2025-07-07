@@ -1,8 +1,10 @@
+import asyncio
+
 import nonebot
 from nonebot.utils import is_coroutine_callable
 from tortoise import Tortoise
 from tortoise.connection import connections
-from tortoise.models import Model as Model_
+from tortoise.models import Model as TortoiseModel
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.utils.exception import HookPriorityException
@@ -17,13 +19,15 @@ MODELS: list[str] = []
 driver = nonebot.get_driver()
 
 
-class Model(Model_):
-    """
-    自动添加模块
+DEFAULT_DB_TIMEOUT = 10  # 默认超时时间（秒）
 
-    Args:
-        Model_: Model
+
+class Model(TortoiseModel):
     """
+    自动添加模块 + 数据库操作超时
+    """
+
+    db_timeout: int = DEFAULT_DB_TIMEOUT
 
     def __init_subclass__(cls, **kwargs):
         if cls.__module__ not in MODELS:
@@ -31,6 +35,35 @@ class Model(Model_):
 
         if func := getattr(cls, "_run_script", None):
             SCRIPT_METHOD.append((cls.__module__, func))
+        super().__init_subclass__(**kwargs)
+
+    async def save(self, *args, **kwargs):
+        return await asyncio.wait_for(
+            super().save(*args, **kwargs), timeout=self.db_timeout
+        )
+
+    async def delete(self, *args, **kwargs):
+        return await asyncio.wait_for(
+            super().delete(*args, **kwargs), timeout=self.db_timeout
+        )
+
+    @classmethod
+    async def create(cls, *args, **kwargs):
+        return await asyncio.wait_for(
+            super().create(*args, **kwargs), timeout=cls.db_timeout
+        )
+
+    @classmethod
+    async def get_or_create(cls, *args, **kwargs):
+        return await asyncio.wait_for(
+            super().get_or_create(*args, **kwargs), timeout=cls.db_timeout
+        )
+
+    @classmethod
+    async def update_or_create(cls, *args, **kwargs):
+        return await asyncio.wait_for(
+            super().update_or_create(*args, **kwargs), timeout=cls.db_timeout
+        )
 
 
 class DbUrlIsNode(HookPriorityException):

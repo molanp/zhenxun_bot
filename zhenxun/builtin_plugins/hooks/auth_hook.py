@@ -25,9 +25,6 @@ async def _(
 @run_postprocessor
 async def _(
     matcher: Matcher,
-    exception: Exception | None,
-    bot: Bot,
-    event: Event,
     session: EventSession,
 ):
     user_id = session.id1
