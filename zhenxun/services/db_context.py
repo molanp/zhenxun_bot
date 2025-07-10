@@ -60,6 +60,12 @@ class Model(TortoiseModel):
         )
 
     @classmethod
+    async def get_or_none(cls, *args, **kwargs):
+        return await asyncio.wait_for(
+            super().get_or_none(*args, **kwargs), timeout=cls.db_timeout
+        )
+
+    @classmethod
     async def update_or_create(cls, *args, **kwargs):
         return await asyncio.wait_for(
             super().update_or_create(*args, **kwargs), timeout=cls.db_timeout
