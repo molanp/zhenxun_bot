@@ -52,11 +52,11 @@ async def _(bot: Bot):
 SIGN_SQL = """
 SELECT user_id, checkin_count, add_probability, specify_probability, impression
 FROM (
-    SELECT 
-        t1.user_id, 
-        t1.checkin_count, 
-        t1.add_probability, 
-        t1.specify_probability, 
+    SELECT
+        t1.user_id,
+        t1.checkin_count,
+        t1.add_probability,
+        t1.specify_probability,
         t1.impression,
         ROW_NUMBER() OVER(PARTITION BY t1.user_id ORDER BY t1.impression DESC) AS rn
     FROM sign_group_users t1
