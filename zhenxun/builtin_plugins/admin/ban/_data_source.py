@@ -9,7 +9,7 @@ from zhenxun.services.log import logger
 from zhenxun.utils.image_utils import BuildImage, ImageTemplate
 
 
-async def call_ban(user_id: str, reason: str| None = None, duration: int = 1):
+async def call_ban(user_id: str, reason: str | None = None, duration: int = 1):
     """调用ban
 
     参数:
