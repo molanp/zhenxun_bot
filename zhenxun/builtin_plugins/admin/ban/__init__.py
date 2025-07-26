@@ -119,7 +119,7 @@ _ban_matcher = on_alconna(
     Alconna(
         "ban",
         Args["user?", [str, At]],
-        Option("-r|--reason", Args["reason?", str]),
+        Option("-r|--reason", Args["reason", str]),
         Option("-g|--group", Args["group_id", str]),
         Option("-t|--time", Args["duration", int]),
     ),
