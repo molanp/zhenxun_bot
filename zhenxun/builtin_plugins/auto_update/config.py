@@ -2,6 +2,8 @@ from pathlib import Path
 
 from zhenxun.configs.path_config import TEMP_PATH
 
+GIT_GITHUB_URL = "https://github.com/zhenxun-org/zhenxun_bot.git"
+
 DEFAULT_GITHUB_URL = "https://github.com/HibiKier/zhenxun_bot/tree/main"
 RELEASE_URL = "https://api.github.com/repos/HibiKier/zhenxun_bot/releases/latest"
 

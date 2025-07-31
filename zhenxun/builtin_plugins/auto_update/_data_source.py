@@ -1,6 +1,5 @@
 import os
 import shutil
-import subprocess
 import tarfile
 import zipfile
 
@@ -12,7 +11,9 @@ from zhenxun.services.log import logger
 from zhenxun.utils.github_utils import GithubUtils
 from zhenxun.utils.github_utils.models import RepoInfo
 from zhenxun.utils.http_utils import AsyncHttpx
+from zhenxun.utils.manager.virtual_env_package_manager import VirtualEnvPackageManager
 from zhenxun.utils.platform import PlatformUtils
+from zhenxun.utils.repo_utils import AliyunRepoManager, GithubRepoManager
 
 from .config import (
     BACKUP_PATH,
@@ -22,6 +23,7 @@ from .config import (
     DEFAULT_GITHUB_URL,
     DOWNLOAD_GZ_FILE,
     DOWNLOAD_ZIP_FILE,
+    GIT_GITHUB_URL,
     PYPROJECT_FILE,
     PYPROJECT_FILE_STRING,
     PYPROJECT_LOCK_FILE,
@@ -33,26 +35,6 @@ from .config import (
     TMP_PATH,
     VERSION_FILE,
 )
-
-
-def install_requirement():
-    requirement_path = (REQ_TXT_FILE).absolute()
-
-    if not requirement_path.exists():
-        logger.debug(
-            f"没有找到zhenxun的requirement.txt,目标路径为{requirement_path}", COMMAND
-        )
-        return
-    try:
-        result = subprocess.run(
-            ["pip", "install", "-r", str(requirement_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        logger.debug(f"成功安装真寻依赖，日志:\n{result.stdout}", COMMAND)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"安装真寻依赖失败，错误:\n{e.stderr}", COMMAND, e=e)
 
 
 @run_sync
@@ -133,7 +115,6 @@ def _file_handle(latest_version: str | None):
     if latest_version:
         with open(VERSION_FILE, "w", encoding="utf8") as f:
             f.write(f"__version__: {latest_version}")
-    install_requirement()
 
 
 class UpdateManager:
@@ -185,17 +166,7 @@ class UpdateManager:
         )
 
     @classmethod
-    async def update(cls, bot: Bot, user_id: str, version_type: str) -> str:
-        """更新操作
-
-        参数:
-            bot: Bot
-            user_id: 用户id
-            version_type: 更新版本类型
-
-        返回:
-            str | None: 返回消息
-        """
+    async def __zip_update(cls, version_type: str):
         logger.info("开始下载真寻最新版文件....", COMMAND)
         cur_version = cls.__get_version()
         url = None
@@ -222,11 +193,6 @@ class UpdateManager:
             f"开始更新版本：{cur_version} -> {new_version} | 下载链接：{url}",
             COMMAND,
         )
-        await PlatformUtils.send_superuser(
-            bot,
-            f"检测真寻已更新，版本更新：{cur_version} -> {new_version}\n开始更新...",
-            user_id,
-        )
         download_file = (
             DOWNLOAD_GZ_FILE if version_type == "release" else DOWNLOAD_ZIP_FILE
         )
@@ -242,6 +208,65 @@ class UpdateManager:
         else:
             logger.debug("下载真寻最新版文件失败...", COMMAND)
         return ""
+
+    @classmethod
+    async def update(
+        cls,
+        bot: Bot,
+        user_id: str,
+        version_type: str,
+        force: bool,
+        source: str,
+        zip: bool,
+        update_type: str,
+    ) -> str:
+        """更新操作
+
+        参数:
+            bot: Bot
+            user_id: 用户id
+            version_type: 更新版本类型
+            force: 是否强制更新
+            source: 更新源
+            zip: 是否下载zip文件
+            update_type: 更新方式
+
+        返回:
+            str | None: 返回消息
+        """
+        cur_version = cls.__get_version()
+        await PlatformUtils.send_superuser(
+            bot,
+            f"检测真寻已更新，当前版本：{cur_version}\n开始更新...",
+            user_id,
+        )
+        if zip:
+            return await cls.__zip_update(version_type)
+        elif source == "git":
+            result = await GithubRepoManager.update(
+                GIT_GITHUB_URL,
+                BASE_PATH,
+                use_git=update_type == "git",
+                force=force,
+            )
+        else:
+            result = await AliyunRepoManager.update(
+                GIT_GITHUB_URL,
+                BASE_PATH,
+                force=force,
+            )
+        if not result.success:
+            return f"版本更新失败...错误: {result.error_message}"
+        await PlatformUtils.send_superuser(
+            bot, "真寻更新完成，开始安装依赖...", user_id
+        )
+        await VirtualEnvPackageManager.install_requirement(REQ_TXT_FILE)
+        return (
+            f"版本更新完成！\n"
+            f"版本: {cur_version} -> {result.new_version}\n"
+            f"变更文件个数: {len(result.changed_files)}\n"
+            "请重新启动真寻以完成更新!"
+        )
 
     @classmethod
     def __get_version(cls) -> str:

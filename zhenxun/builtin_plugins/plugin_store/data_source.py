@@ -40,14 +40,14 @@ def row_style(column: str, text: str) -> RowStyle:
     return style
 
 
-def install_requirement(plugin_path: Path):
+async def install_requirement(plugin_path: Path):
     requirement_files = ["requirement.txt", "requirements.txt"]
     requirement_paths = [plugin_path / file for file in requirement_files]
 
     if existing_requirements := next(
         (path for path in requirement_paths if path.exists()), None
     ):
-        VirtualEnvPackageManager.install_requirement(existing_requirements)
+        await VirtualEnvPackageManager.install_requirement(existing_requirements)
 
 
 class StoreManager:
@@ -288,7 +288,7 @@ class StoreManager:
                         if not success:
                             raise Exception("插件依赖文件下载失败")
                     logger.debug(f"插件依赖文件列表: {req_paths}", LOG_COMMAND)
-                    install_requirement(plugin_path)
+                    await install_requirement(plugin_path)
             except ValueError as e:
                 logger.warning("未获取到依赖文件路径...", e=e)
             return True

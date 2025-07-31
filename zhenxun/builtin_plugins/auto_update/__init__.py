@@ -32,15 +32,23 @@ __plugin_meta__ = PluginMetadata(
         检查更新真寻最新版本，包括了自动更新
         资源文件大小一般在130mb左右，除非必须更新一般仅更新代码文件
         指令：
-            检查更新 [main|release|resource|webui] ?[-r]
+            检查更新 [main|release|resource|webui] ?[-r] ?[-f] ?[-z] ?[-t]
                 main: main分支
                 release: 最新release
                 resource: 资源文件
                 webui: webui文件
                 -r: 下载资源文件，一般在更新main或release时使用
+                -f: 强制更新，一般用于更新main时使用（仅git更新时有效）
+                -s: 更新源，为 git 或 ali（默认使用ali）
+                -z: 下载zip文件进行更新（仅git有效）
+                -t: 更新方式，git或download（默认使用git）
+                        git: 使用git pull（推荐）
+                        download: 通过commit hash比较文件后下载更新（仅git有效）
+
             示例:
             检查更新 main
             检查更新 main -r
+            检查更新 main -f
             检查更新 release -r
             检查更新 resource
             检查更新 webui
@@ -57,6 +65,10 @@ _matcher = on_alconna(
         "检查更新",
         Args["ver_type?", ["main", "release", "resource", "webui"]],
         Option("-r|--resource", action=store_true, help_text="下载资源文件"),
+        Option("-f|--force", action=store_true, help_text="强制更新"),
+        Option("-s", Args["source?", ["git", "ali"]], help_text="更新源"),
+        Option("-z|--zip", action=store_true, help_text="下载zip文件"),
+        Option("-t", Args["update_type?", ["git", "download"]], help_text="更新方式"),
     ),
     priority=1,
     block=True,
@@ -71,6 +83,10 @@ async def _(
     session: Uninfo,
     ver_type: Match[str],
     resource: Query[bool] = Query("resource", False),
+    force: Query[bool] = Query("force", False),
+    source: Query[str] = Query("source", "ali"),
+    zip: Query[bool] = Query("zip", False),
+    update_type: Query[str] = Query("update_type", "git"),
 ):
     result = ""
     await MessageUtils.build_message("正在进行检查更新...").send(reply_to=True)
@@ -80,7 +96,15 @@ async def _(
             logger.info("查看当前版本...", "检查更新", session=session)
             await MessageUtils.build_message(result).finish()
         try:
-            result = await UpdateManager.update(bot, session.user.id, ver_type.result)
+            result = await UpdateManager.update(
+                bot,
+                session.user.id,
+                ver_type.result,
+                force.result,
+                source.result,
+                zip.result,
+                update_type.result,
+            )
         except Exception as e:
             logger.error("版本更新失败...", "检查更新", session=session, e=e)
             await MessageUtils.build_message(f"更新版本失败...e: {e}").finish()
