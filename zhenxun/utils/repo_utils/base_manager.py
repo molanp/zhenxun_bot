@@ -9,7 +9,7 @@ import aiofiles
 
 from zhenxun.services.log import logger
 
-from .config import RepoConfig
+from .config import LOG_COMMAND, RepoConfig
 from .models import (
     FileDownloadResult,
     RepoCommitInfo,
@@ -230,11 +230,13 @@ class BaseRepoManager(ABC):
         """
         from .models import RepoType
 
+        repo_name = repo_url.split("/")[-1].replace(".git", "")
+
         try:
             # 创建结果对象
             result = RepoUpdateResult(
                 repo_type=repo_type or RepoType.GITHUB,  # 默认使用GitHub类型
-                repo_name=repo_url.split("/")[-1].replace(".git", ""),
+                repo_name=repo_name,
                 owner=owner or "",
                 old_version="",
                 new_version="",
@@ -244,7 +246,7 @@ class BaseRepoManager(ABC):
             if not await check_git():
                 return RepoUpdateResult(
                     repo_type=repo_type or RepoType.GITHUB,
-                    repo_name=repo_url.split("/")[-1].replace(".git", ""),
+                    repo_name=repo_name,
                     owner=owner or "",
                     old_version="",
                     new_version="",
@@ -258,14 +260,14 @@ class BaseRepoManager(ABC):
             # 检查本地目录是否存在
             if not local_path.exists():
                 # 如果不存在，则克隆仓库
-                logger.info(f"克隆仓库 {repo_url} 到 {local_path}")
+                logger.info(f"克隆仓库 {repo_url} 到 {local_path}", LOG_COMMAND)
                 success, stdout, stderr = await run_git_command(
                     f"clone -b {branch} {repo_url} {local_path}"
                 )
                 if not success:
                     return RepoUpdateResult(
                         repo_type=repo_type or RepoType.GITHUB,
-                        repo_name=repo_url.split("/")[-1].replace(".git", ""),
+                        repo_name=repo_name,
                         owner=owner or "",
                         old_version="",
                         new_version="",
@@ -287,7 +289,7 @@ class BaseRepoManager(ABC):
             if not success:
                 return RepoUpdateResult(
                     repo_type=repo_type or RepoType.GITHUB,
-                    repo_name=repo_url.split("/")[-1].replace(".git", ""),
+                    repo_name=repo_name,
                     owner=owner or "",
                     old_version="",
                     new_version="",
@@ -308,18 +310,18 @@ class BaseRepoManager(ABC):
             # 如果远程URL不匹配，则更新它
             remote_url = remote_url.strip()
             if success and repo_url not in remote_url and remote_url not in repo_url:
-                logger.info(f"更新远程URL: {remote_url} -> {repo_url}")
+                logger.info(f"更新远程URL: {remote_url} -> {repo_url}", LOG_COMMAND)
                 await run_git_command(
                     f"remote set-url origin {repo_url}", cwd=local_path
                 )
 
             # 获取远程更新
-            logger.info("获取远程更新")
+            logger.info("获取远程更新", LOG_COMMAND)
             success, _, stderr = await run_git_command("fetch origin", cwd=local_path)
             if not success:
                 return RepoUpdateResult(
                     repo_type=repo_type or RepoType.GITHUB,
-                    repo_name=repo_url.split("/")[-1].replace(".git", ""),
+                    repo_name=repo_name,
                     owner=owner or "",
                     old_version=old_version.strip(),
                     new_version="",
@@ -334,14 +336,14 @@ class BaseRepoManager(ABC):
 
             # 如果当前分支不是目标分支，则切换分支
             if success and current_branch != branch:
-                logger.info(f"切换分支: {current_branch} -> {branch}")
+                logger.info(f"切换分支: {current_branch} -> {branch}", LOG_COMMAND)
                 success, _, stderr = await run_git_command(
                     f"checkout {branch}", cwd=local_path
                 )
                 if not success:
                     return RepoUpdateResult(
                         repo_type=repo_type or RepoType.GITHUB,
-                        repo_name=repo_url.split("/")[-1].replace(".git", ""),
+                        repo_name=repo_name,
                         owner=owner or "",
                         old_version=old_version.strip(),
                         new_version="",
@@ -349,16 +351,16 @@ class BaseRepoManager(ABC):
                     )
 
             # 拉取最新代码
-            logger.info("拉取最新代码")
+            logger.info("拉取最新代码", LOG_COMMAND)
             pull_cmd = f"pull origin {branch}"
             if force:
                 pull_cmd = f"pull --force origin {branch}"
-                logger.info("使用强制拉取模式")
+                logger.info("使用强制拉取模式", LOG_COMMAND)
             success, _, stderr = await run_git_command(pull_cmd, cwd=local_path)
             if not success:
                 return RepoUpdateResult(
                     repo_type=repo_type or RepoType.GITHUB,
-                    repo_name=repo_url.split("/")[-1].replace(".git", ""),
+                    repo_name=repo_name,
                     owner=owner or "",
                     old_version=old_version.strip(),
                     new_version="",
@@ -373,7 +375,9 @@ class BaseRepoManager(ABC):
 
             # 如果版本相同，则无需更新
             if old_version.strip() == new_version.strip():
-                logger.info(f"仓库 {repo_url} 已是最新版本: {new_version.strip()}")
+                logger.info(
+                    f"仓库 {repo_url} 已是最新版本: {new_version.strip()}", LOG_COMMAND
+                )
                 result.success = True
                 return result
 
@@ -389,16 +393,16 @@ class BaseRepoManager(ABC):
                     if line.strip()
                 ]
                 result.changed_files = changed_files
-                logger.info(f"变更的文件列表: {changed_files}")
+                logger.info(f"变更的文件列表: {changed_files}", LOG_COMMAND)
 
             result.success = True
             return result
 
         except Exception as e:
-            logger.error(f"Git更新失败: {e}")
+            logger.error("Git更新失败", LOG_COMMAND, e=e)
             return RepoUpdateResult(
                 repo_type=repo_type or RepoType.GITHUB,
-                repo_name=repo_url.split("/")[-1].replace(".git", ""),
+                repo_name=repo_name,
                 owner=owner or "",
                 old_version="",
                 new_version="",

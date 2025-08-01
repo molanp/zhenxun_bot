@@ -34,6 +34,8 @@ class AliyunCodeupConfig:
     access_key_secret: str = "NmJ3d2VNRU1MREY0T1RtRnBqMlFqdlBxN3pMUk1j"
     # 组织ID
     organization_id: str = "67a361cf556e6cdab537117a"
+    # 组织名称
+    organization_name: str = "zhenxun-org"
     # RDC Access Token
     rdc_access_token_encrypted: str = (
         "cHQtYXp0allnQWpub0FYZWpqZm1RWGtneHk0XzBlMmYzZTZmLWQwOWItNDE4Mi1iZWUx"
