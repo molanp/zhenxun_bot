@@ -78,7 +78,7 @@ class FileDownloadResult:
     # 仓库名称
     repo_name: str
     # 文件路径
-    file_path: list[tuple[str, Path]]
+    file_path: list[tuple[str, Path]] | str
     # 版本
     version: str
     # 是否成功

@@ -172,6 +172,7 @@ class GithubManager(BaseRepoManager):
         返回:
             FileDownloadResult: 下载结果
         """
+        repo_name = repo_url.split("/")[-1].replace(".git", "").strip()
         try:
             # 解析仓库URL
             repo_info = GithubUtils.parse_github_url(repo_url)
@@ -181,9 +182,7 @@ class GithubManager(BaseRepoManager):
             result = FileDownloadResult(
                 repo_type=RepoType.GITHUB,
                 repo_name=repo_info.repo,
-                owner=repo_info.owner,
                 file_path=file_path,
-                local_path=str(local_path),
                 version=branch,
             )
 
@@ -201,10 +200,8 @@ class GithubManager(BaseRepoManager):
             logger.error("下载文件失败", LOG_COMMAND, e=e)
             return FileDownloadResult(
                 repo_type=RepoType.GITHUB,
-                repo_name=repo_url.split("/")[-1] if "/" in repo_url else repo_url,
-                owner=repo_url.split("/")[-2] if "/" in repo_url else "unknown",
+                repo_name=repo_name,
                 file_path=file_path,
-                local_path=str(local_path),
                 version=branch,
                 error_message=str(e),
             )
@@ -212,10 +209,8 @@ class GithubManager(BaseRepoManager):
             logger.error("下载文件失败", LOG_COMMAND, e=e)
             return FileDownloadResult(
                 repo_type=RepoType.GITHUB,
-                repo_name=repo_url.split("/")[-1] if "/" in repo_url else repo_url,
-                owner=repo_url.split("/")[-2] if "/" in repo_url else "unknown",
+                repo_name=repo_name,
                 file_path=file_path,
-                local_path=str(local_path),
                 version=branch,
                 error_message=str(e),
             )

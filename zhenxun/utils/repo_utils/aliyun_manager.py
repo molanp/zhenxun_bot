@@ -187,9 +187,7 @@ class AliyunCodeupManager(BaseRepoManager):
             result = FileDownloadResult(
                 repo_type=RepoType.ALIYUN,
                 repo_name=repo_url.split("/")[-1].replace(".git", ""),
-                owner=self.config.aliyun_codeup.organization_id,
                 file_path=file_path,
-                local_path=str(local_path),
                 version=branch,
             )
 
@@ -212,9 +210,7 @@ class AliyunCodeupManager(BaseRepoManager):
             return FileDownloadResult(
                 repo_type=RepoType.ALIYUN,
                 repo_name=repo_name,
-                owner=self.config.aliyun_codeup.organization_id,
                 file_path=file_path,
-                local_path=str(local_path),
                 version=branch,
                 error_message=str(e),
             )
@@ -225,9 +221,7 @@ class AliyunCodeupManager(BaseRepoManager):
             return FileDownloadResult(
                 repo_type=RepoType.ALIYUN,
                 repo_name=repo_name,
-                owner=self.config.aliyun_codeup.organization_id,
                 file_path=file_path,
-                local_path=str(local_path),
                 version=branch,
                 error_message=str(e),
             )
@@ -321,16 +315,13 @@ class AliyunCodeupManager(BaseRepoManager):
                 "authored_date", datetime.now().isoformat()
             ).replace("Z", "+00:00")
 
-            commit_info = RepoCommitInfo(
+            return RepoCommitInfo(
                 commit_id=id_value,
                 message=message_value,
                 author=author_value,
                 commit_time=datetime.fromisoformat(date_value),
                 changed_files=[],  # 阿里云API可能没有直接提供变更文件列表
             )
-
-            return commit_info
-
         except Exception as e:
             logger.error(f"获取提交信息失败: {e}")
             return None
@@ -416,11 +407,7 @@ class AliyunCodeupManager(BaseRepoManager):
 
         # 获取两个提交之间的差异
         try:
-            # 这里需要实现从阿里云获取提交差异的逻辑
-            # 由于AliyunFileInfo可能没有get_commit_diff_files方法 这里提供一个简单的实现
-            # 实际上应该调用阿里云API获取提交差异
-            files = []  # 这里应该是从阿里云API获取的文件列表
-            return files
+            return []
         except Exception as e:
             logger.error(f"获取提交差异失败: {e}")
             raise RepoUpdateError(f"获取提交差异失败: {e}")
