@@ -16,6 +16,7 @@ from .exceptions import (
     RepoNotFoundError,
     RepoUpdateError,
 )
+from .file_manager import RepoFileManager as RepoFileManagerClass
 from .github_manager import GithubManager
 from .models import (
     FileDownloadResult,
@@ -28,6 +29,7 @@ from .utils import check_git, filter_files, glob_to_regex, run_git_command
 
 GithubRepoManager = GithubManager()
 AliyunRepoManager = AliyunCodeupManager()
+RepoFileManager = RepoFileManagerClass()
 
 __all__ = [
     "AliyunCodeupConfig",
@@ -45,6 +47,7 @@ __all__ = [
     "RepoConfig",
     "RepoDownloadError",
     "RepoFileInfo",
+    "RepoFileManager",
     "RepoManagerError",
     "RepoNotFoundError",
     "RepoType",

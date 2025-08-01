@@ -5,6 +5,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 
 
 class RepoType(str, Enum):
@@ -26,6 +27,8 @@ class RepoFileInfo:
     size: int | None = None
     # 最后修改时间
     last_modified: datetime | None = None
+    # 子文件列表
+    children: list["RepoFileInfo"] = field(default_factory=list)
 
 
 @dataclass
@@ -71,15 +74,11 @@ class FileDownloadResult:
     """文件下载结果"""
 
     # 仓库类型
-    repo_type: RepoType
+    repo_type: RepoType | None
     # 仓库名称
     repo_name: str
-    # 仓库拥有者
-    owner: str
     # 文件路径
-    file_path: str
-    # 本地路径
-    local_path: str
+    file_path: list[tuple[str, Path]]
     # 版本
     version: str
     # 是否成功
