@@ -31,6 +31,17 @@ async def check_git() -> bool:
         return False
 
 
+async def clean_git(cwd: Path):
+    """
+    清理git仓库
+
+    参数:
+        cwd: 工作目录
+    """
+    await run_git_command("reset --hard", cwd)
+    await run_git_command("clean -xdf", cwd)
+
+
 async def run_git_command(
     command: str, cwd: Path | None = None
 ) -> tuple[bool, str, str]:

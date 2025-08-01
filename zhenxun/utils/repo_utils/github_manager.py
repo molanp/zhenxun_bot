@@ -172,7 +172,9 @@ class GithubManager(BaseRepoManager):
         返回:
             FileDownloadResult: 下载结果
         """
-        repo_name = repo_url.split("/")[-1].replace(".git", "").strip()
+        repo_name = (
+            repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "").strip()
+        )
         try:
             # 解析仓库URL
             repo_info = GithubUtils.parse_github_url(repo_url)

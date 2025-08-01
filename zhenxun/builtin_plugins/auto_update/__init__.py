@@ -109,10 +109,10 @@ async def _(
             logger.error("版本更新失败...", "检查更新", session=session, e=e)
             await MessageUtils.build_message(f"更新版本失败...e: {e}").finish()
     elif ver_type.result == "webui":
-        result = await UpdateManager.update_webui()
+        result = await UpdateManager.update_webui(zip.result, source.result)
     if resource.result or ver_type.result == "resource":
         try:
-            await ResourceManager.init_resources(True)
+            await ResourceManager.init_resources(True, zip.result, source.result)
             result += "\n资源文件更新成功！"
         except DownloadResourceException:
             result += "\n资源更新下载失败..."

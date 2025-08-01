@@ -69,7 +69,7 @@ class AliyunCodeupManager(BaseRepoManager):
             self._check_config()
 
             # 获取仓库名称（从URL中提取）
-            repo_url = repo_url.split("/")[-1].replace(".git", "")
+            repo_url = repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
 
             # 获取仓库最新提交ID
             newest_commit = await self._get_newest_commit(repo_url, branch)
@@ -77,7 +77,9 @@ class AliyunCodeupManager(BaseRepoManager):
             # 创建结果对象
             result = RepoUpdateResult(
                 repo_type=RepoType.ALIYUN,
-                repo_name=repo_url.split("/")[-1].replace(".git", ""),
+                repo_name=repo_url.split("/tree/")[0]
+                .split("/")[-1]
+                .replace(".git", ""),
                 owner=self.config.aliyun_codeup.organization_id,
                 old_version="",  # 将在后面更新
                 new_version=newest_commit,
@@ -99,7 +101,7 @@ class AliyunCodeupManager(BaseRepoManager):
             local_path.mkdir(parents=True, exist_ok=True)
 
             # 获取仓库名称（从URL中提取）
-            repo_name = repo_url.split("/")[-1].replace(".git", "")
+            repo_name = repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
 
             # 获取变更的文件列表
             changed_files = await self._get_changed_files(
@@ -135,7 +137,7 @@ class AliyunCodeupManager(BaseRepoManager):
         except RepoUpdateError as e:
             logger.error(f"更新仓库失败: {e}")
             # 从URL中提取仓库名称
-            repo_name = repo_url.split("/")[-1].replace(".git", "")
+            repo_name = repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
             return RepoUpdateResult(
                 repo_type=RepoType.ALIYUN,
                 repo_name=repo_name,
@@ -147,7 +149,7 @@ class AliyunCodeupManager(BaseRepoManager):
         except Exception as e:
             logger.error(f"更新仓库失败: {e}")
             # 从URL中提取仓库名称
-            repo_name = repo_url.split("/")[-1].replace(".git", "")
+            repo_name = repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
             return RepoUpdateResult(
                 repo_type=RepoType.ALIYUN,
                 repo_name=repo_name,
@@ -181,12 +183,16 @@ class AliyunCodeupManager(BaseRepoManager):
             self._check_config()
 
             # 获取仓库名称（从URL中提取）
-            repo_identifier = repo_url.split("/")[-1].replace(".git", "")
+            repo_identifier = (
+                repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
+            )
 
             # 创建结果对象
             result = FileDownloadResult(
                 repo_type=RepoType.ALIYUN,
-                repo_name=repo_url.split("/")[-1].replace(".git", ""),
+                repo_name=repo_url.split("/tree/")[0]
+                .split("/")[-1]
+                .replace(".git", ""),
                 file_path=file_path,
                 version=branch,
             )
@@ -206,7 +212,7 @@ class AliyunCodeupManager(BaseRepoManager):
         except RepoDownloadError as e:
             logger.error(f"下载文件失败: {e}")
             # 从URL中提取仓库名称
-            repo_name = repo_url.split("/")[-1].replace(".git", "")
+            repo_name = repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
             return FileDownloadResult(
                 repo_type=RepoType.ALIYUN,
                 repo_name=repo_name,
@@ -217,7 +223,7 @@ class AliyunCodeupManager(BaseRepoManager):
         except Exception as e:
             logger.error(f"下载文件失败: {e}")
             # 从URL中提取仓库名称
-            repo_name = repo_url.split("/")[-1].replace(".git", "")
+            repo_name = repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
             return FileDownloadResult(
                 repo_type=RepoType.ALIYUN,
                 repo_name=repo_name,
@@ -250,7 +256,9 @@ class AliyunCodeupManager(BaseRepoManager):
             self._check_config()
 
             # 获取仓库名称（从URL中提取）
-            repo_identifier = repo_url.split("/")[-1].replace(".git", "")
+            repo_identifier = (
+                repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
+            )
 
             # 获取文件列表
             search_type = "RECURSIVE" if recursive else "DIRECT"
@@ -298,7 +306,9 @@ class AliyunCodeupManager(BaseRepoManager):
             self._check_config()
 
             # 获取仓库名称（从URL中提取）
-            repo_identifier = repo_url.split("/")[-1].replace(".git", "")
+            repo_identifier = (
+                repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
+            )
 
             # 获取提交信息
             # 注意：这里假设AliyunFileInfo有get_commit_info方法，如果没有，需要实现
@@ -440,7 +450,7 @@ class AliyunCodeupManager(BaseRepoManager):
         def prepare_aliyun_url(repo_url: str) -> str:
             import base64
 
-            repo_name = repo_url.split("/")[-1].replace(".git", "")
+            repo_name = repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
             # 构建仓库URL
             # 阿里云CodeUp的仓库URL格式通常为：
             # https://codeup.aliyun.com/{organization_id}/{organization_name}/{repo_name}.git

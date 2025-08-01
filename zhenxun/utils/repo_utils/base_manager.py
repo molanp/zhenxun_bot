@@ -230,7 +230,7 @@ class BaseRepoManager(ABC):
         """
         from .models import RepoType
 
-        repo_name = repo_url.split("/")[-1].replace(".git", "")
+        repo_name = repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "")
 
         try:
             # 创建结果对象

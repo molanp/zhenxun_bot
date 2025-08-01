@@ -7,6 +7,8 @@ GIT_GITHUB_URL = "https://github.com/zhenxun-org/zhenxun_bot.git"
 DEFAULT_GITHUB_URL = "https://github.com/HibiKier/zhenxun_bot/tree/main"
 RELEASE_URL = "https://api.github.com/repos/HibiKier/zhenxun_bot/releases/latest"
 
+GIT_WEBUI_UI_URL = "https://github.com/HibiKier/zhenxun_bot_webui.git"
+
 VERSION_FILE_STRING = "__version__"
 VERSION_FILE = Path() / VERSION_FILE_STRING
 

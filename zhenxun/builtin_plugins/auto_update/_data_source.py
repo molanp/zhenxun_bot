@@ -7,7 +7,7 @@ import zipfile
 from nonebot.adapters import Bot
 from nonebot.utils import run_sync
 
-from zhenxun.configs.path_config import DATA_PATH
+from zhenxun.configs.path_config import DATA_PATH, TEMP_PATH
 from zhenxun.services.log import logger
 from zhenxun.utils.github_utils import GithubUtils
 from zhenxun.utils.github_utils.models import RepoInfo
@@ -15,6 +15,7 @@ from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.manager.virtual_env_package_manager import VirtualEnvPackageManager
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.repo_utils import AliyunRepoManager, GithubRepoManager
+from zhenxun.utils.repo_utils.utils import clean_git
 
 from .config import (
     BACKUP_PATH,
@@ -25,6 +26,7 @@ from .config import (
     DOWNLOAD_GZ_FILE,
     DOWNLOAD_ZIP_FILE,
     GIT_GITHUB_URL,
+    GIT_WEBUI_UI_URL,
     PYPROJECT_FILE,
     PYPROJECT_FILE_STRING,
     PYPROJECT_LOCK_FILE,
@@ -120,7 +122,7 @@ def _file_handle(latest_version: str | None):
 
 class UpdateManager:
     @classmethod
-    async def update_webui(cls) -> str:
+    async def update_webui(cls, is_zip: bool, source: str) -> str:
         from zhenxun.builtin_plugins.web_ui.public.data_source import (
             update_webui_assets,
         )
@@ -133,8 +135,26 @@ class UpdateManager:
                 shutil.rmtree(BACKUP_PATH)
             WEBUI_PATH.rename(BACKUP_PATH)
         try:
-            await update_webui_assets()
-            logger.info("更新webui成功...", COMMAND)
+            if is_zip:
+                await update_webui_assets()
+                logger.info("更新webui成功...", COMMAND)
+            else:
+                TMP_PATH = TEMP_PATH / "_webui_tmp"
+                if TMP_PATH.exists():
+                    await clean_git(TMP_PATH)
+                    shutil.rmtree(TMP_PATH)
+                if source == "ali":
+                    result = await AliyunRepoManager.update(
+                        GIT_WEBUI_UI_URL, TMP_PATH, "dist"
+                    )
+                else:
+                    result = await GithubRepoManager.update(
+                        GIT_WEBUI_UI_URL, TMP_PATH, "dist"
+                    )
+                if not result.success:
+                    return f"Webui更新失败...错误: {result.error_message}"
+                shutil.rmtree(WEBUI_PATH, ignore_errors=True)
+                shutil.copytree(TMP_PATH / "dist", WEBUI_PATH)
             if BACKUP_PATH.exists():
                 logger.debug(f"删除旧的webui文件夹 {BACKUP_PATH}", COMMAND)
                 shutil.rmtree(BACKUP_PATH)
