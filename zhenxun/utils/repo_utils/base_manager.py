@@ -287,14 +287,36 @@ class BaseRepoManager(ABC):
                 "rev-parse --is-inside-work-tree", cwd=local_path
             )
             if not success:
-                return RepoUpdateResult(
-                    repo_type=repo_type or RepoType.GITHUB,
-                    repo_name=repo_name,
-                    owner=owner or "",
-                    old_version="",
-                    new_version="",
-                    error_message=f"{local_path} 不是一个Git仓库",
+                # 如果不是Git仓库，尝试初始化它
+                logger.info(f"目录 {local_path} 不是Git仓库，尝试初始化", LOG_COMMAND)
+                init_success, _, init_stderr = await run_git_command(
+                    "init", cwd=local_path
                 )
+                if not init_success:
+                    return RepoUpdateResult(
+                        repo_type=repo_type or RepoType.GITHUB,
+                        repo_name=repo_name,
+                        owner=owner or "",
+                        old_version="",
+                        new_version="",
+                        error_message=f"初始化Git仓库失败: {init_stderr}",
+                    )
+
+                # 添加远程仓库
+                remote_success, _, remote_stderr = await run_git_command(
+                    f"remote add origin {repo_url}", cwd=local_path
+                )
+                if not remote_success:
+                    return RepoUpdateResult(
+                        repo_type=repo_type or RepoType.GITHUB,
+                        repo_name=repo_name,
+                        owner=owner or "",
+                        old_version="",
+                        new_version="",
+                        error_message=f"添加远程仓库失败: {remote_stderr}",
+                    )
+
+                logger.info(f"成功初始化Git仓库 {local_path}", LOG_COMMAND)
 
             # 获取当前提交ID作为旧版本
             success, old_version, _ = await run_git_command(
