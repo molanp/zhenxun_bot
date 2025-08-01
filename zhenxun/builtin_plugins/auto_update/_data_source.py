@@ -265,7 +265,8 @@ class UpdateManager:
         return (
             f"版本更新完成！\n"
             f"版本: {cur_version} -> {result.new_version}\n"
-            f"变更文件个数: {len(result.changed_files)}\n"
+            f"变更文件个数: {len(result.changed_files)}"
+            f"{'' if source == 'git' else '（阿里云更新不支持查看变更文件）'}\n"
             "请重新启动真寻以完成更新!"
         )
 
