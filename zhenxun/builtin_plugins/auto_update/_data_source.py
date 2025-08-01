@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import shutil
 import tarfile
 import zipfile
@@ -245,14 +246,14 @@ class UpdateManager:
         elif source == "git":
             result = await GithubRepoManager.update(
                 GIT_GITHUB_URL,
-                BASE_PATH,
+                Path(),
                 use_git=update_type == "git",
                 force=force,
             )
         else:
             result = await AliyunRepoManager.update(
                 GIT_GITHUB_URL,
-                BASE_PATH,
+                Path(),
                 force=force,
             )
         if not result.success:

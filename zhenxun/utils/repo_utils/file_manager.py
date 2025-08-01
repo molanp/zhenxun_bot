@@ -154,7 +154,7 @@ class RepoFileManager:
                 )
                 results.append((f, content))
             except Exception as e:
-                logger.error(f"获取阿里云文件内容失败: {file_path}", LOG_COMMAND, e=e)
+                logger.warning(f"获取阿里云文件内容失败: {file_path}", LOG_COMMAND, e=e)
                 if not ignore_error:
                     raise
         logger.debug(f"获取阿里云文件内容: {[r[0] for r in results]}", LOG_COMMAND)

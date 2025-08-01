@@ -376,7 +376,7 @@ class BaseRepoManager(ABC):
             logger.info("拉取最新代码", LOG_COMMAND)
             pull_cmd = f"pull origin {branch}"
             if force:
-                pull_cmd = f"pull --force origin {branch}"
+                pull_cmd = f"fetch --all && git reset --hard origin/{branch}"
                 logger.info("使用强制拉取模式", LOG_COMMAND)
             success, _, stderr = await run_git_command(pull_cmd, cwd=local_path)
             if not success:
