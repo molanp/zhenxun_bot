@@ -88,7 +88,7 @@ async def test_update_plugin_basic_is_new(
     )
     mocker.patch(
         "zhenxun.builtin_plugins.plugin_store.data_source.StoreManager.get_loaded_plugins",
-        return_value=[("search_image", "0.2")],
+        return_value=[("search_image", "0.1")],
     )
 
     plugin_id = 1

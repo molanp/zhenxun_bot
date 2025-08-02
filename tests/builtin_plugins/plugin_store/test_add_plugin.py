@@ -15,7 +15,7 @@ from tests.config import BotId, GroupId, MessageId, UserId
 from tests.utils import _v11_group_message_event
 
 
-@pytest.mark.parametrize("package_api", ["jsd", "gh"])
+@pytest.mark.parametrize("package_api", ["gh"])
 @pytest.mark.parametrize("is_commit", [True, False])
 async def test_add_plugin_basic(
     package_api: str,
@@ -37,11 +37,7 @@ async def test_add_plugin_basic(
         new=tmp_path / "zhenxun",
     )
 
-    if package_api != "jsd":
-        mocked_api["zhenxun_bot_plugins_metadata"].respond(404)
-    if package_api != "gh":
-        mocked_api["zhenxun_bot_plugins_tree"].respond(404)
-
+    mocked_api["zhenxun_bot_plugins_metadata"].respond(404)
     if not is_commit:
         mocked_api["zhenxun_bot_plugins_commit"].respond(404)
         mocked_api["zhenxun_bot_plugins_commit_proxy"].respond(404)
@@ -86,7 +82,7 @@ async def test_add_plugin_basic(
     assert (mock_base_path / "plugins" / "search_image" / "__init__.py").is_file()
 
 
-@pytest.mark.parametrize("package_api", ["jsd", "gh"])
+@pytest.mark.parametrize("package_api", ["gh"])
 @pytest.mark.parametrize("is_commit", [True, False])
 async def test_add_plugin_basic_commit_version(
     package_api: str,
@@ -108,11 +104,7 @@ async def test_add_plugin_basic_commit_version(
         new=tmp_path / "zhenxun",
     )
 
-    if package_api != "jsd":
-        mocked_api["zhenxun_bot_plugins_metadata_commit"].respond(404)
-    if package_api != "gh":
-        mocked_api["zhenxun_bot_plugins_tree_commit"].respond(404)
-
+    mocked_api["zhenxun_bot_plugins_metadata_commit"].respond(404)
     if not is_commit:
         mocked_api["zhenxun_bot_plugins_commit"].respond(404)
         mocked_api["zhenxun_bot_plugins_commit_proxy"].respond(404)
@@ -159,7 +151,7 @@ async def test_add_plugin_basic_commit_version(
     assert (mock_base_path / "plugins" / "bilibili_sub" / "__init__.py").is_file()
 
 
-@pytest.mark.parametrize("package_api", ["jsd", "gh"])
+@pytest.mark.parametrize("package_api", ["gh"])
 @pytest.mark.parametrize("is_commit", [True, False])
 async def test_add_plugin_basic_is_not_dir(
     package_api: str,
@@ -181,10 +173,7 @@ async def test_add_plugin_basic_is_not_dir(
         new=tmp_path / "zhenxun",
     )
 
-    if package_api != "jsd":
-        mocked_api["zhenxun_bot_plugins_metadata"].respond(404)
-    if package_api != "gh":
-        mocked_api["zhenxun_bot_plugins_tree"].respond(404)
+    mocked_api["zhenxun_bot_plugins_metadata"].respond(404)
 
     if not is_commit:
         mocked_api["zhenxun_bot_plugins_commit"].respond(404)
@@ -230,7 +219,7 @@ async def test_add_plugin_basic_is_not_dir(
     assert (mock_base_path / "plugins" / "alapi" / "jitang.py").is_file()
 
 
-@pytest.mark.parametrize("package_api", ["jsd", "gh"])
+@pytest.mark.parametrize("package_api", ["gh"])
 @pytest.mark.parametrize("is_commit", [True, False])
 async def test_add_plugin_extra(
     package_api: str,
@@ -252,10 +241,7 @@ async def test_add_plugin_extra(
         new=tmp_path / "zhenxun",
     )
 
-    if package_api != "jsd":
-        mocked_api["zhenxun_github_sub_metadata"].respond(404)
-    if package_api != "gh":
-        mocked_api["zhenxun_github_sub_tree"].respond(404)
+    mocked_api["zhenxun_github_sub_metadata"].respond(404)
 
     if not is_commit:
         mocked_api["zhenxun_github_sub_commit"].respond(404)
