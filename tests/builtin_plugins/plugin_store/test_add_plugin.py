@@ -48,7 +48,7 @@ async def test_add_plugin_basic(
         mocked_api["zhenxun_bot_plugins_index_commit"].respond(404)
         mocked_api["zhenxun_bot_plugins_index_commit_proxy"].respond(404)
 
-    plugin_id = 1
+    plugin_id = "search_image"
 
     async with app.test_matcher(_matcher) as ctx:
         bot = create_bot(ctx)
@@ -65,7 +65,7 @@ async def test_add_plugin_basic(
         ctx.receive_event(bot=bot, event=event)
         ctx.should_call_send(
             event=event,
-            message=Message(message=f"正在添加插件 Id: {plugin_id}"),
+            message=Message(message=f"正在添加插件 Module: {plugin_id}"),
             result=None,
             bot=bot,
         )
@@ -118,7 +118,7 @@ async def test_add_plugin_basic_commit_version(
         mocked_api["zhenxun_bot_plugins_commit_proxy"].respond(404)
         mocked_api["zhenxun_bot_plugins_index_commit"].respond(404)
         mocked_api["zhenxun_bot_plugins_index_commit_proxy"].respond(404)
-    plugin_id = 3
+    plugin_id = "bilibili_sub"
 
     async with app.test_matcher(_matcher) as ctx:
         bot = create_bot(ctx)
@@ -135,7 +135,7 @@ async def test_add_plugin_basic_commit_version(
         ctx.receive_event(bot=bot, event=event)
         ctx.should_call_send(
             event=event,
-            message=Message(message=f"正在添加插件 Id: {plugin_id}"),
+            message=Message(message=f"正在添加插件 Module: {plugin_id}"),
             result=None,
             bot=bot,
         )
@@ -192,7 +192,7 @@ async def test_add_plugin_basic_is_not_dir(
         mocked_api["zhenxun_bot_plugins_index_commit"].respond(404)
         mocked_api["zhenxun_bot_plugins_index_commit_proxy"].respond(404)
 
-    plugin_id = 0
+    plugin_id = "jitang"
 
     async with app.test_matcher(_matcher) as ctx:
         bot = create_bot(ctx)
@@ -209,7 +209,7 @@ async def test_add_plugin_basic_is_not_dir(
         ctx.receive_event(bot=bot, event=event)
         ctx.should_call_send(
             event=event,
-            message=Message(message=f"正在添加插件 Id: {plugin_id}"),
+            message=Message(message=f"正在添加插件 Module: {plugin_id}"),
             result=None,
             bot=bot,
         )
@@ -265,7 +265,7 @@ async def test_add_plugin_extra(
         mocked_api["zhenxun_bot_plugins_index_commit"].respond(404)
         mocked_api["zhenxun_bot_plugins_index_commit_proxy"].respond(404)
 
-    plugin_id = 4
+    plugin_id = "github_sub"
 
     async with app.test_matcher(_matcher) as ctx:
         bot = create_bot(ctx)
@@ -282,7 +282,7 @@ async def test_add_plugin_extra(
         ctx.receive_event(bot=bot, event=event)
         ctx.should_call_send(
             event=event,
-            message=Message(message=f"正在添加插件 Id: {plugin_id}"),
+            message=Message(message=f"正在添加插件 Module: {plugin_id}"),
             result=None,
             bot=bot,
         )
@@ -339,7 +339,7 @@ async def test_plugin_not_exist_add(
         )
         ctx.should_call_send(
             event=event,
-            message=Message(message="插件ID不存在..."),
+            message=Message(message="添加插件 Id: -1 失败 e: 插件ID不存在..."),
             result=None,
             bot=bot,
         )
@@ -385,7 +385,9 @@ async def test_add_plugin_exist(
         )
         ctx.should_call_send(
             event=event,
-            message=Message(message="插件 识图 已安装，无需重复安装"),
+            message=Message(
+                message="添加插件 Id: 1 失败 e: 插件 识图 已安装，无需重复安装"
+            ),
             result=None,
             bot=bot,
         )

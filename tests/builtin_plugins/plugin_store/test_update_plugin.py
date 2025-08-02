@@ -88,7 +88,7 @@ async def test_update_plugin_basic_is_new(
     )
     mocker.patch(
         "zhenxun.builtin_plugins.plugin_store.data_source.StoreManager.get_loaded_plugins",
-        return_value=[("search_image", "0.1")],
+        return_value=[("search_image", "0.2")],
     )
 
     plugin_id = 1
@@ -158,7 +158,7 @@ async def test_plugin_not_exist_update(
         )
         ctx.should_call_send(
             event=event,
-            message=Message(message="插件ID不存在..."),
+            message=Message(message="更新插件 Id: -1 失败 e: 插件ID不存在..."),
             result=None,
             bot=bot,
         )
@@ -200,7 +200,9 @@ async def test_update_plugin_not_install(
         )
         ctx.should_call_send(
             event=event,
-            message=Message(message="插件 识图 未安装，无法更新"),
+            message=Message(
+                message="更新插件 Id: 1 失败 e: 插件 识图 未安装，无法更新"
+            ),
             result=None,
             bot=bot,
         )

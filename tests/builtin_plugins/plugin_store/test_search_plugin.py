@@ -63,11 +63,11 @@ async def test_search_plugin_name(
         [
             [
                 "",
-                4,
+                49,
                 "github订阅",
                 "订阅github用户或仓库",
                 "xuanerwa",
-                "0.7",
+                "0.9",
                 "普通插件",
             ]
         ],
@@ -129,11 +129,11 @@ async def test_search_plugin_author(
         [
             [
                 "",
-                4,
+                49,
                 "github订阅",
                 "订阅github用户或仓库",
                 "xuanerwa",
-                "0.7",
+                "0.9",
                 "普通插件",
             ]
         ],
