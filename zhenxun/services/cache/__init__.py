@@ -78,17 +78,17 @@ message_list.append("Hello")  # 类型安全
 """
 
 import asyncio
-import random
 from collections.abc import Callable
 from datetime import datetime
 from functools import wraps
+import random
 from typing import Any, ClassVar, Generic, TypeVar, get_type_hints
 
-import nonebot
 from aiocache import Cache as AioCache
 from aiocache import SimpleMemoryCache
 from aiocache.base import BaseCache
 from aiocache.serializers import JsonSerializer
+import nonebot
 from nonebot.compat import model_dump
 from nonebot.utils import is_coroutine_callable
 from pydantic import BaseModel

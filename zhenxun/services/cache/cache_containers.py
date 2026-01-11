@@ -1,6 +1,6 @@
+from dataclasses import dataclass
 import random
 import time
-from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
 from zhenxun.services.cache.config import TTL_JITTER
