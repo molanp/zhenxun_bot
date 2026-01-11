@@ -1,6 +1,9 @@
-from dataclasses import dataclass
+import random
 import time
+from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
+
+from zhenxun.services.cache.config import TTL_JITTER
 
 T = TypeVar("T")
 
@@ -59,7 +62,13 @@ class CacheDict(Generic[T]):
             key: 字典键
             value: 字典值
         """
-        expire_time = time.time() + self.expire if self.expire > 0 else 0
+        # 计算过期时间并加入随机抖动，避免大量键同时到期造成雪崩
+        if self.expire > 0:
+            jitter = random.uniform(1 - TTL_JITTER, 1 + TTL_JITTER)
+            ttl = max(1, int(self.expire * jitter))
+            expire_time = time.time() + ttl
+        else:
+            expire_time = 0
         self._data[key] = CacheData(value=value, expire_time=expire_time)
 
     def __delitem__(self, key: str) -> None:
@@ -109,10 +118,16 @@ class CacheDict(Generic[T]):
         """
         # 计算过期时间
         expire_time = 0
+        ttl = None
         if expire is not None and expire > 0:
-            expire_time = time.time() + expire
+            ttl = expire
         elif self.expire > 0:
-            expire_time = time.time() + self.expire
+            ttl = self.expire
+
+        if ttl is not None and ttl > 0:
+            jitter = random.uniform(1 - TTL_JITTER, 1 + TTL_JITTER)
+            ttl = max(1, int(ttl * jitter))
+            expire_time = time.time() + ttl
 
         self._data[key] = CacheData(value=value, expire_time=expire_time)
 
@@ -432,7 +447,12 @@ class CacheList(Generic[T]):
 
     def _update_expire_time(self):
         """更新过期时间"""
-        self._expire_time = time.time() + self.expire if self.expire > 0 else 0
+        if self.expire > 0:
+            jitter = random.uniform(1 - TTL_JITTER, 1 + TTL_JITTER)
+            ttl = max(1, int(self.expire * jitter))
+            self._expire_time = time.time() + ttl
+        else:
+            self._expire_time = 0
 
     def __str__(self) -> str:
         """字符串表示

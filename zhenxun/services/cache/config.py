@@ -36,3 +36,6 @@ SPECIAL_KEY_FORMATS = {
     "BAN": "{user_id}" + COMPOSITE_KEY_SEPARATOR + "{group_id}",
     "GROUPS": "{group_id}" + COMPOSITE_KEY_SEPARATOR + "{channel_id}",
 }
+
+# TTL抖动比例（用于缓解批量失效），例如 0.1 表示 ±10%
+TTL_JITTER = 0.1

@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any, ClassVar, Generic, TypeVar, cast
 
 from zhenxun.services.cache import Cache, CacheRoot, cache_config
@@ -45,6 +46,8 @@ class DataAccess(Generic[T]):
     _NULL_RESULT = "__NULL_RESULT_PLACEHOLDER__"
     # 默认空结果缓存时间（秒）- 设置为5分钟，避免频繁查询数据库
     _NULL_RESULT_TTL = 300
+    # 单飞锁：按 (cache_type, cache_key) 控制并发回源
+    _single_flight_locks: ClassVar[dict[tuple[str, str], asyncio.Lock]] = {}
 
     @classmethod
     def set_null_result_ttl(cls, seconds: int) -> None:
@@ -214,41 +217,73 @@ class DataAccess(Generic[T]):
 
         # 如果缓存中没有，从数据库获取
         logger.debug(f"{self.model_cls.__name__} 从数据库获取数据: {kwargs}")
-        data = await db_query_func(*args, **kwargs)
+        # 单飞锁：当存在缓存键时，保证只有一个协程回源并写缓存，其他协程等待
+        if (
+            cache_key is not None
+            and self.cache_type
+            and cache_config.cache_mode != CacheMode.NONE
+        ):
+            lock_key = (self.cache_type, cache_key)
+            lock = self._single_flight_locks.get(lock_key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._single_flight_locks[lock_key] = lock
+            async with lock:
+                # double check cache
+                try:
+                    cached = await self.cache.get(cache_key)
+                    if cached == self._NULL_RESULT:
+                        self._cache_stats[self.cache_type]["null_hits"] += 1
+                        if allow_not_exist:
+                            return None
+                    if cached:
+                        self._cache_stats[self.cache_type]["hits"] += 1
+                        return cast(T, cached)
+                except Exception:
+                    # ignore and fallback to db
+                    pass
 
-        # 如果获取到数据，存入缓存
-        if data:
-            try:
-                # 生成缓存键
-                cache_key = self._build_cache_key_for_item(data)
-                if cache_key is not None:
-                    # 存入缓存
-                    await self.cache.set(cache_key, data)
-                    self._cache_stats[self.cache_type]["sets"] += 1
-                    logger.debug(
-                        f"{self.model_cls.__name__} 数据已存入缓存: {cache_key}"
+                data = await db_query_func(*args, **kwargs)
+
+                # 写入缓存（含空结果缓存）
+                if data:
+                    try:
+                        await self.cache.set(cache_key, data)
+                        self._cache_stats[self.cache_type]["sets"] += 1
+                    except Exception as e:
+                        logger.error(
+                            f"{self.model_cls.__name__} 写入缓存失败: {cache_key}", e=e
+                        )
+                else:
+                    try:
+                        await self.cache.set(
+                            cache_key, self._NULL_RESULT, expire=self._NULL_RESULT_TTL
+                        )
+                        self._cache_stats[self.cache_type]["null_sets"] += 1
+                    except Exception as e:
+                        logger.error(
+                            f"{self.model_cls.__name__} 写入空结果缓存失败: {cache_key}",
+                            e=e,
+                        )
+
+            # 清理锁字典以防内存泄漏（锁不会被重复创建过多）
+            self._single_flight_locks.pop(lock_key, None)
+        else:
+            data = await db_query_func(*args, **kwargs)
+
+        # NOTE:
+        # 当通过单飞锁代码路径写入缓存时，上面的写缓存逻辑已执行；若走无锁路径（如无 cache_key），在此处理写缓存。
+        if cache_key is None:
+            if data and self.cache_type and cache_config.cache_mode != CacheMode.NONE:
+                try:
+                    cache_key = self._build_cache_key_for_item(data)
+                    if cache_key is not None:
+                        await self.cache.set(cache_key, data)
+                        self._cache_stats[self.cache_type]["sets"] += 1
+                except Exception as e:
+                    logger.error(
+                        f"{self.model_cls.__name__} 存入缓存失败，参数: {kwargs}", e=e
                     )
-            except Exception as e:
-                logger.error(
-                    f"{self.model_cls.__name__} 存入缓存失败，参数: {kwargs}", e=e
-                )
-        elif cache_key is not None:
-            # 如果没有获取到数据，缓存空结果
-            try:
-                # 存入空结果缓存，使用较短的过期时间
-                await self.cache.set(
-                    cache_key, self._NULL_RESULT, expire=self._NULL_RESULT_TTL
-                )
-                self._cache_stats[self.cache_type]["null_sets"] += 1
-                logger.debug(
-                    f"{self.model_cls.__name__} 空结果已存入缓存: {cache_key},"
-                    f" TTL={self._NULL_RESULT_TTL}秒"
-                )
-            except Exception as e:
-                logger.error(
-                    f"{self.model_cls.__name__} 存入空结果缓存失败，参数: {kwargs}", e=e
-                )
-
         return data
 
     async def get_or_none(

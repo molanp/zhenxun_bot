@@ -78,16 +78,17 @@ message_list.append("Hello")  # 类型安全
 """
 
 import asyncio
+import random
 from collections.abc import Callable
 from datetime import datetime
 from functools import wraps
 from typing import Any, ClassVar, Generic, TypeVar, get_type_hints
 
+import nonebot
 from aiocache import Cache as AioCache
 from aiocache import SimpleMemoryCache
 from aiocache.base import BaseCache
 from aiocache.serializers import JsonSerializer
-import nonebot
 from nonebot.compat import model_dump
 from nonebot.utils import is_coroutine_callable
 from pydantic import BaseModel
@@ -102,6 +103,7 @@ from .config import (
     DEFAULT_EXPIRE,
     LOG_COMMAND,
     SPECIAL_KEY_FORMATS,
+    TTL_JITTER,
     CacheMode,
 )
 
@@ -210,17 +212,17 @@ class CacheData:
         self.cache = cache
         self._data = None
         self._last_update = 0
+        self._lock = asyncio.Lock()
 
-        # 如果不是延迟加载，立即加载数据
+        # 如果不是延迟加载，立即加载数据（后台任务）
         if not lazy_load:
-            import asyncio
-
             try:
-                loop = asyncio.get_event_loop()
-                if not loop.is_running():
-                    loop.run_until_complete(self.get_data())
+                # 后台异步加载，确保不会阻塞初始化
+                asyncio.create_task(self.get_data())
             except Exception:
-                pass
+                logger.error(
+                    f"CacheData 初始化时后台加载失败: {self.name}", LOG_COMMAND
+                )
 
     async def get_data(self) -> Any:
         """获取数据
@@ -230,16 +232,30 @@ class CacheData:
         """
         # 检查是否需要更新
         now = datetime.now().timestamp()
-        if self._data is None or (
+        expired = self._data is None or (
             self.expire > 0 and now - self._last_update > self.expire
-        ):
-            # 更新数据
-            try:
-                self._data = await self.func()
-                self._last_update = now
-            except Exception as e:
-                logger.error(f"获取缓存数据 {self.name} 失败", LOG_COMMAND, e=e)
-
+        )
+        if expired:
+            # 单飞加载：只有第一个进入的协程会实际调用 func，其它协程等待结果
+            async with self._lock:
+                now = datetime.now().timestamp()
+                expired = self._data is None or (
+                    self.expire > 0 and now - self._last_update > self.expire
+                )
+                if expired:
+                    try:
+                        result = await (
+                            self.func()
+                            if is_coroutine_callable(self.func)
+                            else asyncio.get_event_loop().run_in_executor(
+                                None, self.func
+                            )
+                        )
+                        await self.set_data(result)
+                    except Exception as e:
+                        logger.error(
+                            f"CacheData 加载数据失败: {self.name}", LOG_COMMAND, e=e
+                        )
         return self._data
 
     async def set_data(self, data: Any) -> bool:
@@ -254,9 +270,19 @@ class CacheData:
         try:
             self._data = data
             self._last_update = datetime.now().timestamp()
-            # 如果有缓存后端，保存到缓存
+            # 如果有缓存后端，保存到缓存（使用抖动后的 TTL）
             if self.cache and cache_config.cache_mode != CacheMode.NONE:
-                await self.cache.set(self.name, data, ttl=self.expire)  # type: ignore
+                try:
+                    ttl = max(1, int(self.expire)) if self.expire > 0 else 0
+                    if ttl > 0 and TTL_JITTER > 0:
+                        jitter = random.uniform(1 - TTL_JITTER, 1 + TTL_JITTER)
+                        ttl = max(1, int(ttl * jitter))
+                    # aiocache 接口: set(key, value, ttl=...)
+                    await self.cache.set(self.name, self._data, ttl=ttl)  # type: ignore
+                except Exception as e:
+                    logger.error(
+                        f"CacheData 写入后端缓存失败: {self.name}", LOG_COMMAND, e=e
+                    )
             return True
         except Exception as e:
             logger.error(f"设置缓存数据 {self.name} 失败", LOG_COMMAND, e=e)
@@ -273,7 +299,12 @@ class CacheData:
             self._last_update = 0
             # 如果有缓存后端，清除缓存
             if self.cache and cache_config.cache_mode != CacheMode.NONE:
-                await self.cache.delete(self.name)  # type: ignore
+                try:
+                    await self.cache.delete(self.name)  # type: ignore
+                except Exception as e:
+                    logger.error(
+                        f"CacheData 清除后端缓存失败: {self.name}", LOG_COMMAND, e=e
+                    )
             return True
         except Exception as e:
             logger.error(f"清除缓存数据 {self.name} 失败", LOG_COMMAND, e=e)
@@ -614,10 +645,14 @@ class CacheManager:
 
             # 设置过期时间
             ttl = expire if expire is not None else model.expire
+            # 增加抖动，避免大量缓存同时过期
+            if ttl and TTL_JITTER > 0:
+                jitter = random.uniform(1 - TTL_JITTER, 1 + TTL_JITTER)
+                ttl = max(1, int(ttl * jitter))
 
             # 设置缓存
             await asyncio.wait_for(
-                self.cache_backend.set(cache_key, serialized_value, ttl=ttl),  # type: ignore
+                self.cache_backend.set(cache_key, serialized_value, ttl=ttl),
                 timeout=DB_TIMEOUT_SECONDS,
             )
             return True
