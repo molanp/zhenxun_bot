@@ -86,7 +86,7 @@ async def with_timeout(coro, timeout=TIMEOUT_SECONDS, name=None):
                 ):
                     CIRCUIT_BREAKERS[name]["active"] = True
                     CIRCUIT_BREAKERS[name]["reset_time"] = (
-                        time.time() + CIRCUIT_RESET_TIME
+                        time.perf_counter() + CIRCUIT_RESET_TIME
                     )
                     logger.warning(
                         f"{name} 熔断器已激活，将在 {CIRCUIT_RESET_TIME} 秒后重置",
@@ -111,7 +111,7 @@ def check_circuit_breaker(name):
     # 检查是否需要重置熔断器
     if (
         CIRCUIT_BREAKERS[name]["active"]
-        and time.time() > CIRCUIT_BREAKERS[name]["reset_time"]
+        and time.perf_counter() > CIRCUIT_BREAKERS[name]["reset_time"]
     ):
         CIRCUIT_BREAKERS[name]["active"] = False
         CIRCUIT_BREAKERS[name]["failures"] = 0
@@ -254,7 +254,7 @@ async def reduce_gold(user_id: str, module: str, cost_gold: int, session: Uninfo
 
 # 辅助函数，用于记录每个 hook 的执行时间
 async def time_hook(coro, name, time_dict):
-    start = time.time()
+    start = time.perf_counter()
     try:
         # 检查熔断状态
         if check_circuit_breaker(name):
@@ -268,7 +268,7 @@ async def time_hook(coro, name, time_dict):
         time_dict[name] = f"超时 (>{TIMEOUT_SECONDS}s)"
     finally:
         if name not in time_dict:
-            time_dict[name] = f"{time.time() - start:.3f}s"
+            time_dict[name] = f"{time.perf_counter() - start:.3f}s"
 
 
 async def _enter_hooks_section():
@@ -329,12 +329,14 @@ async def auth(
             raise PermissionExemption("Matcher插件名称不存在...")
 
         # 获取插件和用户数据
-        plugin_user_start = time.time()
+        plugin_user_start = time.perf_counter()
         try:
             plugin, user = await with_timeout(
                 get_plugin_and_user(module, entity.user_id), name="get_plugin_and_user"
             )
-            hook_times["get_plugin_user"] = f"{time.time() - plugin_user_start:.3f}s"
+            hook_times["get_plugin_user"] = (
+                f"{time.perf_counter() - plugin_user_start:.3f}s"
+            )
         except asyncio.TimeoutError:
             logger.error(
                 f"获取插件和用户数据超时，模块: {module}",
@@ -348,12 +350,12 @@ async def auth(
         entered_hooks = True
 
         # 获取插件费用
-        cost_start = time.time()
+        cost_start = time.perf_counter()
         try:
             cost_gold = await with_timeout(
                 get_plugin_cost(bot, user, plugin, session), name="get_plugin_cost"
             )
-            hook_times["cost_gold"] = f"{time.time() - cost_start:.3f}s"
+            hook_times["cost_gold"] = f"{time.perf_counter() - cost_start:.3f}s"
         except asyncio.TimeoutError:
             logger.error(
                 f"获取插件费用超时，模块: {module}", LOGGER_COMMAND, session=session

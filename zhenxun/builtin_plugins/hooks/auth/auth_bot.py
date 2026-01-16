@@ -23,7 +23,7 @@ async def auth_bot(plugin: PluginInfo, bot_id: str):
         SkipPluginException: 忽略插件
         SkipPluginException: 忽略插件
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     try:
         # 从数据库或缓存中获取 bot 信息
@@ -46,7 +46,7 @@ async def auth_bot(plugin: PluginInfo, bot_id: str):
             )
     finally:
         # 记录执行时间
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的检查
             logger.warning(
                 f"auth_bot 耗时: {elapsed:.3f}s, "

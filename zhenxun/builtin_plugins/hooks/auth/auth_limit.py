@@ -54,7 +54,7 @@ class LimitManager:
     @classmethod
     async def init_limit(cls):
         """初始化限制"""
-        cls.last_update_time = time.time()
+        cls.last_update_time = time.perf_counter()
         try:
             await asyncio.wait_for(cls.update_limits(), timeout=DB_TIMEOUT_SECONDS * 2)
         except asyncio.TimeoutError:
@@ -69,7 +69,7 @@ class LimitManager:
 
         cls.is_updating = True
         try:
-            start_time = time.time()
+            start_time = time.perf_counter()
             try:
                 limit_list = await asyncio.wait_for(
                     PluginLimit.filter(status=True).all(), timeout=DB_TIMEOUT_SECONDS
@@ -88,8 +88,8 @@ class LimitManager:
             for limit in limit_list:
                 cls.add_limit(limit)
 
-            cls.last_update_time = time.time()
-            elapsed = time.time() - start_time
+            cls.last_update_time = time.perf_counter()
+            elapsed = time.perf_counter() - start_time
             if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的更新
                 logger.warning(f"更新限制信息耗时: {elapsed:.3f}s", LOGGER_COMMAND)
         finally:
@@ -153,7 +153,7 @@ class LimitManager:
         返回:
             list[PluginLimit]: 限制列表
         """
-        current_time = time.time()
+        current_time = time.perf_counter()
 
         # 检查缓存
         if module in cls.module_limit_cache:
@@ -163,12 +163,12 @@ class LimitManager:
 
         # 缓存不存在或已过期，从数据库查询
         try:
-            start_time = time.time()
+            start_time = time.perf_counter()
             limits = await asyncio.wait_for(
                 PluginLimit.filter(module=module, status=True).all(),
                 timeout=DB_TIMEOUT_SECONDS,
             )
-            elapsed = time.time() - start_time
+            elapsed = time.perf_counter() - start_time
             if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的查询
                 logger.warning(
                     f"查询模块限制信息耗时: {elapsed:.3f}s, 模块: {module}",
@@ -202,11 +202,11 @@ class LimitManager:
         异常:
             IgnoredException: IgnoredException
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # 定期更新全局限制信息
         if (
-            time.time() - cls.last_update_time > cls.update_interval
+            time.perf_counter() - cls.last_update_time > cls.update_interval
             and not cls.is_updating
         ):
             # 使用异步任务更新，避免阻塞当前请求
@@ -228,7 +228,7 @@ class LimitManager:
                 await cls.__check(limit_model, user_id, group_id, channel_id)
         finally:
             # 记录总执行时间
-            elapsed = time.time() - start_time
+            elapsed = time.perf_counter() - start_time
             if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的检查
                 logger.warning(
                     f"限制检查耗时: {elapsed:.3f}s, 模块: {module}",

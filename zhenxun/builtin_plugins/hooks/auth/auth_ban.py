@@ -42,7 +42,7 @@ async def calculate_ban_time(ban_record: BanConsole | None) -> int:
     if ban_record.duration == -1:
         return -1
 
-    _time = time.time() - (ban_record.ban_time + ban_record.duration)
+    _time = time.perf_counter() - (ban_record.ban_time + ban_record.duration)
     if _time < 0:
         return int(abs(_time))
     await ban_record.delete()
@@ -50,80 +50,75 @@ async def calculate_ban_time(ban_record: BanConsole | None) -> int:
 
 
 async def is_ban(user_id: str | None, group_id: str | None) -> int:
-    """检查用户或群组是否被ban
+    """检查用户或群组是否被 ban。
+
+    会优先检查群组的 ban 状态，仅在群组未被 ban 时才继续检查用户 ban
 
     参数:
-        user_id: 用户ID
-        group_id: 群组ID
+        user_id: 用户 ID。
+        group_id: 群组 ID。
 
     返回:
-        int: ban的剩余时间，0表示未被ban
+        int: ban 的剩余时间，0 表示未被 ban，-1 表示永久 ban。
     """
     if not user_id and not group_id:
         return 0
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     ban_dao = DataAccess(BanConsole)
 
-    # 分别获取用户在群组中的ban记录和全局ban记录
+    # 分别获取用户在群组中的 ban 记录和全局 ban 记录
     group_user = None
     user = None
 
     try:
-        # 并行查询用户和群组的 ban 记录
-        tasks = []
-        if user_id and group_id:
-            tasks.append(ban_dao.safe_get_or_none(user_id=user_id, group_id=group_id))
-        if user_id:
-            tasks.append(
-                ban_dao.safe_get_or_none(user_id=user_id, group_id__isnull=True)
-            )
-
-        # 等待所有查询完成，添加超时控制
-        if tasks:
+        # 优先检查群组维度的 ban（群组 ban > 用户 ban）
+        if group_id:
             try:
-                ban_records = await asyncio.wait_for(
-                    asyncio.gather(*tasks), timeout=DB_TIMEOUT_SECONDS
+                group_user = await asyncio.wait_for(
+                    ban_dao.safe_get_or_none(
+                        user_id=user_id or None,
+                        group_id=group_id,
+                    ),
+                    timeout=DB_TIMEOUT_SECONDS,
                 )
-                if len(tasks) == 2:
-                    group_user, user = ban_records
-                elif user_id and group_id:
-                    group_user = ban_records[0]
-                else:
-                    user = ban_records[0]
             except asyncio.TimeoutError:
                 logger.error(
-                    f"查询ban记录超时: user_id={user_id}, group_id={group_id}",
+                    f"查询 群组 ban 记录超时: user_id={user_id}, group_id={group_id}",
                     LOGGER_COMMAND,
                 )
-                return 0
+                group_user = None
 
-        # 检查记录并计算ban时间
-        results = []
+        # 如果群组已经被 ban，直接根据群组记录计算剩余时间
         if group_user:
-            results.append(group_user)
-        if user:
-            results.append(user)
+            logger.debug(f"查询到的 群组 ban 记录: {group_user}", LOGGER_COMMAND)
+            return await calculate_ban_time(group_user)
 
-        # 如果没有找到记录，返回0
-        if not results:
+        # 群组未被 ban，再检查用户维度 ban（全局 ban）
+        if user_id:
+            try:
+                user = await asyncio.wait_for(
+                    ban_dao.safe_get_or_none(user_id=user_id, group_id__isnull=True),
+                    timeout=DB_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"查询 用户 ban 记录超时: user_id={user_id}, group_id={group_id}",
+                    LOGGER_COMMAND,
+                )
+                user = None
+
+        # 如果没有任何记录，返回 0
+        if not user:
             return 0
 
-        logger.debug(f"查询到的ban记录: {results}", LOGGER_COMMAND)
-        # 检查所有记录，找出最严格的ban（时间最长的）
-        max_ban_time: int = 0
-        for result in results:
-            if result.duration > 0 or result.duration == -1:
-                # 直接计算ban时间，避免再次查询数据库
-                ban_time = await calculate_ban_time(result)
-                if ban_time == -1 or ban_time > max_ban_time:
-                    max_ban_time = ban_time
-
-        return max_ban_time
+        logger.debug(f"查询到的用户 ban 记录: {user}", LOGGER_COMMAND)
+        # 直接计算用户 ban 剩余时间
+        return await calculate_ban_time(user)
     finally:
         # 记录执行时间
-        elapsed = time.time() - start_time
-        if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的检查
+        elapsed = time.perf_counter() - start_time
+        if elapsed > WARNING_THRESHOLD:  # 记录耗时超过阈值的检查
             logger.warning(
                 f"is_ban 耗时: {elapsed:.3f}s",
                 LOGGER_COMMAND,
@@ -132,21 +127,26 @@ async def is_ban(user_id: str | None, group_id: str | None) -> int:
             )
 
 
-def check_plugin_type(matcher: Matcher) -> bool:
-    """判断插件类型是否是隐藏插件
+def is_hidden_plugin(matcher: Matcher) -> bool:
+    """判断插件是否为隐藏插件
 
     参数:
-        matcher: Matcher
+        matcher: 当前触发的 Matcher 实例。
 
     返回:
-        bool: 是否为隐藏插件
+        bool: 隐藏插件为 True
     """
-    if plugin := matcher.plugin:
-        if metadata := plugin.metadata:
-            extra = metadata.extra
-            if extra.get("plugin_type") in [PluginType.HIDDEN]:
-                return False
-    return True
+    plugin = matcher.plugin
+    if not plugin:
+        return False
+
+    metadata = plugin.metadata
+    if not metadata:
+        return False
+
+    extra = metadata.extra
+    # 使用字典查找并提前返回，避免多层嵌套判断带来的额外开销
+    return extra.get("plugin_type") in {PluginType.HIDDEN}
 
 
 def format_time(time_val: float) -> str:
@@ -183,13 +183,13 @@ async def group_handle(group_id: str) -> None:
     异常:
         SkipPluginException: 群组处于黑名单
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     try:
         if await is_ban(None, group_id):
             raise SkipPluginException("群组处于黑名单中...")
     finally:
         # 记录执行时间
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的检查
             logger.warning(
                 f"group_handle 耗时: {elapsed:.3f}s",
@@ -209,7 +209,7 @@ async def user_handle(plugin: PluginInfo, entity: EntityIDs, session: Uninfo) ->
     异常:
         SkipPluginException: 用户处于黑名单
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     try:
         ban_result = Config.get_config("hook", "BAN_RESULT")
         time_val = await is_ban(entity.user_id, entity.group_id)
@@ -240,7 +240,7 @@ async def user_handle(plugin: PluginInfo, entity: EntityIDs, session: Uninfo) ->
         raise SkipPluginException("用户处于黑名单中...")
     finally:
         # 记录执行时间
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的检查
             logger.warning(
                 f"user_handle 耗时: {elapsed:.3f}s",
@@ -259,9 +259,9 @@ async def auth_ban(
         bot: Bot
         session: Uninfo
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     try:
-        if not check_plugin_type(matcher):
+        if is_hidden_plugin(matcher):
             return
         if not matcher.plugin_name:
             return
@@ -288,7 +288,7 @@ async def auth_ban(
                 # 超时时不阻塞，继续执行
     finally:
         # 记录总执行时间
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的检查
             logger.warning(
                 f"auth_ban 总耗时: {elapsed:.3f}s, plugin={matcher.plugin_name}",

@@ -27,7 +27,7 @@ class GroupCheck:
         self.group_id = group.group_id
 
     async def check(self):
-        start_time = time.time()
+        start_time = time.perf_counter()
         try:
             # 检查超级用户禁用
             if (
@@ -89,7 +89,7 @@ class GroupCheck:
                 )
         finally:
             # 记录执行时间
-            elapsed = time.time() - start_time
+            elapsed = time.perf_counter() - start_time
             if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的检查
                 logger.warning(
                     f"GroupCheck.check 耗时: {elapsed:.3f}s, 群组: {self.group_id}",
@@ -137,7 +137,7 @@ class PluginCheck:
         异常:
             IgnoredException: 忽略插件
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         try:
             if plugin.status or plugin.block_type != BlockType.ALL:
                 return
@@ -159,7 +159,7 @@ class PluginCheck:
             )
         finally:
             # 记录执行时间
-            elapsed = time.time() - start_time
+            elapsed = time.perf_counter() - start_time
             if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的检查
                 logger.warning(
                     f"PluginCheck.check_global 耗时: {elapsed:.3f}s", LOGGER_COMMAND
@@ -176,7 +176,7 @@ async def auth_plugin(
         session: Uninfo
         event: Event
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     try:
         is_poke_event = is_poke(event)
         user_check = PluginCheck(group, session, is_poke_event)
@@ -197,7 +197,7 @@ async def auth_plugin(
 
     finally:
         # 记录总执行时间
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         if elapsed > WARNING_THRESHOLD:  # 记录耗时超过500ms的检查
             logger.warning(
                 f"auth_plugin 总耗时: {elapsed:.3f}s, 模块: {plugin.module}",
