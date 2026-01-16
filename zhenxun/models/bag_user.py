@@ -146,15 +146,3 @@ class BagUser(Model):
             await user.save(update_fields=["property"])
             return True
         return False
-
-    @classmethod
-    async def _run_script(cls):
-        return [
-            # 删除 props 字段
-            "ALTER TABLE bag_users DROP props;",
-            # 将user_qq改为user_id
-            "ALTER TABLE bag_users RENAME COLUMN user_qq TO user_id;",
-            "ALTER TABLE bag_users ALTER COLUMN user_id TYPE character varying(255);",
-            # 将user_id字段类型改为character varying(255)
-            "ALTER TABLE bag_users ALTER COLUMN group_id TYPE character varying(255);",
-        ]

@@ -209,10 +209,3 @@ class BanConsole(Model):
             return await cls.safe_get_or_none(id=id)
         return await cls._get_data(user_id, group_id)
 
-    @classmethod
-    async def _run_script(cls):
-        return [
-            "CREATE INDEX idx_ban_console_user_id ON ban_console(user_id);",
-            "CREATE INDEX idx_ban_console_group_id ON ban_console(group_id);",
-            "ALTER TABLE ban_console ADD COLUMN ban_reason TEXT DEFAULT NULL;",
-        ]

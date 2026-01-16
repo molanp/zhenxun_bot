@@ -113,8 +113,7 @@ class DataAccess(Generic[T]):
             # 多字段主键
             key_parts = []
             for field in self.key_field:
-                value = kwargs.get(field, None)
-                if value is not None:
+                if value := kwargs.get(field):
                     key_parts.append(str(value))
             return COMPOSITE_KEY_SEPARATOR.join(key_parts) if key_parts else None
         elif self.key_field in kwargs:
@@ -180,7 +179,10 @@ class DataAccess(Generic[T]):
         # 存入缓存
         try:
             # 生成缓存键
-            cache_key = self._build_cache_key_for_item(data)
+            if not data:
+                cache_key = self._build_cache_key_from_kwargs(**kwargs)
+            else:
+                cache_key = self._build_cache_key_for_item(data)
             if cache_key is not None:
                 # 存入缓存
                 await self.cache.set(cache_key, data)
@@ -291,14 +293,12 @@ class DataAccess(Generic[T]):
             # 构建键参数列表
             key_parts = []
             for field in self.key_field:
-                value = getattr(data, field, None)
-                if value is not None:
+                if value := getattr(data, field, None):
                     key_parts.append(value)
 
             # 如果没有有效参数，返回None
             return COMPOSITE_KEY_SEPARATOR.join(key_parts) if key_parts else None
-        elif hasattr(data, self.key_field):
-            value = getattr(data, self.key_field, None)
+        elif value := getattr(data, self.key_field, None):
             return str(value) if value is not None else None
 
         return None
@@ -331,8 +331,7 @@ class DataAccess(Generic[T]):
 
         # 收集所有字段值
         for field in field_names:
-            value = getattr(item, field, None)
-            if value is not None:
+            if value := getattr(item, field, None):
                 key_parts.append(value)
 
         return COMPOSITE_KEY_SEPARATOR.join(key_parts)

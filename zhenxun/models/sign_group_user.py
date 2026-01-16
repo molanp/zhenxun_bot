@@ -55,10 +55,7 @@ class SignGroupUser(Model):
         参数:
             :param group_id: 群号
         """
-        if group_id:
-            query = cls.filter(group_id=str(group_id))
-        else:
-            query = cls
+        query = cls.filter(group_id=str(group_id)) if group_id else cls
         value_list = await query.all().values_list("user_id", "group_id", "impression")  # type: ignore
         user_list = []
         group_list = []
@@ -69,14 +66,3 @@ class SignGroupUser(Model):
             impression_list.append(float(value[2]))
         return user_list, impression_list, group_list
 
-    @classmethod
-    async def _run_script(cls):
-        return [
-            # 将user_id改为user_id
-            "ALTER TABLE sign_group_users RENAME COLUMN user_qq TO user_id;",
-            "ALTER TABLE sign_group_users "
-            "ALTER COLUMN user_id TYPE character varying(255);",
-            # 将user_id字段类型改为character varying(255)
-            "ALTER TABLE sign_group_users "
-            "ALTER COLUMN group_id TYPE character varying(255);",
-        ]

@@ -170,9 +170,3 @@ class FgRequest(Model):
                         approve=handle_type == RequestHandleType.APPROVE,
                     )
         return req
-
-    @classmethod
-    async def _run_script(cls):
-        return [
-            SqlUtils.add_column("fg_request", "message_ids", "character varying(255)")
-        ]

@@ -25,10 +25,3 @@ class TaskInfo(Model):
         table = "task_info"
         table_description = "被动技能基本信息"
 
-    @classmethod
-    async def _run_script(cls):
-        return [
-            "ALTER TABLE task_info ADD default_status boolean DEFAULT true;",
-            "ALTER TABLE task_info ADD load_status boolean DEFAULT false;",
-            # 默认状态
-        ]

@@ -534,14 +534,3 @@ class GroupConsole(Model):
 
         # 更新缓存
         await cls._update_cache(group)
-
-    @classmethod
-    def _run_script(cls):
-        return [
-            "ALTER TABLE group_console ADD superuser_block_plugin"
-            " character varying(255) NOT NULL DEFAULT '';",
-            "ALTER TABLE group_console ADD superuser_block_task"
-            " character varying(255) NOT NULL DEFAULT '';",
-            "CREATE INDEX idx_group_console_group_id ON group_console(group_id);",
-            "CREATE INDEX idx_group_console_group_null_channel ON group_console(group_id) WHERE channel_id IS NULL;",  # 单独创建channel为空的索引 # noqa: E501
-        ]

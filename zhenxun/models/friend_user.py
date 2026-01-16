@@ -72,12 +72,3 @@ class FriendUser(Model):
             user_id=user_id,
             defaults=defaults,
         )
-
-    @classmethod
-    def _run_script(cls):
-        return [
-            "ALTER TABLE friend_users "
-            "ALTER COLUMN user_id TYPE character varying(255);",
-            "ALTER TABLE friend_users "
-            "ADD COLUMN platform character varying(255) default 'qq';",
-        ]

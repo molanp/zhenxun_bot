@@ -96,21 +96,3 @@ class GroupInfoUser(Model):
                 return user.nickname
         return ""
 
-    @classmethod
-    async def _run_script(cls):
-        return [
-            # 允许 user_join_time 为空
-            "alter table group_info_users alter user_join_time drop not null;",
-            "ALTER TABLE group_info_users "
-            "ALTER COLUMN user_join_time TYPE timestamp with time zone "
-            "USING user_join_time::timestamp with time zone;",
-            # 将user_id改为user_id
-            "ALTER TABLE group_info_users RENAME COLUMN user_qq TO user_id;",
-            "ALTER TABLE group_info_users "
-            "ALTER COLUMN user_id TYPE character varying(255);",
-            # 将user_id字段类型改为character varying(255)
-            "ALTER TABLE group_info_users "
-            "ALTER COLUMN group_id TYPE character varying(255);",
-            "ALTER TABLE group_info_users "
-            "ADD COLUMN platform character varying(255) default 'qq';",
-        ]

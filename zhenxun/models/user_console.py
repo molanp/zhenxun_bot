@@ -199,10 +199,3 @@ class UserConsole(Model):
         if goods := await GoodsInfo.get_or_none(goods_name=name):
             return await cls.use_props(user_id, goods.uuid, num, platform)
         raise GoodsNotFound("未找到商品...")
-
-    @classmethod
-    async def _run_script(cls):
-        return [
-            "CREATE INDEX idx_user_console_user_id ON user_console(user_id);",
-            "CREATE INDEX idx_user_console_uid ON user_console(uid);",
-        ]

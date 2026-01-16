@@ -106,15 +106,3 @@ class GroupInfo(Model):
         elif "module," in group.block_plugin:
             group.block_plugin = group.block_plugin.replace(f"{module},", "")
         await group.save(update_fields=["block_plugin", "superuser_block_plugin"])
-
-    @classmethod
-    def _run_script(cls):
-        return [
-            "ALTER TABLE group_info ADD group_flag Integer NOT NULL DEFAULT 0;",
-            # group_info表添加一个group_flag
-            "ALTER TABLE group_info ALTER COLUMN group_id TYPE character varying(255);",
-            "ALTER TABLE group_info ADD block_plugin Text NOT NULL DEFAULT '';",
-            "ALTER TABLE group_info ADD block_task Text NOT NULL DEFAULT '';",
-            "ALTER TABLE group_info ADD platform character varying(255) NOT NULL"
-            " DEFAULT 'qq';",
-        ]

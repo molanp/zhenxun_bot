@@ -101,12 +101,3 @@ class PluginInfo(Model):
                 load_status=load_status, plugin_type__not=PluginType.PARENT, **kwargs
             ).all()
         return await cls.filter(load_status=load_status, **kwargs).all()
-
-    @classmethod
-    async def _run_script(cls):
-        return [
-            "ALTER TABLE plugin_info ADD COLUMN parent character varying(255);",
-            "ALTER TABLE plugin_info ADD COLUMN is_show boolean DEFAULT true;",
-            "ALTER TABLE plugin_info ADD COLUMN ignore_prompt boolean DEFAULT false;",
-            "ALTER TABLE plugin_info ADD COLUMN impression float DEFAULT 0;",
-        ]
