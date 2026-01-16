@@ -15,7 +15,7 @@ from .auth_checker import LimitManager, auth
 # # 权限检测
 @run_preprocessor
 async def _(matcher: Matcher, event: Event, bot: Bot, session: Uninfo, message: UniMsg):
-    start_time = time.time()
+    start_time = time.perf_counter()
     await auth(
         matcher,
         event,
@@ -23,7 +23,7 @@ async def _(matcher: Matcher, event: Event, bot: Bot, session: Uninfo, message: 
         session,
         message,
     )
-    logger.debug(f"权限检测耗时：{time.time() - start_time}秒", LOGGER_COMMAND)
+    logger.debug(f"权限检测耗时：{time.perf_counter() - start_time}秒", LOGGER_COMMAND)
 
 
 # 解除命令block阻塞

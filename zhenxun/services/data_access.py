@@ -142,7 +142,9 @@ class DataAccess(Generic[T]):
         if isinstance(self.key_field, tuple):
             # 多字段主键
             key_parts = []
-            key_parts.extend(str(kwargs.get(field, "")) for field in self.key_field)
+            for field in self.key_field:
+                if value := kwargs.get(field):
+                    key_parts.append(str(value))
             return COMPOSITE_KEY_SEPARATOR.join(key_parts) if key_parts else None
         elif self.key_field in kwargs:
             # 单字段主键
@@ -190,7 +192,7 @@ class DataAccess(Generic[T]):
                     # 空结果缓存命中
                     self._cache_stats[self.cache_type]["null_hits"] += 1
                     logger.debug(
-                        f"{self.model_cls.__name__} 从缓存获取到空结果: {cache_key}"
+                        f"{self.model_cls.__name__} 从缓存获取到空结果: {cache_key}, kwargs: {kwargs}"
                     )
                     if allow_not_exist:
                         logger.debug(
@@ -208,7 +210,10 @@ class DataAccess(Generic[T]):
                 else:
                     # 缓存未命中
                     self._cache_stats[self.cache_type]["misses"] += 1
-                    logger.debug(f"{self.model_cls.__name__} 缓存未命中: {cache_key}")
+                    cache_status = "未命中" if allow_not_exist else "不允许为空"
+                    logger.debug(
+                        f"{self.model_cls.__name__} 缓存{cache_status}: {cache_key}"
+                    )
         except Exception as e:
             logger.error(f"{self.model_cls.__name__} 从缓存获取数据失败: {kwargs}", e=e)
 
@@ -354,8 +359,9 @@ class DataAccess(Generic[T]):
             # 构建键参数列表
             key_parts = []
             for field in self.key_field:
-                value = getattr(data, field, "")
-                key_parts.append(value if value is not None else "")
+                value = getattr(data, field, None)
+                if value is not None:
+                    key_parts.append(value)
 
             # 如果没有有效参数，返回None
             return COMPOSITE_KEY_SEPARATOR.join(key_parts) if key_parts else None
@@ -393,8 +399,9 @@ class DataAccess(Generic[T]):
 
         # 收集所有字段值
         for field in field_names:
-            value = getattr(item, field, "")
-            key_parts.append(value if value is not None else "")
+            value = getattr(item, field, None)
+            if value is not None:
+                key_parts.append(value)
 
         return COMPOSITE_KEY_SEPARATOR.join(key_parts)
 

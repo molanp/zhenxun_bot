@@ -311,7 +311,7 @@ async def auth(
         session: Uninfo
         message: UniMsg
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     cost_gold = 0
     ignore_flag = False
     entity = get_entity_ids(session)
@@ -319,7 +319,7 @@ async def auth(
 
     # 用于记录各个 hook 的执行时间
     hook_times = {}
-    hooks_time = 0  # 初始化 hooks_time 变量
+    hooks_start = time.perf_counter()
 
     # 记录是否已进入 hooks 区域（用于 finally 中释放）
     entered_hooks = False
@@ -373,9 +373,6 @@ async def auth(
                 name="get_group",
             )
 
-        # 并行执行所有 hook 检查，并记录执行时间
-        hooks_start = time.time()
-
         # 创建所有 hook 任务
         hook_tasks = [
             time_hook(auth_ban(matcher, bot, session, plugin), "auth_ban", hook_times),
@@ -407,8 +404,6 @@ async def auth(
             )
             # 不抛出异常，允许继续执行
 
-        hooks_time = time.time() - hooks_start
-
     except SkipPluginException as e:
         LimitManager.unblock(module, entity.user_id, entity.group_id, entity.channel_id)
         logger.info(str(e), LOGGER_COMMAND, session=session)
@@ -418,6 +413,7 @@ async def auth(
     except PermissionExemption as e:
         logger.info(str(e), LOGGER_COMMAND, session=session)
     finally:
+        hooks_time = time.perf_counter() - hooks_start
         # 如果进入过 hooks 区域，确保释放信号量（即使上层处理抛出了异常）
         if entered_hooks:
             try:
@@ -430,20 +426,20 @@ async def auth(
                 )
     # 扣除金币
     if not ignore_flag and cost_gold > 0:
-        gold_start = time.time()
+        gold_start = time.perf_counter()
         try:
             await with_timeout(
                 reduce_gold(entity.user_id, module, cost_gold, session),
                 name="reduce_gold",
             )
-            hook_times["reduce_gold"] = f"{time.time() - gold_start:.3f}s"
+            hook_times["reduce_gold"] = f"{time.perf_counter() - gold_start:.3f}s"
         except asyncio.TimeoutError:
             logger.error(
                 f"扣除金币超时，模块: {module}", LOGGER_COMMAND, session=session
             )
 
     # 记录总执行时间
-    total_time = time.time() - start_time
+    total_time = time.perf_counter() - start_time
     if total_time > WARNING_THRESHOLD:  # 如果总时间超过500ms，记录详细信息
         logger.warning(
             f"权限检查耗时过长: {total_time:.3f}s, 模块: {module}, "
