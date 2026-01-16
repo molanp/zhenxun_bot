@@ -32,92 +32,32 @@ from .auth.exception import (
     PermissionExemption,
     SkipPluginException,
 )
-from .auth.utils import base_config
 
 # 超时设置（秒）
 TIMEOUT_SECONDS = 5.0
-# 熔断计数器
-CIRCUIT_BREAKERS = {
-    "auth_ban": {"failures": 0, "threshold": 3, "active": False, "reset_time": 0},
-    "auth_bot": {"failures": 0, "threshold": 3, "active": False, "reset_time": 0},
-    "auth_group": {"failures": 0, "threshold": 3, "active": False, "reset_time": 0},
-    "auth_admin": {"failures": 0, "threshold": 3, "active": False, "reset_time": 0},
-    "auth_plugin": {"failures": 0, "threshold": 3, "active": False, "reset_time": 0},
-    "auth_limit": {"failures": 0, "threshold": 3, "active": False, "reset_time": 0},
-}
-# 熔断重置时间（秒）
-CIRCUIT_RESET_TIME = 300  # 5分钟
-
-# 并发控制：限制同时进入 hooks 并行检查的协程数
-
-# 默认为 6，可通过环境变量 AUTH_HOOKS_CONCURRENCY_LIMIT 调整
-HOOKS_CONCURRENCY_LIMIT = base_config.get("AUTH_HOOKS_CONCURRENCY_LIMIT")
-
-# 全局信号量与计数器
-HOOKS_SEMAPHORE = asyncio.Semaphore(HOOKS_CONCURRENCY_LIMIT)
-HOOKS_ACTIVE_COUNT = 0
-HOOKS_ACTIVE_LOCK = asyncio.Lock()
 
 
-# 超时装饰器
+# 简单超时封装：只做一次调用，不做熔断/重试
 async def with_timeout(coro, timeout=TIMEOUT_SECONDS, name=None):
-    """带超时控制的协程执行
+    """带超时控制的协程执行（单次）。
+
+    仅包装 asyncio.wait_for，在超时时打日志并抛出异常，不做熔断和重试逻辑。
 
     参数:
-        coro: 要执行的协程
-        timeout: 超时时间（秒）
-        name: 操作名称，用于日志记录
+        coro: 要执行的协程。
+        timeout: 超时时间（秒）。
+        name: 操作名称，用于日志记录。
 
     返回:
-        协程的返回值，或者在超时时抛出 TimeoutError
+        协程的返回值；超时时抛出 TimeoutError。
     """
     try:
         return await asyncio.wait_for(coro, timeout=timeout)
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as e:
         if name:
-            logger.error(f"{name} 操作超时 (>{timeout}s)", LOGGER_COMMAND)
-            # 更新熔断计数器
-            if name in CIRCUIT_BREAKERS:
-                CIRCUIT_BREAKERS[name]["failures"] += 1
-                if (
-                    CIRCUIT_BREAKERS[name]["failures"]
-                    >= CIRCUIT_BREAKERS[name]["threshold"]
-                    and not CIRCUIT_BREAKERS[name]["active"]
-                ):
-                    CIRCUIT_BREAKERS[name]["active"] = True
-                    CIRCUIT_BREAKERS[name]["reset_time"] = (
-                        time.perf_counter() + CIRCUIT_RESET_TIME
-                    )
-                    logger.warning(
-                        f"{name} 熔断器已激活，将在 {CIRCUIT_RESET_TIME} 秒后重置",
-                        LOGGER_COMMAND,
-                    )
+            logger.error(f"{name} 操作超时 (>{timeout}s)", LOGGER_COMMAND, e=e)
         raise
 
-
-# 检查熔断状态
-def check_circuit_breaker(name):
-    """检查熔断器状态
-
-    参数:
-        name: 操作名称
-
-    返回:
-        bool: 是否已熔断
-    """
-    if name not in CIRCUIT_BREAKERS:
-        return False
-
-    # 检查是否需要重置熔断器
-    if (
-        CIRCUIT_BREAKERS[name]["active"]
-        and time.perf_counter() > CIRCUIT_BREAKERS[name]["reset_time"]
-    ):
-        CIRCUIT_BREAKERS[name]["active"] = False
-        CIRCUIT_BREAKERS[name]["failures"] = 0
-        logger.info(f"{name} 熔断器已重置", LOGGER_COMMAND)
-
-    return CIRCUIT_BREAKERS[name]["active"]
 
 
 async def get_plugin_and_user(
@@ -152,23 +92,11 @@ async def get_plugin_and_user(
             asyncio.gather(plugin_task, user_task), name="get_plugin_and_user"
         )
     except asyncio.TimeoutError:
-        # 如果并行查询超时，尝试串行查询
-        logger.warning("并行查询超时，尝试串行查询", LOGGER_COMMAND)
-        plugin = await with_timeout(
-            plugin_dao.safe_get_or_none(module=module), name="get_plugin"
-        )
-        user = await with_timeout(
-            user_dao.safe_get_or_none(user_id=user_id), name="get_user"
-        )
-    except IntegrityError:
-        await asyncio.sleep(0.5)
-        plugin_task = plugin_dao.safe_get_or_none(module=module)
-        user_task = user_dao.get_by_func_or_none(
-            UserConsole.get_user, False, user_id=user_id
-        )
-        plugin, user = await with_timeout(
-            asyncio.gather(plugin_task, user_task), name="get_plugin_and_user"
-        )
+        # 超时直接抛出，由上层统一处理
+        raise
+    except IntegrityError as e:
+        # 数据竞争时直接提示跳过本次权限检查，避免多次重试
+        raise PermissionExemption("用户数据存在竞争，已跳过该次权限检查...") from e
 
     if not plugin:
         raise PermissionExemption(f"插件:{module} 数据不存在，已跳过权限检查...")
@@ -256,43 +184,13 @@ async def reduce_gold(user_id: str, module: str, cost_gold: int, session: Uninfo
 async def time_hook(coro, name, time_dict):
     start = time.perf_counter()
     try:
-        # 检查熔断状态
-        if check_circuit_breaker(name):
-            logger.info(f"{name} 熔断器激活中，跳过执行", LOGGER_COMMAND)
-            time_dict[name] = "熔断跳过"
-            return
-
-        # 添加超时控制
+        # 添加超时控制（单次执行）
         return await with_timeout(coro, name=name)
     except asyncio.TimeoutError:
         time_dict[name] = f"超时 (>{TIMEOUT_SECONDS}s)"
     finally:
         if name not in time_dict:
             time_dict[name] = f"{time.perf_counter() - start:.3f}s"
-
-
-async def _enter_hooks_section():
-    """尝试获取全局信号量并更新计数器，超时则抛出 PermissionExemption。"""
-    global HOOKS_ACTIVE_COUNT
-    # 队列模式：如果达到上限，协程将排队等待直到获取到信号量
-    await HOOKS_SEMAPHORE.acquire()
-    async with HOOKS_ACTIVE_LOCK:
-        HOOKS_ACTIVE_COUNT += 1
-        logger.debug(f"当前并发权限检查数量: {HOOKS_ACTIVE_COUNT}", LOGGER_COMMAND)
-
-
-async def _leave_hooks_section():
-    """释放信号量并更新计数器。"""
-    global HOOKS_ACTIVE_COUNT
-    from contextlib import suppress
-
-    with suppress(Exception):
-        HOOKS_SEMAPHORE.release()
-    async with HOOKS_ACTIVE_LOCK:
-        HOOKS_ACTIVE_COUNT -= 1
-        # 保证计数不为负
-        HOOKS_ACTIVE_COUNT = max(HOOKS_ACTIVE_COUNT, 0)
-        logger.debug(f"当前并发权限检查数量: {HOOKS_ACTIVE_COUNT}", LOGGER_COMMAND)
 
 
 async def auth(
@@ -321,9 +219,6 @@ async def auth(
     hook_times = {}
     hooks_start = time.perf_counter()
 
-    # 记录是否已进入 hooks 区域（用于 finally 中释放）
-    entered_hooks = False
-
     try:
         if not module:
             raise PermissionExemption("Matcher插件名称不存在...")
@@ -337,17 +232,13 @@ async def auth(
             hook_times["get_plugin_user"] = (
                 f"{time.perf_counter() - plugin_user_start:.3f}s"
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             logger.error(
                 f"获取插件和用户数据超时，模块: {module}",
                 LOGGER_COMMAND,
                 session=session,
             )
-            raise PermissionExemption("获取插件和用户数据超时，请稍后再试...")
-
-        # 进入 hooks 并行检查区域（会在高并发时排队）
-        await _enter_hooks_section()
-        entered_hooks = True
+            raise PermissionExemption("获取插件和用户数据超时，请稍后再试...") from e
 
         # 获取插件费用
         cost_start = time.perf_counter()
@@ -416,16 +307,11 @@ async def auth(
         logger.info(str(e), LOGGER_COMMAND, session=session)
     finally:
         hooks_time = time.perf_counter() - hooks_start
-        # 如果进入过 hooks 区域，确保释放信号量（即使上层处理抛出了异常）
-        if entered_hooks:
-            try:
-                await _leave_hooks_section()
-            except Exception:
-                logger.error(
-                    "释放 hooks 信号量时出错",
-                    LOGGER_COMMAND,
-                    session=session,
-                )
+        logger.debug(
+            f"hooks gather 实际耗时: {hooks_time:.3f}s, 详情: {hook_times}",
+            LOGGER_COMMAND,
+            session=session,
+        )
     # 扣除金币
     if not ignore_flag and cost_gold > 0:
         gold_start = time.perf_counter()

@@ -41,8 +41,8 @@ class DataAccess(Generic[T]):
 
     # 添加缓存统计信息
     _cache_stats: ClassVar[dict] = {}
-    # 空结果标记
-    _MISS_HIT = "__MISS_HIT_PLACEHOLDER__"
+
+    _NULL_RESULT = "__NULL_RESULT_PLACEHOLDER__"
 
     def __init__(
         self, model_cls: type[T], key_field: str = "id", cache_type: str | None = None
@@ -114,14 +114,15 @@ class DataAccess(Generic[T]):
             key_parts = []
             for field in self.key_field:
                 if value := kwargs.get(field):
-                    key_parts.append(str(value))
+                    key_parts.append(f"{field}:{value}")
             return COMPOSITE_KEY_SEPARATOR.join(key_parts) if key_parts else None
         elif self.key_field in kwargs:
             # 单字段主键
-            return str(kwargs[self.key_field])
+            value = kwargs[self.key_field]
+            return f"{self.key_field}:{value}"
         return None
 
-    async def _get_with_cache(self, db_query_func, *args, **kwargs) -> T | None:
+    async def _with_cache(self, db_query_func, *args, **kwargs) -> Any:
         """带缓存的通用获取方法
 
         参数:
@@ -142,25 +143,31 @@ class DataAccess(Generic[T]):
             )
 
         # 尝试从缓存获取
-        cache_key = None
-        try:
-            # 尝试构建缓存键
-            cache_key = self._build_cache_key_from_kwargs(**kwargs)
+        cache_key = self._build_cache_key_from_kwargs(**kwargs)
 
+        try:
             # 如果成功构建缓存键，尝试从缓存获取
             if cache_key is not None:
-                data = await self.cache.get(cache_key, self._MISS_HIT)
+                data = await self.cache.get(cache_key)
                 logger.debug(
                     f"{self.model_cls.__name__}  key: {cache_key}"
                     f" 从缓存获取到的数据 {type(data)}: {data}"
                 )
-                if data == self._MISS_HIT:
+                if not data:
                     # 缓存未命中
                     self._cache_stats[self.cache_type]["misses"] += 1
                     logger.debug(
                         f"{self.model_cls.__name__} 缓存未命中: {cache_key}"
                         f", kwargs: {kwargs}"
                     )
+                elif data == self._NULL_RESULT:
+                    # 缓存命中，但结果为空
+                    self._cache_stats[self.cache_type]["hits"] += 1
+                    logger.debug(
+                        f"{self.model_cls.__name__} 从缓存获取数据成功: {cache_key}"
+                        f", kwargs: {kwargs}"
+                    )
+                    return None
                 else:
                     # 缓存命中
                     self._cache_stats[self.cache_type]["hits"] += 1
@@ -179,13 +186,9 @@ class DataAccess(Generic[T]):
         # 存入缓存
         try:
             # 生成缓存键
-            if not data:
-                cache_key = self._build_cache_key_from_kwargs(**kwargs)
-            else:
-                cache_key = self._build_cache_key_for_item(data)
             if cache_key is not None:
                 # 存入缓存
-                await self.cache.set(cache_key, data)
+                await self.cache.set(cache_key, data or self._NULL_RESULT)
                 self._cache_stats[self.cache_type]["sets"] += 1
                 logger.debug(f"{self.model_cls.__name__} 数据已存入缓存: {cache_key}")
         except Exception as e:
@@ -205,7 +208,7 @@ class DataAccess(Generic[T]):
         返回:
             Optional[T]: 查询结果，如果不存在返回None
         """
-        return await self._get_with_cache(self.model_cls.get_or_none, *args, **kwargs)
+        return await self._with_cache(self.model_cls.get_or_none, *args, **kwargs)
 
     async def safe_get_or_none(
         self, allow_not_exist: bool = True, *args, **kwargs
@@ -220,9 +223,7 @@ class DataAccess(Generic[T]):
         返回:
             Optional[T]: 查询结果，如果不存在返回None
         """
-        return await self._get_with_cache(
-            self.model_cls.safe_get_or_none, *args, **kwargs
-        )
+        return await self._with_cache(self.model_cls.safe_get_or_none, *args, **kwargs)
 
     async def get_by_func_or_none(
         self, func, allow_not_exist: bool = True, *args, **kwargs
@@ -235,7 +236,7 @@ class DataAccess(Generic[T]):
             *args: 查询参数
             **kwargs: 查询参数
         """
-        return await self._get_with_cache(func, *args, **kwargs)
+        return await self._with_cache(func, *args, **kwargs)
 
     async def clear_cache(self, **kwargs) -> bool:
         """只清除缓存，不影响数据库数据
@@ -279,92 +280,6 @@ class DataAccess(Generic[T]):
             logger.error(f"清除{self.model_cls.__name__}缓存失败", e=e)
             return False
 
-    def _build_composite_key(self, data: T) -> str | None:
-        """构建复合缓存键
-
-        参数:
-            data: 数据对象
-
-        返回:
-            str | None: 构建的缓存键，如果无法构建则返回None
-        """
-        # 如果是元组，表示多个字段组成键
-        if isinstance(self.key_field, tuple):
-            # 构建键参数列表
-            key_parts = []
-            for field in self.key_field:
-                if value := getattr(data, field, None):
-                    key_parts.append(value)
-
-            # 如果没有有效参数，返回None
-            return COMPOSITE_KEY_SEPARATOR.join(key_parts) if key_parts else None
-        elif value := getattr(data, self.key_field, None):
-            return str(value) if value is not None else None
-
-        return None
-
-    def _build_cache_key_for_item(self, item: T) -> str | None:
-        """为数据项构建缓存键
-
-        参数:
-            item: 数据项
-
-        返回:
-            str | None: 缓存键，如果无法生成则返回None
-        """
-        # 如果没有缓存类型，返回None
-        if not self.cache_type:
-            return None
-
-        # 获取缓存类型的配置信息
-        cache_model = CacheRoot.get_model(self.cache_type)
-
-        if not cache_model.key_format:
-            # 常规处理，使用主键作为缓存键
-            return self._build_composite_key(item)
-        # 构建键参数字典
-        key_parts = []
-        # 从格式字符串中提取所需的字段名
-        import re
-
-        field_names = re.findall(r"{([^}]+)}", cache_model.key_format)
-
-        # 收集所有字段值
-        for field in field_names:
-            if value := getattr(item, field, None):
-                key_parts.append(value)
-
-        return COMPOSITE_KEY_SEPARATOR.join(key_parts)
-
-    async def _cache_items(self, data_list: list[T]) -> None:
-        """将数据列表存入缓存
-
-        参数:
-            data_list: 数据列表
-        """
-        if (
-            not data_list
-            or not self.cache_type
-            or cache_config.cache_mode == CacheMode.NONE
-        ):
-            return
-
-        try:
-            # 遍历数据列表，将每条数据存入缓存
-            cached_count = 0
-            for item in data_list:
-                cache_key = self._build_cache_key_for_item(item)
-                if cache_key is not None:
-                    await self.cache.set(cache_key, item)
-                    cached_count += 1
-                    self._cache_stats[self.cache_type]["sets"] += 1
-
-            logger.debug(
-                f"{self.model_cls.__name__} 批量缓存: {cached_count}/{len(data_list)}项"
-            )
-        except Exception as e:
-            logger.error(f"{self.model_cls.__name__} 批量缓存失败", e=e)
-
     async def filter(self, *args, **kwargs) -> list[T]:
         """筛选数据
 
@@ -377,13 +292,10 @@ class DataAccess(Generic[T]):
         """
         # 从数据库获取数据
         logger.debug(f"{self.model_cls.__name__} filter: 从数据库查询, 参数: {kwargs}")
-        data_list = await self.model_cls.filter(*args, **kwargs)
+        data_list = await self._with_cache(self.model_cls.filter, *args, **kwargs)
         logger.debug(
             f"{self.model_cls.__name__} filter: 查询结果数量: {len(data_list)}"
         )
-
-        # 将数据存入缓存
-        await self._cache_items(data_list)
 
         return data_list
 
@@ -398,9 +310,6 @@ class DataAccess(Generic[T]):
         data_list = await self.model_cls.all()
         logger.debug(f"{self.model_cls.__name__} all: 查询结果数量: {len(data_list)}")
 
-        # 将数据存入缓存
-        await self._cache_items(data_list)
-
         return data_list
 
     async def count(self, *args, **kwargs) -> int:
@@ -414,7 +323,7 @@ class DataAccess(Generic[T]):
             int: 数据数量
         """
         # 直接从数据库获取数量
-        return await self.model_cls.filter(*args, **kwargs).count()
+        return len(await self.filter(*args, **kwargs))
 
     async def exists(self, *args, **kwargs) -> bool:
         """判断数据是否存在
@@ -427,7 +336,7 @@ class DataAccess(Generic[T]):
             bool: 是否存在
         """
         # 直接从数据库判断是否存在
-        return await self.model_cls.filter(*args, **kwargs).exists()
+        return bool(await self.filter(*args, **kwargs))
 
     async def create(self, **kwargs) -> T:
         """创建数据
@@ -446,7 +355,7 @@ class DataAccess(Generic[T]):
         if self.cache_type and cache_config.cache_mode != CacheMode.NONE:
             try:
                 # 生成缓存键
-                cache_key = self._build_cache_key_for_item(data)
+                cache_key = self._build_cache_key_from_kwargs(**kwargs)
                 if cache_key is not None:
                     # 存入缓存
                     await self.cache.set(cache_key, data)
@@ -484,7 +393,7 @@ class DataAccess(Generic[T]):
         if self.cache_type and cache_config.cache_mode != CacheMode.NONE:
             try:
                 # 生成缓存键
-                cache_key = self._build_cache_key_for_item(data)
+                cache_key = self._build_cache_key_from_kwargs(**kwargs)
                 if cache_key is not None:
                     # 存入缓存
                     await self.cache.set(cache_key, data)
@@ -520,23 +429,6 @@ class DataAccess(Generic[T]):
                     logger.debug(
                         f"{self.model_cls.__name__} delete: 已删除缓存: {cache_key}"
                     )
-                else:
-                    # 否则需要先查询出要删除的数据，然后删除对应的缓存
-                    items = await self.model_cls.filter(*args, **kwargs)
-                    logger.debug(
-                        f"{self.model_cls.__name__} delete:"
-                        f" 查询到 {len(items)} 条要删除的数据"
-                    )
-                    for item in items:
-                        item_cache_key = self._build_cache_key_for_item(item)
-                        if item_cache_key is not None:
-                            await self.cache.delete(item_cache_key)
-                            self._cache_stats[self.cache_type]["deletes"] += 1
-                    if items:
-                        logger.debug(
-                            f"{self.model_cls.__name__} delete:"
-                            f" 已删除 {len(items)} 条数据的缓存"
-                        )
             except Exception as e:
                 logger.error(f"{self.model_cls.__name__} delete: 删除缓存失败", e=e)
 
@@ -546,19 +438,3 @@ class DataAccess(Generic[T]):
             f"{self.model_cls.__name__} delete: 已从数据库删除 {result} 条数据"
         )
         return result
-
-    def _generate_cache_key(self, data: T) -> str:
-        """根据数据对象生成缓存键
-
-        参数:
-            data: 数据对象
-
-        返回:
-            str: 缓存键
-        """
-        # 使用新方法构建复合键
-        if composite_key := self._build_composite_key(data):
-            return composite_key
-
-        # 如果无法生成复合键，生成一个唯一键
-        return f"object_{id(data)}"
