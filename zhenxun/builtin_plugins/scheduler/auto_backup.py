@@ -4,6 +4,7 @@ import shutil
 from nonebot_plugin_apscheduler import scheduler
 
 from zhenxun.configs.config import Config
+from zhenxun.services.data_access import DataAccess
 from zhenxun.services.log import logger
 
 Config.add_plugin_config(
@@ -24,6 +25,13 @@ Config.add_plugin_config(
     type=list[str],
 )
 
+# 缓存统计
+@scheduler.scheduled_job(
+    "cron",
+    minute=5,
+)
+async def _():
+    logger.info(f"缓存统计: {DataAccess.get_cache_stats()}", "缓存统计")
 
 # 自动备份
 @scheduler.scheduled_job(
