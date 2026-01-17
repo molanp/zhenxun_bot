@@ -30,31 +30,7 @@ from .auth.exception import (
     PermissionExemption,
     SkipPluginException,
 )
-
-# 超时设置（秒）
-TIMEOUT_SECONDS = 5.0
-
-
-# 简单超时封装：只做一次调用，不做熔断/重试
-async def with_timeout(coro, timeout=TIMEOUT_SECONDS, name=None):
-    """带超时控制的协程执行（单次）。
-
-    仅包装 asyncio.wait_for，在超时时打日志并抛出异常，不做熔断和重试逻辑。
-
-    参数:
-        coro: 要执行的协程。
-        timeout: 超时时间（秒）。
-        name: 操作名称，用于日志记录。
-
-    返回:
-        协程的返回值；超时时抛出 TimeoutError。
-    """
-    try:
-        return await asyncio.wait_for(coro, timeout=timeout)
-    except asyncio.TimeoutError as e:
-        if name:
-            logger.error(f"{name} 操作超时 (>{timeout}s)", LOGGER_COMMAND, e=e)
-        raise
+from .auth.utils import TIMEOUT_SECONDS, with_timeout
 
 
 async def get_plugin_and_user(

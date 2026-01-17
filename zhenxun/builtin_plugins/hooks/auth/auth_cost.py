@@ -3,7 +3,6 @@ import asyncio
 from nonebot.adapters import Bot
 from nonebot_plugin_uninfo import Uninfo
 
-from zhenxun.builtin_plugins.hooks.auth_checker import with_timeout
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.data_access import DataAccess
@@ -13,7 +12,7 @@ from zhenxun.utils.platform import PlatformUtils
 
 from .config import LOGGER_COMMAND
 from .exception import IsSuperuserException, SkipPluginException
-from .utils import send_message
+from .utils import send_message, with_timeout
 
 
 async def auth_cost(
