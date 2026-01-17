@@ -20,6 +20,7 @@ class LevelUser(Model):
         table = "level_users"
         table_description = "用户权限数据库"
         unique_together = ("user_id", "group_id")
+        indexes = [("user_id", "group_id")]  # noqa: RUF012
 
     cache_type = CacheType.LEVEL
     """缓存类型"""
@@ -124,3 +125,11 @@ class LevelUser(Model):
             return user.group_flag == 1
         return False
 
+    @classmethod
+    def _run_script(cls):
+        return [
+            """
+            CREATE INDEX idx_level_users_user_group
+            ON level_users (user_id, group_id);
+            """,
+        ]

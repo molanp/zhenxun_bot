@@ -43,6 +43,8 @@ class DataAccess(Generic[T]):
     _cache_stats: ClassVar[dict] = {}
 
     _NULL_RESULT = "__NULL_RESULT_PLACEHOLDER__"
+    _MISS_HIT = "__MISS_HIT_PLACEHOLDER__"
+
 
     def __init__(
         self, model_cls: type[T], key_field: str = "id", cache_type: str | None = None
@@ -114,6 +116,7 @@ class DataAccess(Generic[T]):
             key_parts = []
             for field in self.key_field:
                 if value := kwargs.get(field):
+                    # 防止缓存空键查询
                     key_parts.append(f"{field}:{value}")
             return COMPOSITE_KEY_SEPARATOR.join(key_parts) if key_parts else None
         elif self.key_field in kwargs:
@@ -148,12 +151,12 @@ class DataAccess(Generic[T]):
         try:
             # 如果成功构建缓存键，尝试从缓存获取
             if cache_key is not None:
-                data = await self.cache.get(cache_key)
+                data = await self.cache.get(cache_key, self._MISS_HIT)
                 logger.debug(
                     f"{self.model_cls.__name__}  key: {cache_key}"
                     f" 从缓存获取到的数据 {type(data)}: {data}"
                 )
-                if not data:
+                if data == self._MISS_HIT:
                     # 缓存未命中
                     self._cache_stats[self.cache_type]["misses"] += 1
                     logger.debug(

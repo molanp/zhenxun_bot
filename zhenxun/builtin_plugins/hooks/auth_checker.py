@@ -13,9 +13,7 @@ from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.data_access import DataAccess
 from zhenxun.services.log import logger
-from zhenxun.utils.enum import GoldHandle, PluginType
-from zhenxun.utils.exception import InsufficientGold
-from zhenxun.utils.platform import PlatformUtils
+from zhenxun.utils.enum import PluginType
 from zhenxun.utils.utils import get_entity_ids
 
 from .auth.auth_admin import auth_admin
@@ -57,7 +55,6 @@ async def with_timeout(coro, timeout=TIMEOUT_SECONDS, name=None):
         if name:
             logger.error(f"{name} 操作超时 (>{timeout}s)", LOGGER_COMMAND, e=e)
         raise
-
 
 
 async def get_plugin_and_user(
@@ -104,80 +101,11 @@ async def get_plugin_and_user(
         raise PermissionExemption(
             f"插件: {plugin.name}:{plugin.module} 为HIDDEN，已跳过权限检查..."
         )
-    user = None
-    try:
-        user = await user_dao.get_by_func_or_none(
-            UserConsole.get_user, False, user_id=user_id
-        )
-    except IntegrityError as e:
-        raise PermissionExemption("重复创建用户，已跳过该次权限检查...") from e
+
     if not user:
         raise PermissionExemption("用户数据不存在，已跳过权限检查...")
+
     return plugin, user
-
-
-async def get_plugin_cost(
-    bot: Bot, user: UserConsole, plugin: PluginInfo, session: Uninfo
-) -> int:
-    """获取插件费用
-
-    参数:
-        bot: Bot
-        user: 用户数据
-        plugin: 插件数据
-        session: Uninfo
-
-    异常:
-        IsSuperuserException: 超级用户
-        IsSuperuserException: 超级用户
-
-    返回:
-        int: 调用插件金币费用
-    """
-    cost_gold = await with_timeout(auth_cost(user, plugin, session), name="auth_cost")
-    if session.user.id in bot.config.superusers:
-        if plugin.plugin_type == PluginType.SUPERUSER:
-            raise IsSuperuserException()
-        if not plugin.limit_superuser:
-            raise IsSuperuserException()
-    return cost_gold
-
-
-async def reduce_gold(user_id: str, module: str, cost_gold: int, session: Uninfo):
-    """扣除用户金币
-
-    参数:
-        user_id: 用户id
-        module: 插件模块名称
-        cost_gold: 消耗金币
-        session: Uninfo
-    """
-    user_dao = DataAccess(UserConsole)
-    try:
-        await with_timeout(
-            UserConsole.reduce_gold(
-                user_id,
-                cost_gold,
-                GoldHandle.PLUGIN,
-                module,
-                PlatformUtils.get_platform(session),
-            ),
-            name="reduce_gold",
-        )
-    except InsufficientGold:
-        if u := await UserConsole.get_user(user_id):
-            u.gold = 0
-            await u.save(update_fields=["gold"])
-    except asyncio.TimeoutError:
-        logger.error(
-            f"扣除金币超时，用户: {user_id}, 金币: {cost_gold}",
-            LOGGER_COMMAND,
-            session=session,
-        )
-
-    # 清除缓存，使下次查询时从数据库获取最新数据
-    await user_dao.clear_cache(user_id=user_id)
-    logger.debug(f"调用功能花费金币: {cost_gold}", LOGGER_COMMAND, session=session)
 
 
 # 辅助函数，用于记录每个 hook 的执行时间
@@ -210,7 +138,6 @@ async def auth(
         message: UniMsg
     """
     start_time = time.perf_counter()
-    cost_gold = 0
     ignore_flag = False
     entity = get_entity_ids(session)
     module = matcher.plugin_name or ""
@@ -240,18 +167,20 @@ async def auth(
             )
             raise PermissionExemption("获取插件和用户数据超时，请稍后再试...") from e
 
-        # 获取插件费用
+        # 处理插件金币逻辑（检查与扣费合并）
         cost_start = time.perf_counter()
         try:
-            cost_gold = await with_timeout(
-                get_plugin_cost(bot, user, plugin, session), name="get_plugin_cost"
+            _ = await with_timeout(
+                auth_cost(bot, user, plugin, session), name="handle_cost"
             )
             hook_times["cost_gold"] = f"{time.perf_counter() - cost_start:.3f}s"
         except asyncio.TimeoutError:
             logger.error(
-                f"获取插件费用超时，模块: {module}", LOGGER_COMMAND, session=session
+                f"金币处理（检查/扣费）超时，模块: {module}",
+                LOGGER_COMMAND,
+                session=session,
             )
-            # 继续执行，不阻止权限检查
+            # 超时时不阻塞，允许继续执行
 
         # 执行 bot_filter
         bot_filter(session)
@@ -312,19 +241,6 @@ async def auth(
             LOGGER_COMMAND,
             session=session,
         )
-    # 扣除金币
-    if not ignore_flag and cost_gold > 0:
-        gold_start = time.perf_counter()
-        try:
-            await with_timeout(
-                reduce_gold(entity.user_id, module, cost_gold, session),
-                name="reduce_gold",
-            )
-            hook_times["reduce_gold"] = f"{time.perf_counter() - gold_start:.3f}s"
-        except asyncio.TimeoutError:
-            logger.error(
-                f"扣除金币超时，模块: {module}", LOGGER_COMMAND, session=session
-            )
 
     # 记录总执行时间
     total_time = time.perf_counter() - start_time

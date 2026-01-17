@@ -47,15 +47,11 @@ class UserConsole(Model):
         返回:
             UserConsole: UserConsole
         """
-        if not await cls.exists(user_id=user_id):
-            await cls.create(
-                user_id=user_id, platform=platform, uid=await cls.get_new_uid()
-            )
-        # user, _ = await UserConsole.get_or_create(
-        #     user_id=user_id,
-        #     defaults={"platform": platform, "uid": await cls.get_new_uid()},
-        # )
-        return await cls.get(user_id=user_id)
+        user, _ = await UserConsole.get_or_create(
+            user_id=user_id,
+            defaults={"platform": platform, "uid": await cls.get_new_uid()},
+        )
+        return user
 
     @classmethod
     async def get_new_uid(cls) -> int:
@@ -98,6 +94,7 @@ class UserConsole(Model):
         handle: GoldHandle,
         plugin_module: str,
         platform: str | None = None,
+        no_raise: bool = False,
     ):
         """消耗金币
 
@@ -106,7 +103,8 @@ class UserConsole(Model):
             gold: 金币
             handle: 金币处理
             plugin_name: 插件模块
-            platform: 平台.
+            platform: 平台
+            no_raise: 不抛出异常,金币不足会强制设为0
 
         异常:
             InsufficientGold: 金币不足
@@ -116,8 +114,12 @@ class UserConsole(Model):
             defaults={"platform": platform, "uid": await cls.get_new_uid()},
         )
         if user.gold < gold:
-            raise InsufficientGold()
-        user.gold -= gold
+            if not no_raise:
+                raise InsufficientGold()
+            gold = user.gold
+            user.gold = 0
+        else:
+            user.gold -= gold
         await user.save(update_fields=["gold"])
         await UserGoldLog.create(
             user_id=user_id, gold=gold, handle=handle, source=plugin_module
