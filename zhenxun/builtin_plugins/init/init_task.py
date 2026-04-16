@@ -91,7 +91,6 @@ async def to_db(
         await TaskInfo.filter(module__not_in=load_task).update(load_status=False)
 
 
-
 async def get_run_task(task: Task, *args, **kwargs):
     is_run = False
     if task.check:

@@ -8,7 +8,6 @@ from zhenxun.services.help_service import create_plugin_help_image
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.exception import EmptyError
-from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
 
 __plugin_meta__ = PluginMetadata(

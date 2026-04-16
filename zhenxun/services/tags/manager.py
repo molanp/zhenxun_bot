@@ -518,9 +518,9 @@ class TagManager:
                 all_groups = await PlatformUtils.get_group_list(bot)
                 return [str(g.group_id) for g in all_groups if g.group_id]
             else:
-                all_group_ids = await GroupConsole.filter(bot_id=bot.self_id if bot else None).values_list(
-                    "group_id", flat=True
-                )
+                all_group_ids = await GroupConsole.filter(
+                    bot_id=bot.self_id if bot else None
+                ).values_list("group_id", flat=True)
                 return [str(gid) for gid in all_group_ids]
 
         tag = await GroupTag.get_or_none(name=name).prefetch_related("groups")

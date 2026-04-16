@@ -111,7 +111,7 @@ async def create_help_img(
     bot_avatar_path = await avatar_service.get_avatar_path(platform, bot_id)
     bot_avatar_url = bot_avatar_path.as_uri() if bot_avatar_path else ""
 
-    categories_objects =[
+    categories_objects = [
         PluginMenuCategory(name=category["name"], items=category["items"])
         for category in categories_for_model
     ]
@@ -203,9 +203,7 @@ async def get_plugin_help(
                 {
                     "title": "功能简介",
                     "content": [
-                        format_usage_for_markdown(
-                            _plugin.metadata.description.strip()
-                        )
+                        format_usage_for_markdown(_plugin.metadata.description.strip())
                     ],
                     "is_admin": False,
                 }

@@ -92,9 +92,7 @@ class GroupCheck:
 
 
 class PluginCheck:
-    def __init__(
-        self, group: GroupConsole | None, session: Uninfo, is_poke: bool
-    ):
+    def __init__(self, group: GroupConsole | None, session: Uninfo, is_poke: bool):
         self.session = session
         self.is_poke = is_poke
         self.group_data = group
