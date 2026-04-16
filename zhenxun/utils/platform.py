@@ -404,6 +404,7 @@ class PlatformUtils:
             group_id = scene.id
             result_list.append(
                 GroupConsole(
+                    bot_id=bot.self_id,
                     group_id=scene.id,
                     group_name=scene.name,
                 )
@@ -412,6 +413,7 @@ class PlatformUtils:
                 if channel_list := await interface.get_scenes(parent_scene_id=group_id):
                     result_list.extend(
                         GroupConsole(
+                            bot_id=bot.self_id,
                             group_id=scene.id,
                             group_name=channel.name,
                             channel_id=channel.id,

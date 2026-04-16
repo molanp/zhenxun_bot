@@ -45,14 +45,15 @@ async def _(bot: Bot):
     if PlatformUtils.get_platform(bot) != "qq":
         return
 
-    logger.debug(f"更新Bot: {bot.self_id} 的群认证...", "群认证同步")
+    bot_id = bot.self_id
+    logger.debug(f"更新Bot: {bot_id} 的群认证...", "群认证同步")
 
     # 实际在用的群列表（当前 bot 连接可见的群）
     current_group_list, _ = await PlatformUtils.get_group_list(bot)
     current_group_ids = {g.group_id for g in current_group_list}
 
     # 数据库中已有的群记录
-    db_group_list: list[str] = await GroupConsole.all().values_list(
+    db_group_list: list[str] = await GroupConsole.filter(bot_id=bot_id).values_list(
         "group_id", flat=True
     )  # pyright: ignore[reportAssignmentType]
     db_group_ids = set(db_group_list)
@@ -68,30 +69,34 @@ async def _(bot: Bot):
         await GroupConsole.bulk_create(create_list, 10)
 
     if delete_ids := list(db_group_ids - current_group_ids):
-        deleted_count = await GroupConsole.filter(group_id__in=delete_ids).delete()
+        deleted_count = await GroupConsole.filter(
+            group_id__in=delete_ids, bot_id=bot_id
+        ).delete()
     else:
         deleted_count = 0
     logger.info(
-        f"更新Bot: {bot.self_id} 的群认证完成，共创建 {len(create_list)} 条数据，"
+        f"更新Bot: {bot_id} 的群认证完成，共创建 {len(create_list)} 条数据，"
         f"删除 {deleted_count} 条已退出群组的数据...",
         "群认证同步",
     )
 
     if Config.get_config("auto_clean", "CLEAN_CHAT_HISTORY"):
         # 清理已退出群组的聊天记录
+        job_id = f"clean_chat_history_{bot_id}"
         scheduler.add_job(
             clean_chat_history,
             "cron",
             hour=1,
             minute=0,
-            args=(current_group_list,),
-            id="clean_chat_history",
+            args=(current_group_list, bot_id),
+            id=job_id,
             replace_existing=True,
         )
 
 
 async def clean_chat_history(
     group_list: list[GroupConsole],
+    bot_id: str,
     max_delete: int = 2000,
 ):
     """清理已退出群组的聊天记录
@@ -107,7 +112,7 @@ async def clean_chat_history(
 
     # 只取最多 max_delete 条记录的 id，然后删除这些记录，避免一次删太多
     ids = (
-        await ChatHistory.filter(group_id__not_in=group_ids)
+        await ChatHistory.filter(group_id__not_in=group_ids, bot_id=bot_id)
         .limit(max_delete)
         .values_list("id", flat=True)
     )

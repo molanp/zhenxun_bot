@@ -56,6 +56,8 @@ def convert_module_format(data: str | list[str]) -> str | list[str]:
 class GroupConsole(Model):
     id = fields.IntField(pk=True, generated=True, auto_increment=True)
     """自增id"""
+    bot_id = fields.CharField(255, description="机器人id")
+    """机器人id"""
     group_id = fields.CharField(255, description="群组id")
     """群聊id"""
     channel_id = fields.CharField(255, null=True, description="频道id")
@@ -522,6 +524,8 @@ class GroupConsole(Model):
             " Text NOT NULL DEFAULT '';",
             "ALTER TABLE group_console ADD superuser_block_task"
             " Text NOT NULL DEFAULT '';",
+            "ALTER TABLE group_console ADD bot_id"
+            " VARCHAR(255) NOT NULL;"
             "CREATE INDEX idx_group_console_group_id ON group_console(group_id);",
             (
                 "CREATE INDEX idx_group_console_group_null_channel ON "
