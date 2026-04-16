@@ -17,6 +17,7 @@ class StatisticsManage:
         plugin_name: str | None,
         is_global: bool,
         search_type: str | None,
+        bot_id: str,
         user_id: str | None = None,
         group_id: str | None = None,
     ):
@@ -43,7 +44,7 @@ class StatisticsManage:
             title = f"{user.user_name if user else user_id} {day_type}功能调用统计"
         elif group_id:
             """查群组"""
-            group = await GroupConsole.get_group(group_id=group_id)
+            group = await GroupConsole.get_group(bot_id=bot_id, group_id=group_id)
             title = f"{group.group_name if group else group_id} {day_type}功能调用统计"
         else:
             title = "功能调用统计"

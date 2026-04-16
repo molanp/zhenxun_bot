@@ -5,6 +5,7 @@ from nonebot.adapters import Bot
 from tortoise import fields
 
 from zhenxun.configs.config import BotConfig
+from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.services.db_context import Model
 from zhenxun.services.log import logger
@@ -120,13 +121,16 @@ class FgRequest(Model):
             raise NotFoundError
         req.handle_type = handle_type
         await req.save(update_fields=["handle_type"])
-        if bot and handle_type not in [
-            RequestHandleType.IGNORE,
-            RequestHandleType.EXPIRE,
-        ]:
+        if bot and handle_type == RequestHandleType.APPROVE:
             if req.request_type == RequestType.FRIEND:
                 await bot.set_friend_add_request(
                     flag=req.flag, approve=handle_type == RequestHandleType.APPROVE
+                )
+                await FriendUser.update_or_create(
+                    bot_id=req.bot_id,
+                    user_id=req.user_id,
+                    user_name=req.nickname,
+                    platform=req.platform,
                 )
                 if (
                     handle_type == RequestHandleType.APPROVE
@@ -153,7 +157,10 @@ class FgRequest(Model):
                         )
             else:
                 await GroupConsole.update_or_create(
-                    group_id=req.group_id, defaults={"group_flag": 1}
+                    group_id=req.group_id,
+                    bot_id=req.bot_id,
+                    platform=req.platform,
+                    defaults={"group_flag": 1},
                 )
                 if req.flag == "0":
                     # 用户手动申请入群，创建群认证后提醒用户拉群

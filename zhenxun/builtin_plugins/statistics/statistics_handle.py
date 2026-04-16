@@ -161,7 +161,12 @@ async def _(
         """个人全局"""
         gid = None
     if result := await StatisticsManage.get_statistics(
-        plugin_name, arparma.find("global"), st, uid, gid
+        plugin_name=plugin_name,
+        is_global=arparma.find("global"),
+        search_type=st,
+        user_id=uid,
+        group_id=gid,
+        bot_id=session.bot_id,
     ):
         if isinstance(result, str):
             await MessageUtils.build_message(result).finish(reply_to=True)

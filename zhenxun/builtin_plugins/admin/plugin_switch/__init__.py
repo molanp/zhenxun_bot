@@ -131,7 +131,7 @@ async def get_target_groups(
         targets.update(str(group_id) for group_id in tag_groups)
 
     if all_scope:
-        all_groups, _ = await PlatformUtils.get_group_list(bot)
+        all_groups = await PlatformUtils.get_group_list(bot)
         targets.update(str(group.group_id) for group in all_groups if group.group_id)
 
     if not targets and session.group:
@@ -196,6 +196,7 @@ async def _handle_switch_command(
                 messages.append(
                     await PluginManager.set_all_plugin_status(
                         status=status,
+                        bot_id=bot.self_id,
                         is_default=default_status.result if is_superuser else False,
                         group_id=gid,
                         is_task=task.result,
@@ -207,6 +208,7 @@ async def _handle_switch_command(
         if is_superuser and not session.group:
             result = await PluginManager.set_all_plugin_status(
                 status=status,
+                bot_id=bot.self_id,
                 is_default=default_status.result,
                 group_id=None,
                 is_task=task.result,
@@ -233,7 +235,7 @@ async def _handle_switch_command(
         name_str = str(name)
         if is_superuser and default_status.result:
             result = await PluginManager.set_default_status(
-                name_str, status, is_task=task.result
+                plugin_name=name_str, status=status, is_task=task.result
             )
             messages.append(result)
             continue
@@ -245,7 +247,12 @@ async def _handle_switch_command(
             elif block_type_val in ["g", "group"]:
                 _type = BlockType.GROUP
             result = await PluginManager.superuser_set_status(
-                name_str, status, _type, None, is_task=task.result
+                plugin_name=name_str,
+                status=status,
+                block_type=_type,
+                bot=bot,
+                group_id=None,
+                is_task=task.result,
             )
             messages.append(result)
             continue
@@ -254,7 +261,12 @@ async def _handle_switch_command(
             if is_superuser and not session.group:
                 target_block_type = None if status else BlockType.ALL
                 result = await PluginManager.superuser_set_status(
-                    name_str, status, target_block_type, None, is_task=task.result
+                    plugin_name=name_str,
+                    status=status,
+                    block_type=target_block_type,
+                    bot=bot,
+                    group_id=None,
+                    is_task=task.result,
                 )
                 messages.append(result)
                 continue
@@ -417,7 +429,9 @@ async def _(
     if arparma.find("check") or arparma.find("open") or arparma.find("close"):
         return
 
-    image = await build_task(session.group.id if session.group else None)
+    image = await build_task(
+        bot_id=session.self_id, group_id=session.group.id if session.group else None
+    )
     if image:
         logger.info("查看群被动列表", arparma.header_result, session=session)
         await MessageUtils.build_message(image).finish(reply_to=True)

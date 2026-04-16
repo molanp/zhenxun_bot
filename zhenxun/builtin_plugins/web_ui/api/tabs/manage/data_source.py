@@ -33,10 +33,12 @@ class ApiDataSource:
         参数:
             group: UpdateGroup
         """
-        db_group = await GroupConsole.get_group_db(group.group_id) or GroupConsole(
-            group_id=group.group_id
-        )
-        task_list = await TaskInfo.all().values_list("module", flat=True)
+        raise NotImplementedError("尚未实现，需要 webui 返回 bot_id")
+        bot_id = group.self_id
+        db_group = await GroupConsole.get_group(
+            bot_id=bot_id, group_id=group.group_id
+        ) or GroupConsole(bot_id=bot_id, group_id=group.group_id)
+        task_list = await TaskInfo.filter().values_list("module", flat=True)
         db_group.level = group.level
         db_group.status = group.status
         if group.close_plugins:
@@ -59,6 +61,7 @@ class ApiDataSource:
         返回:
             ReqResult: 数据内容
         """
+        raise NotImplementedError("尚未实现，需要 webui 返回 bot_id")
         req_result = ReqResult()
         data_list = await FgRequest.filter(handle_type__isnull=True).all()
         for req in data_list:
@@ -106,7 +109,7 @@ class ApiDataSource:
             UserDetail | None: 详情数据
         """
         bot = nonebot.get_bot(bot_id)
-        friend_list, _ = await PlatformUtils.get_friend_list(bot)
+        friend_list = await PlatformUtils.get_friend_list(bot)
         fd = [x for x in friend_list if x.user_id == user_id]
         if not fd:
             return None
@@ -250,7 +253,8 @@ class ApiDataSource:
         返回:
             GroupDetail | None: 群组详情数据
         """
-        group = await GroupConsole.get_group_db(group_id=group_id)
+        raise NotImplementedError("尚未实现，需要 webui 返回 bot_id")
+        group = await GroupConsole.get_group(group_id=group_id)
         if not group:
             return None
         like_plugin = await cls.__get_group_detail_like_plugin(group_id)

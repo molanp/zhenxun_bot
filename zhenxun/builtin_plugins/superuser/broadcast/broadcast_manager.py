@@ -77,7 +77,7 @@ class BroadcastManager:
         cls._last_broadcast_msg_ids.clear()
 
     @classmethod
-    async def get_all_groups(cls, bot: Bot) -> tuple[list[GroupConsole], str]:
+    async def get_all_groups(cls, bot: Bot) -> list[GroupConsole]:
         """获取群组列表"""
         return await PlatformUtils.get_group_list(bot)
 
@@ -101,7 +101,7 @@ class BroadcastManager:
             10,
         )
 
-        all_groups, _ = await cls.get_all_groups(bot)
+        all_groups = await cls.get_all_groups(bot)
         return await cls.send_to_specific_groups(
             bot, message, all_groups, session, concurrency_limit=concurrency_limit
         )
@@ -211,8 +211,7 @@ class BroadcastManager:
             session=log_session,
         )
 
-        msg_ids = cls.get_last_broadcast_msg_ids()
-        if msg_ids:
+        if msg_ids := cls.get_last_broadcast_msg_ids():
             id_list_str = ", ".join([f"{k}:{v}" for k, v in msg_ids.items()])
             logger.debug(
                 f"广播结束，记录了 {len(msg_ids)} 条消息ID: {id_list_str}",
@@ -321,10 +320,7 @@ class BroadcastManager:
         if force_send:
             return True
 
-        if await CommonUtils.task_is_block(bot, "broadcast", group.group_id):
-            return False
-
-        return True
+        return not await CommonUtils.task_is_block(bot, "broadcast", group.group_id)
 
     @classmethod
     async def _broadcast_forward(
@@ -390,9 +386,7 @@ class BroadcastManager:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        success_count = sum(
-            1 for result in results if not isinstance(result, Exception)
-        )
+        success_count = sum(not isinstance(result, Exception) for result in results)
         error_count = len(results) - success_count
 
         return success_count, error_count, len(skipped_groups)
@@ -475,9 +469,7 @@ class BroadcastManager:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        success_count = sum(
-            1 for result in results if not isinstance(result, Exception)
-        )
+        success_count = sum(not isinstance(result, Exception) for result in results)
         error_count = len(results) - success_count
 
         return success_count, error_count, len(skipped_groups)

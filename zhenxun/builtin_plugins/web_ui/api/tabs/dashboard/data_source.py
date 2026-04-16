@@ -71,8 +71,8 @@ class ApiDataSource:
                 PlatformUtils.get_group_list(bot, True),
                 PlatformUtils.get_friend_list(bot),
             )
-            bot_info.group_count = len(group[0])
-            bot_info.friend_count = len(friend[0])
+            bot_info.group_count = len(group)
+            bot_info.friend_count = len(friend)
         except Exception as e:
             logger.warning("获取bot好友/群组信息失败...", "WebUi", e=e)
             bot_info.group_count = 0

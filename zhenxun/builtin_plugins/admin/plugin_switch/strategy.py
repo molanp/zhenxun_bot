@@ -5,10 +5,6 @@ from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.cache import CacheRoot
-from zhenxun.services.cache.runtime_cache import (
-    PluginInfoMemoryCache,
-    TaskInfoMemoryCache,
-)
 from zhenxun.utils.enum import BlockType, CacheType, PluginType
 
 
@@ -38,7 +34,9 @@ class SwitchStrategy(ABC):
         pass
 
     @abstractmethod
-    async def check_block_status(self, group_id: str, module: str) -> tuple[bool, bool]:
+    async def check_block_status(
+        self, bot_id: str, group_id: str, module: str
+    ) -> tuple[bool, bool]:
         """检查目标群组的禁用状态，返回 (is_su_blocked, is_norm_blocked)"""
         pass
 
@@ -95,9 +93,15 @@ class PluginStrategy(SwitchStrategy):
             name=name, load_status=True, plugin_type__not=PluginType.PARENT
         )
 
-    async def check_block_status(self, group_id: str, module: str) -> tuple[bool, bool]:
-        is_su_blocked = await GroupConsole.is_superuser_block_plugin(group_id, module)
-        is_norm_blocked = await GroupConsole.is_normal_block_plugin(group_id, module)
+    async def check_block_status(
+        self, bot_id: str, group_id: str, module: str
+    ) -> tuple[bool, bool]:
+        is_su_blocked = await GroupConsole.is_superuser_block_plugin(
+            bot_id=bot_id, group_id=group_id, module=module
+        )
+        is_norm_blocked = await GroupConsole.is_normal_block_plugin(
+            bot_id=bot_id, group_id=group_id, module=module
+        )
         return is_su_blocked, is_norm_blocked
 
     async def get_all_modules(self) -> list[str]:
@@ -133,7 +137,6 @@ class PluginStrategy(SwitchStrategy):
 
     async def refresh_cache(self) -> None:
         await CacheRoot.invalidate_cache(CacheType.PLUGINS)
-        await PluginInfoMemoryCache.refresh()
 
 
 class TaskStrategy(SwitchStrategy):
@@ -152,9 +155,15 @@ class TaskStrategy(SwitchStrategy):
     async def get_entity(self, name: str) -> Any:
         return await TaskInfo.get_or_none(name=name)
 
-    async def check_block_status(self, group_id: str, module: str) -> tuple[bool, bool]:
-        is_su_blocked = await GroupConsole.is_superuser_block_task(group_id, module)
-        is_norm_blocked = await GroupConsole.is_block_task(group_id, module)
+    async def check_block_status(
+        self, bot_id: str, group_id: str, module: str
+    ) -> tuple[bool, bool]:
+        is_su_blocked = await GroupConsole.is_superuser_block_task(
+            bot_id=bot_id, group_id=group_id, task=module
+        )
+        is_norm_blocked = await GroupConsole.is_block_task(
+            bot_id=bot_id, group_id=group_id, task=module
+        )
         return is_su_blocked, is_norm_blocked
 
     async def get_all_modules(self) -> list[str]:
@@ -179,7 +188,7 @@ class TaskStrategy(SwitchStrategy):
         await self.refresh_cache()
 
     async def refresh_cache(self) -> None:
-        await TaskInfoMemoryCache.refresh()
+        pass
 
 
 def get_strategy(is_task: bool) -> SwitchStrategy:

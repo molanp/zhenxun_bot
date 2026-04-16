@@ -67,9 +67,9 @@ class SignManage:
             index = "-1（未统计）"
         user_list = user_list[:num] if num < len(user_list) else user_list
         column_name = ["排名", "-", "名称", "好感度", "签到次数", "平台"]
-        friend_list = await FriendUser.filter(user_id__in=user_id_list).values_list(
-            "user_id", "user_name"
-        )
+        friend_list = await FriendUser.filter(
+            user_id__in=user_id_list, bot_id=session.self_id
+        ).values_list("user_id", "user_name")
         uid2name = {f[0]: f[1] for f in friend_list}
         if diff_id := set(user_id_list).difference(set(uid2name.keys())):
             group_user = await GroupInfoUser.filter(user_id__in=diff_id).values_list(

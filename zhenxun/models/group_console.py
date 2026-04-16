@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, ClassVar, cast, overload
+from typing import Any, ClassVar, cast, overload
 from typing_extensions import Self
 
 from tortoise import fields
@@ -8,13 +8,9 @@ from zhenxun.configs.config import BotConfig
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.task_info import TaskInfo
 from zhenxun.services.cache import CacheRoot
-from zhenxun.services.cache.runtime_cache import GroupMemoryCache
 from zhenxun.services.data_access import DataAccess
 from zhenxun.services.db_context import Model
 from zhenxun.utils.enum import CacheType, DbLockType, PluginType
-
-if TYPE_CHECKING:
-    from zhenxun.services.cache.runtime_cache import GroupSnapshot
 
 
 def add_disable_marker(name: str) -> str:
@@ -53,6 +49,7 @@ def convert_module_format(data: str | list[str]) -> str | list[str]:
         return "".join(add_disable_marker(item) for item in data)
 
 
+# TODO: 废弃 channel_id 字段
 class GroupConsole(Model):
     id = fields.IntField(pk=True, generated=True, auto_increment=True)
     """自增id"""
@@ -107,7 +104,7 @@ class GroupConsole(Model):
     """开启锁"""
 
     @classmethod
-    async def _get_task_modules(cls, *, default_status: bool) -> list[str]:
+    async def _get_task_modules(cls, *, default_status: bool, bot_id: str) -> list[str]:
         """获取默认禁用的任务模块
 
         返回:
@@ -115,9 +112,9 @@ class GroupConsole(Model):
         """
         return cast(
             list[str],
-            await TaskInfo.filter(default_status=default_status).values_list(
-                "module", flat=True
-            ),
+            await TaskInfo.filter(
+                default_status=default_status, bot_id=bot_id
+            ).values_list("module", flat=True),
         )
 
     @classmethod
@@ -136,7 +133,7 @@ class GroupConsole(Model):
         )
 
     @classmethod
-    async def _update_cache(cls, instance):
+    async def _update_cache(cls, instance: object):
         """更新缓存
 
         参数:
@@ -154,7 +151,9 @@ class GroupConsole(Model):
         """覆盖create方法"""
         group = await super().create(using_db=using_db, **kwargs)
 
-        task_modules = await cls._get_task_modules(default_status=False)
+        task_modules = await cls._get_task_modules(
+            bot_id=kwargs["bot_id"], default_status=False
+        )
         plugin_modules = await cls._get_plugin_modules(default_status=False)
 
         if task_modules or plugin_modules:
@@ -162,7 +161,6 @@ class GroupConsole(Model):
 
         # 更新缓存
         await cls._update_cache(group)
-        await GroupMemoryCache.upsert_from_model(group)
 
         return group
 
@@ -209,7 +207,9 @@ class GroupConsole(Model):
         if not is_create:
             return group, is_create
 
-        task_modules = await cls._get_task_modules(default_status=False)
+        task_modules = await cls._get_task_modules(
+            bot_id=kwargs["bot_id"], default_status=False
+        )
         plugin_modules = await cls._get_plugin_modules(default_status=False)
 
         if task_modules or plugin_modules:
@@ -218,7 +218,6 @@ class GroupConsole(Model):
         # 更新缓存
         if is_create:
             await cls._update_cache(group)
-            await GroupMemoryCache.upsert_from_model(group)
 
         return group, is_create
 
@@ -236,7 +235,9 @@ class GroupConsole(Model):
         if not is_create:
             return group, is_create
 
-        task_modules = await cls._get_task_modules(default_status=False)
+        task_modules = await cls._get_task_modules(
+            bot_id=kwargs["bot_id"], default_status=False
+        )
         plugin_modules = await cls._get_plugin_modules(default_status=False)
 
         if task_modules or plugin_modules:
@@ -244,82 +245,41 @@ class GroupConsole(Model):
 
         # 更新缓存
         await cls._update_cache(group)
-        await GroupMemoryCache.upsert_from_model(group)
-
         return group, is_create
-
-    async def save(self, *args, **kwargs):
-        await super().save(*args, **kwargs)
-        await GroupMemoryCache.upsert_from_model(self)
-
-    async def delete(self, *args, **kwargs):
-        group_id = self.group_id
-        channel_id = self.channel_id
-        await super().delete(*args, **kwargs)
-        await GroupMemoryCache.remove(group_id, channel_id)
 
     @classmethod
     async def get_group(
         cls,
-        group_id: str,
-        channel_id: str | None = None,
-        clean_duplicates: bool = True,
-    ) -> "GroupSnapshot | None":
-        return GroupMemoryCache.get_if_ready(group_id, channel_id)
-
-    @classmethod
-    async def get_group_db(
-        cls,
+        bot_id: str,
         group_id: str,
         channel_id: str | None = None,
         clean_duplicates: bool = True,
     ) -> Self | None:
-        """获取群组（数据库）"""
+        """获取群组"""
         dao = DataAccess(cls)
-        if channel_id:
-            return await dao.safe_get_or_none(
-                group_id=group_id,
-                channel_id=channel_id,
-                clean_duplicates=clean_duplicates,
-            )
         return await dao.safe_get_or_none(
+            bot_id=bot_id,
             group_id=group_id,
-            channel_id__isnull=True,
+            channel_id=channel_id,
             clean_duplicates=clean_duplicates,
         )
 
     @classmethod
-    async def is_super_group(cls, group_id: str) -> bool:
-        group = GroupMemoryCache.get_if_ready(group_id, None)
+    async def is_super_group(cls, bot_id: str, group_id: str) -> bool:
+        group = await cls.get_group(bot_id=bot_id, group_id=group_id)
         return bool(group and group.is_super)
 
     @classmethod
-    async def is_superuser_block_plugin(cls, group_id: str, module: str) -> bool:
-        group = GroupMemoryCache.get_if_ready(group_id, None)
-        if not group:
-            return False
-        return bool(
-            group.superuser_block_plugin_set
-            and module in group.superuser_block_plugin_set
-        )
-
-    @classmethod
-    async def is_block_plugin(cls, group_id: str, module: str) -> bool:
-        group = GroupMemoryCache.get_if_ready(group_id, None)
-        if not group:
-            return False
-        if group.block_plugin_set and module in group.block_plugin_set:
-            return True
-        if (
-            group.superuser_block_plugin_set
-            and module in group.superuser_block_plugin_set
-        ):
-            return True
-        return False
+    async def is_superuser_block_plugin(
+        cls, bot_id: str, group_id: str, module: str
+    ) -> bool:
+        group = await cls.get_group(bot_id=bot_id, group_id=group_id)
+        return bool(group and module in group.superuser_block_plugin)
 
     @classmethod
     async def set_block_plugin(
         cls,
+        bot_id: str,
         group_id: str,
         module: str,
         is_superuser: bool = False,
@@ -334,7 +294,7 @@ class GroupConsole(Model):
             platform: 平台
         """
         group, _ = await cls.get_or_create(
-            group_id=group_id, defaults={"platform": platform}
+            group_id=group_id, defaults={"platform": platform}, bot_id=bot_id
         )
         update_fields = []
         if is_superuser:
@@ -359,6 +319,7 @@ class GroupConsole(Model):
     @classmethod
     async def set_unblock_plugin(
         cls,
+        bot_id: str,
         group_id: str,
         module: str,
         is_superuser: bool = False,
@@ -373,7 +334,7 @@ class GroupConsole(Model):
             platform: 平台
         """
         group, _ = await cls.get_or_create(
-            group_id=group_id, defaults={"platform": platform}
+            group_id=group_id, defaults={"platform": platform}, bot_id=bot_id
         )
         update_fields = []
         if is_superuser:
@@ -397,53 +358,29 @@ class GroupConsole(Model):
 
     @classmethod
     async def is_normal_block_plugin(
-        cls, group_id: str, module: str, channel_id: str | None = None
+        cls, bot_id: str, group_id: str, module: str
     ) -> bool:
-        group = GroupMemoryCache.get_if_ready(group_id, channel_id)
-        if not group:
-            return False
-        return bool(group.block_plugin_set and module in group.block_plugin_set)
+        group = await cls.get_group(bot_id=bot_id, group_id=group_id)
+        return bool(group and module in group.block_plugin)
 
     @classmethod
-    async def is_superuser_block_task(cls, group_id: str, task: str) -> bool:
-        group = GroupMemoryCache.get_if_ready(group_id, None)
-        if not group:
-            return False
-        return bool(
-            group.superuser_block_task_set and task in group.superuser_block_task_set
-        )
+    async def is_superuser_block_task(
+        cls, bot_id: str, group_id: str, task: str
+    ) -> bool:
+        group = await cls.get_group(bot_id=bot_id, group_id=group_id)
+        return bool(group and task in group.superuser_block_task)
 
     @classmethod
-    async def is_block_task(
-        cls, group_id: str, task: str, channel_id: str | None = None
-    ) -> bool:
-        if not channel_id:
-            group = GroupMemoryCache.get_if_ready(group_id, None)
-            if not group:
-                return False
-            if group.block_task_set and task in group.block_task_set:
-                return True
-            if (
-                group.superuser_block_task_set
-                and task in group.superuser_block_task_set
-            ):
-                return True
+    async def is_block_task(cls, bot_id: str, group_id: str, task: str) -> bool:
+        group = await cls.get_group(bot_id=bot_id, group_id=group_id)
+        if not group:
             return False
-        group = GroupMemoryCache.get_if_ready(group_id, channel_id)
-        if group and group.block_task_set and task in group.block_task_set:
-            return True
-        super_group = GroupMemoryCache.get_if_ready(group_id, None)
-        if (
-            super_group
-            and super_group.superuser_block_task_set
-            and task in super_group.superuser_block_task_set
-        ):
-            return True
-        return False
+        return True if task in group.block_task else task in group.superuser_block_task
 
     @classmethod
     async def set_block_task(
         cls,
+        bot_id: str,
         group_id: str,
         task: str,
         is_superuser: bool = False,
@@ -458,7 +395,7 @@ class GroupConsole(Model):
             platform: 平台
         """
         group, _ = await cls.get_or_create(
-            group_id=group_id, defaults={"platform": platform}
+            group_id=group_id, defaults={"platform": platform}, bot_id=bot_id
         )
         update_fields = []
         if is_superuser:
@@ -481,6 +418,7 @@ class GroupConsole(Model):
     @classmethod
     async def set_unblock_task(
         cls,
+        bot_id: str,
         group_id: str,
         task: str,
         is_superuser: bool = False,
@@ -495,7 +433,7 @@ class GroupConsole(Model):
             platform: 平台
         """
         group, _ = await cls.get_or_create(
-            group_id=group_id, defaults={"platform": platform}
+            group_id=group_id, defaults={"platform": platform}, bot_id=bot_id
         )
         update_fields = []
         if is_superuser:
@@ -536,15 +474,12 @@ class GroupConsole(Model):
         if "postgres" in db_type:
             scripts.extend(
                 [
-                    (
-                        "ALTER TABLE group_console ALTER COLUMN "
-                        "block_plugin TYPE TEXT;"
-                    ),
+                    ("ALTER TABLE group_console ALTER COLUMN block_plugin TYPE TEXT;"),
                     (
                         "ALTER TABLE group_console ALTER COLUMN "
                         "superuser_block_plugin TYPE TEXT;"
                     ),
-                    ("ALTER TABLE group_console ALTER COLUMN " "block_task TYPE TEXT;"),
+                    ("ALTER TABLE group_console ALTER COLUMN block_task TYPE TEXT;"),
                     (
                         "ALTER TABLE group_console ALTER COLUMN "
                         "superuser_block_task TYPE TEXT;"
@@ -554,12 +489,12 @@ class GroupConsole(Model):
         elif "mysql" in db_type:
             scripts.extend(
                 [
-                    ("ALTER TABLE group_console MODIFY COLUMN " "block_plugin TEXT;"),
+                    ("ALTER TABLE group_console MODIFY COLUMN block_plugin TEXT;"),
                     (
                         "ALTER TABLE group_console MODIFY COLUMN "
                         "superuser_block_plugin TEXT;"
                     ),
-                    ("ALTER TABLE group_console MODIFY COLUMN " "block_task TEXT;"),
+                    ("ALTER TABLE group_console MODIFY COLUMN block_task TEXT;"),
                     (
                         "ALTER TABLE group_console MODIFY COLUMN "
                         "superuser_block_task TEXT;"

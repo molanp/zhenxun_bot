@@ -98,25 +98,23 @@ async def create_help_img(
         main_category_name = "主要功能" if menu_key in ["normal", "功能"] else menu_key
         categories_for_model.append({"name": main_category_name, "items": max_data})
         plugin_count += len(max_data)
-        active_count += sum(1 for item in max_data if item["status"] == 0)
+        active_count += sum(bool(item["status"] == 0) for item in max_data)
 
     for menu, value in sorted_categories.items():
         category_name = "主要功能" if menu in ["normal", "功能"] else menu
         categories_for_model.append({"name": category_name, "items": value})
         plugin_count += len(value)
-        active_count += sum(1 for item in value if item["status"] == 0)
+        active_count += sum(bool(item["status"] == 0) for item in value)
 
     platform = PlatformUtils.get_platform(session)
     bot_id = BotConfig.get_qbot_uid(session.self_id) or session.self_id
     bot_avatar_path = await avatar_service.get_avatar_path(platform, bot_id)
     bot_avatar_url = bot_avatar_path.as_uri() if bot_avatar_path else ""
 
-    categories_objects = []
-    for category in categories_for_model:
-        categories_objects.append(
-            PluginMenuCategory(name=category["name"], items=category["items"])
-        )
-
+    categories_objects =[
+        PluginMenuCategory(name=category["name"], items=category["items"])
+        for category in categories_for_model
+    ]
     menu_data = PluginMenuData(
         bot_name=BotConfig.self_nickname,
         bot_avatar_url=bot_avatar_url,
@@ -201,17 +199,17 @@ async def get_plugin_help(
                 {"label": "调用次数", "value": call_count},
             ]
 
-            sections = []
-            sections.append(
+            sections = [
                 {
                     "title": "功能简介",
                     "content": [
-                        format_usage_for_markdown(_plugin.metadata.description.strip())
+                        format_usage_for_markdown(
+                            _plugin.metadata.description.strip()
+                        )
                     ],
                     "is_admin": False,
                 }
-            )
-
+            ]
             if usage and usage.strip():
                 sections.append(
                     {

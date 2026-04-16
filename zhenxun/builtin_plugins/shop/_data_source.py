@@ -110,9 +110,9 @@ async def gold_rank(session: Uninfo, group_id: str | None, num: int) -> bytes | 
     else:
         index = "-1（未统计）"
     user_list = user_list[:num] if num < len(user_list) else user_list
-    friend_user = await FriendUser.filter(user_id__in=user_id_list).values_list(
-        "user_id", "user_name"
-    )
+    friend_user = await FriendUser.filter(
+        user_id__in=user_id_list, bot_id=session.self_id
+    ).values_list("user_id", "user_name")
     uid2name = {user[0]: user[1] for user in friend_user}
     if diff_id := set(user_id_list).difference(set(uid2name.keys())):
         group_user = await GroupInfoUser.filter(user_id__in=diff_id).values_list(

@@ -103,7 +103,7 @@ def is_allowed_call() -> Rule:
         if group_id:
             if await BanConsole.is_ban(None, group_id):
                 return False
-            if g := await GroupConsole.get_group(group_id):
+            if g := await GroupConsole.get_group(session.self_id, group_id):
                 if g.level < 0:
                     return False
         return True

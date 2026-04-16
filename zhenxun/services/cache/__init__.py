@@ -79,14 +79,13 @@ message_list.append("Hello")  # 类型安全
 
 import asyncio
 from collections.abc import Callable
+import contextlib
 from datetime import datetime
 from functools import wraps
 from typing import Any, ClassVar, Generic, TypeVar, cast, get_type_hints
 from typing_extensions import Self
 
-from aiocache import Cache as AioCache
-from aiocache import SimpleMemoryCache
-from aiocache.base import BaseCache
+from aiocache import RedisCache, SimpleMemoryCache
 from aiocache.serializers import JsonSerializer
 import nonebot
 from nonebot.compat import model_dump
@@ -116,7 +115,6 @@ __all__ = [
     "CacheRoot",
 ]
 
-from . import runtime_cache as _runtime_cache  # noqa: F401
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -137,6 +135,7 @@ class Config(BaseModel):
     """redis过期时间"""
 
 
+# 获取配置
 # 获取配置
 driver = nonebot.get_driver()
 cache_config = nonebot.get_plugin_config(Config)
@@ -195,7 +194,7 @@ class CacheData:
         func: Callable,
         expire: int = DEFAULT_EXPIRE,
         lazy_load: bool = True,
-        cache: BaseCache | AioCache | None = None,
+        cache: RedisCache | SimpleMemoryCache | None = None,
     ):
         """初始化缓存数据
 
@@ -218,12 +217,10 @@ class CacheData:
         if not lazy_load:
             import asyncio
 
-            try:
+            with contextlib.suppress(Exception):
                 loop = asyncio.get_event_loop()
                 if not loop.is_running():
                     loop.run_until_complete(self.get_data())
-            except Exception:
-                pass
 
     async def get_data(self) -> Any:
         """获取数据
@@ -287,7 +284,7 @@ class CacheManager:
     """缓存管理器"""
 
     _instance: ClassVar["CacheManager | None"] = None
-    _cache_backend: BaseCache | AioCache | None = None
+    _cache_backend: SimpleMemoryCache | RedisCache | None = None
     _registry: ClassVar[dict[str, CacheModel]] = {}
     _data: ClassVar[dict[str, CacheData]] = {}
     _list_caches: ClassVar[dict[str, "CacheList"]] = {}
@@ -436,7 +433,7 @@ class CacheManager:
         )
 
     @property
-    def cache_backend(self) -> BaseCache | AioCache:
+    def cache_backend(self) -> SimpleMemoryCache | RedisCache:
         """获取缓存后端"""
         if self._cache_backend is None:
             ttl = cache_config.redis_expire
@@ -478,35 +475,6 @@ class CacheManager:
                 ttl=ttl,
             )
         return self._cache_backend
-
-    @property
-    def _cache(self) -> BaseCache | AioCache:
-        """获取缓存后端（别名）"""
-        return self.cache_backend
-
-    async def get_cache_data(self, name: str) -> Any:
-        """获取缓存数据
-
-        参数:
-            name: 缓存名称
-
-        返回:
-            Any: 缓存数据
-        """
-        name = name.upper()
-        # 检查是否存在缓存数据
-        if name in self._data:
-            return await self._data[name].get_data()
-
-        # 尝试从缓存后端获取
-        if cache_config.cache_mode != CacheMode.NONE:
-            try:
-                data = await self.cache_backend.get(name)  # type: ignore
-                if data is not None:
-                    return data
-            except Exception as e:
-                logger.error(f"从缓存后端获取数据 {name} 失败", LOG_COMMAND, e=e)
-        return None
 
     async def invalidate_cache(
         self, cache_type: str, key: str | dict[str, Any] | None = None
@@ -690,19 +658,10 @@ class CacheManager:
             return False
 
         try:
-            if cache_type:
-                # 清除指定类型的缓存
-                # pattern = f"{cache_type.upper()}{CACHE_KEY_SEPARATOR}*"
-                # 由于aiocache可能没有delete_pattern方法，使用其他方式清除
-                # 这里简化处理，直接清除所有缓存
-                await self.cache_backend.clear()  # type: ignore
-            else:
-                # 清除所有缓存
-                await self.cache_backend.clear()  # type: ignore
+            await self.cache_backend.clear()
             return True
         except Exception as e:
-            if f"缓存类型 {cache_type} 不存在" not in str(e):
-                logger.warning("清除缓存失败", LOG_COMMAND, e=e)
+            logger.warning("清除缓存失败", LOG_COMMAND, e=e)
             return False
 
     async def close(self):
@@ -710,7 +669,7 @@ class CacheManager:
         if self._cache_backend:
             try:
                 await self._cache_backend.close()  # type: ignore
-            except (AttributeError, Exception) as e:
+            except Exception as e:
                 logger.warning(f"关闭缓存连接失败: {e}", LOG_COMMAND)
             self._cache_backend = None
 
@@ -1018,7 +977,7 @@ class Cache(Generic[T]):
         self.cache_type = cache_type.upper()
 
         # 尝试从类型注解获取结果类型
-        try:
+        with contextlib.suppress(Exception):
             type_hints = get_type_hints(self.__class__)
             if "T" in type_hints:
                 result_type = type_hints["T"]
@@ -1027,8 +986,6 @@ class Cache(Generic[T]):
                     CacheRoot.get_model(self.cache_type)
                 except CacheException:
                     CacheRoot.register(self.cache_type, result_type)
-        except Exception:
-            pass
 
     async def get(
         self, key: str | dict[str, Any], default: T | None = None

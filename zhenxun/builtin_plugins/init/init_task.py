@@ -8,7 +8,6 @@ from nonebot_plugin_apscheduler import scheduler
 from zhenxun.configs.utils import PluginExtraData, Task
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.task_info import TaskInfo
-from zhenxun.services.cache.runtime_cache import TaskInfoMemoryCache
 from zhenxun.services.log import logger
 from zhenxun.utils.common_utils import CommonUtils
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
@@ -90,8 +89,7 @@ async def to_db(
     if load_task:
         await TaskInfo.filter(module__in=load_task).update(load_status=True)
         await TaskInfo.filter(module__not_in=load_task).update(load_status=False)
-    if create_list or update_list or load_task:
-        await TaskInfoMemoryCache.refresh()
+
 
 
 async def get_run_task(task: Task, *args, **kwargs):
@@ -147,7 +145,6 @@ async def _():
         await _handle_setting(plugin, task_info_list, task_list)
     if not task_info_list:
         await TaskInfo.all().update(load_status=False)
-        await TaskInfoMemoryCache.refresh()
         return
     module_dict = {t[1]: t[0] for t in await TaskInfo.all().values_list("id", "module")}
     load_task = []

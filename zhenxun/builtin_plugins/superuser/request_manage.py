@@ -145,7 +145,9 @@ async def _(
             await MessageUtils.build_message("请引用消息处理或添加处理Id.").finish()
     handle_id = id.result
     if reply:
-        db_data = await FgRequest.get_or_none(message_ids__contains=reply.id)
+        db_data = await FgRequest.get_or_none(
+            message_ids__contains=reply.id, bot_id=bot.self_id
+        )
         if not db_data:
             await MessageUtils.build_message(
                 "未发现此消息的Id，请使用Id进行处理..."
@@ -191,7 +193,9 @@ async def _(
     is_friend: Query[bool] = AlconnaQuery("friend.value", False),
     is_group: Query[bool] = AlconnaQuery("group.value", False),
 ):
-    if all_request := await FgRequest.filter(handle_type__isnull=True).all():
+    if all_request := await FgRequest.filter(
+        handle_type__isnull=True, bot_id=session.self_id
+    ).all():
         req_list = list(all_request)
         req_list.reverse()
         friend_req: list[FgRequest] = []
@@ -291,17 +295,21 @@ async def _(
     if is_friend.result:
         _type = "好友"
         await FgRequest.filter(
-            handle_type__isnull=True, request_type=RequestType.FRIEND
+            handle_type__isnull=True,
+            request_type=RequestType.FRIEND,
+            bot_id=session.self_id,
         ).update(handle_type=RequestHandleType.IGNORE)
     elif is_group.result:
         _type = "群组"
         await FgRequest.filter(
-            handle_type__isnull=True, request_type=RequestType.GROUP
+            handle_type__isnull=True,
+            request_type=RequestType.GROUP,
+            bot_id=session.self_id,
         ).update(handle_type=RequestHandleType.IGNORE)
     else:
         _type = "所有"
         await FgRequest.filter(handle_type__isnull=True).update(
-            handle_type=RequestHandleType.IGNORE
+            handle_type=RequestHandleType.IGNORE, bot_id=session.self_id
         )
     logger.info(f"清空{_type}请求", arparma.header_result, session=session)
     await MessageUtils.build_message(f"已清空{_type}请求!").finish()

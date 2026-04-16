@@ -179,7 +179,7 @@ async def GetTargets(
             raise SkippedException("权限不足")
         from zhenxun.utils.platform import PlatformUtils
 
-        all_groups, _ = await PlatformUtils.get_group_list(bot)
+        all_groups = await PlatformUtils.get_group_list(bot)
         return [g.group_id for g in all_groups]
 
     if gid := session.id3 or session.id2:
@@ -219,7 +219,7 @@ async def handle_list(arp: Arparma, bot: Bot, event: Event):
                     f"插件 '{plugin_name_str}' 不支持分群配置。"
                 ).finish()
 
-            all_groups, _ = await PlatformUtils.get_group_list(bot)
+            all_groups = await PlatformUtils.get_group_list(bot)
             if not all_groups:
                 await MessageUtils.build_message("机器人未加入任何群组。").finish()
 

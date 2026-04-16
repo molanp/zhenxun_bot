@@ -1,12 +1,13 @@
 from tortoise import fields
 
-from zhenxun.services.cache.runtime_cache import TaskInfoMemoryCache
 from zhenxun.services.db_context import Model
 
 
 class TaskInfo(Model):
     id = fields.IntField(pk=True, generated=True, auto_increment=True)
     """自增id"""
+    bot_id = fields.CharField(255, description="bot_id")
+    """bot_id"""
     module = fields.CharField(255, description="被动技能模块名")
     """被动技能模块名"""
     name = fields.CharField(255, description="被动技能名称")
@@ -27,29 +28,9 @@ class TaskInfo(Model):
         table_description = "被动技能基本信息"
 
     @classmethod
-    async def create(cls, *args, **kwargs):
-        result = await super().create(*args, **kwargs)
-        await TaskInfoMemoryCache.upsert_from_model(result)
-        return result
-
-    @classmethod
-    async def update_or_create(cls, *args, **kwargs):
-        result = await super().update_or_create(*args, **kwargs)
-        await TaskInfoMemoryCache.upsert_from_model(result[0])
-        return result
-
-    async def save(self, *args, **kwargs):
-        await super().save(*args, **kwargs)
-        await TaskInfoMemoryCache.upsert_from_model(self)
-
-    async def delete(self, *args, **kwargs):
-        module = self.module
-        await super().delete(*args, **kwargs)
-        await TaskInfoMemoryCache.remove(module)
-
-    @classmethod
     async def _run_script(cls):
         return [
+            "ALTER TABLE task_info ADD bot_id VARCHAR(255) NOT NULL;"
             "ALTER TABLE task_info ADD default_status boolean DEFAULT true;",
             "ALTER TABLE task_info ADD load_status boolean DEFAULT false;",
             # 默认状态

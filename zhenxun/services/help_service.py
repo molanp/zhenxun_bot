@@ -39,10 +39,10 @@ async def _get_plugins_by_types(plugin_types: list[PluginType]) -> list[PluginDa
     return data_list
 
 
-async def _get_task_category() -> dict:
+async def _get_task_category(bot_id: str) -> dict:
     """获取被动技能帮助类别"""
     task_items = []
-    if task_list := await TaskInfo.all():
+    if task_list := await TaskInfo.filter(bot_id=bot_id):
         task_names = "\n".join([task.name for task in task_list])
         task_items.append(
             {
@@ -63,7 +63,7 @@ async def _get_task_category() -> dict:
 
 
 async def create_plugin_help_image(
-    plugin_types: list[PluginType], page_title: str
+    bot_id: str, plugin_types: list[PluginType], page_title: str
 ) -> bytes:
     """
     一个通用的函数，用于创建插件帮助图片。
@@ -100,7 +100,7 @@ async def create_plugin_help_image(
             )
         )
 
-    task_category_data = await _get_task_category()
+    task_category_data = await _get_task_category(bot_id=bot_id)
     if task_category_data["items"]:
         task_items = [HelpItem(**item) for item in task_category_data["items"]]
         categories.append(

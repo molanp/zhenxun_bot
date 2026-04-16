@@ -74,13 +74,13 @@ async def build_plugin() -> bytes:
     return await ui.render(table, viewport={"width": 1400, "height": 10})
 
 
-async def build_task(group_id: str | None) -> bytes:
+async def build_task(bot_id: str, group_id: str | None) -> bytes:
     """构造被动技能状态图片"""
     task_list = await TaskInfo.all()
     column_name = ["ID", "模块", "名称", "群组状态", "全局状态", "运行时间"]
     group = None
     if group_id:
-        group = await GroupConsole.get_group_db(group_id=group_id)
+        group = await GroupConsole.get_group(bot_id=bot_id, group_id=group_id)
         if not group:
             raise GroupInfoNotFound()
     else:
@@ -125,19 +125,21 @@ async def render_global_status(name: str, is_task: bool, bot: Bot) -> bytes:
     module = info.module
     default_status = info.status
 
-    online_groups, _ = await PlatformUtils.get_group_list(bot)
-    valid_keys = {(str(g.group_id), g.channel_id) for g in online_groups}
+    online_groups = await PlatformUtils.get_group_list(bot)
+    valid_keys = {(g.group_id, g.channel_id) for g in online_groups}
 
-    all_db_groups = await GroupConsole.all()
+    all_db_groups = await GroupConsole.filter(bot_id=bot.self_id)
     target_groups = [
-        g for g in all_db_groups if (str(g.group_id), g.channel_id) in valid_keys
+        g for g in all_db_groups if (g.group_id, g.channel_id) in valid_keys
     ]
 
     total_count = len(target_groups)
     status_data = []
     for group in target_groups:
         gid = str(group.group_id)
-        is_su_blocked, is_norm_blocked = await strategy.check_block_status(gid, module)
+        is_su_blocked, is_norm_blocked = await strategy.check_block_status(
+            bot_id=bot.self_id, group_id=gid, module=module
+        )
         is_open = bool(default_status) and not is_su_blocked and not is_norm_blocked
 
         if not default_status:
@@ -206,21 +208,21 @@ async def render_global_status(name: str, is_task: bool, bot: Bot) -> bytes:
         display_list=display_list,
         list_title=list_title,
         global_alert=global_alert,
-        perfect_state_alert=ui.alert(
+        perfect_state_alert=None
+        if global_alert
+        else ui.alert(
             "状态完美", f"所有 {total_count} 个群组状态一致。", type="success"
-        )
-        if not global_alert
-        else None,
+        ),
     )
 
 
 async def render_group_active_status(bot: Bot) -> bytes:
     """渲染群组醒来/休眠状态报表"""
-    online_groups, _ = await PlatformUtils.get_group_list(bot)
-    valid_keys = {(str(g.group_id), g.channel_id) for g in online_groups}
-    all_db_groups = await GroupConsole.all()
+    online_groups = await PlatformUtils.get_group_list(bot)
+    valid_keys = {(g.group_id, g.channel_id) for g in online_groups}
+    all_db_groups = await GroupConsole.filter(bot_id=bot.self_id)
     target_groups = [
-        g for g in all_db_groups if (str(g.group_id), g.channel_id) in valid_keys
+        g for g in all_db_groups if (g.group_id, g.channel_id) in valid_keys
     ]
 
     total_count = len(target_groups)

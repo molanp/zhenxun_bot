@@ -147,7 +147,7 @@ def CheckGroupId():
 @_matcher.assign("modify-level", parameterless=[CheckGroupId()])
 async def _(session: EventSession, arparma: Arparma, state: T_State, level: int):
     gid = state["group_id"]
-    group, _ = await GroupConsole.get_or_create(group_id=gid)
+    group, _ = await GroupConsole.get_or_create(group_id=gid, bot_id=session.bot_id)
     old_level = group.level
     group.level = level
     await group.save(update_fields=["level"])
@@ -163,7 +163,7 @@ async def _(session: EventSession, arparma: Arparma, state: T_State, level: int)
 @_matcher.assign("super-handle", parameterless=[CheckGroupId()])
 async def _(session: EventSession, arparma: Arparma, state: T_State):
     gid = state["group_id"]
-    group = await GroupConsole.get_group_db(group_id=gid)
+    group = await GroupConsole.get_group(group_id=gid, bot_id=session.bot_id)
     if not group:
         await MessageUtils.build_message("群组信息不存在, 请更新群组信息...").finish()
     s = "删除" if arparma.find("delete") else "添加"
@@ -178,6 +178,7 @@ async def _(session: EventSession, arparma: Arparma, state: T_State):
     gid = state["group_id"]
     await GroupConsole.update_or_create(
         group_id=gid,
+        bot_id=session.bot_id,
         channel_id__isnull=True,
         defaults={"group_flag": 0 if arparma.find("delete") else 1},
     )
@@ -204,7 +205,7 @@ async def _(bot: Bot, session: EventSession, arparma: Arparma, group_id: int):
                 target=group_id,
             )
             await MessageUtils.build_message(f"退出群组 {group_id} 成功!").send()
-            await GroupConsole.filter(group_id=group_id).delete()
+            await GroupConsole.filter(group_id=group_id, bot_id=bot.self_id).delete()
         except Exception as e:
             logger.error("退出群组失败", "退群", session=session, target=group_id, e=e)
             await MessageUtils.build_message(f"退出群组 {group_id} 失败...").send()

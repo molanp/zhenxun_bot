@@ -58,7 +58,7 @@ class CommonUtils:
                 """bot是否禁用被动"""
                 return True
         if group_id:
-            if await GroupConsole.is_block_task(group_id, module):
+            if await GroupConsole.is_block_task(session.self_id, group_id, module):
                 """群组是否禁用被动"""
                 return True
             if g := GroupMemoryCache.get_if_ready(group_id, None):

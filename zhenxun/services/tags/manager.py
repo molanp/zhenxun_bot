@@ -205,7 +205,7 @@ class TagManager:
         """
         all_bot_group_ids = set()
         for bot in nonebot.get_bots().values():
-            groups, _ = await PlatformUtils.get_group_list(bot)
+            groups = await PlatformUtils.get_group_list(bot)
             all_bot_group_ids.update(g.group_id for g in groups if g.group_id)
 
         all_static_links = await GroupTagLink.filter(tag__tag_type="STATIC").all()
@@ -350,7 +350,7 @@ class TagManager:
         resolved_groups: list[tuple[str, str]] = []
         if final_group_ids:
             groups_from_db = await GroupConsole.filter(
-                group_id__in=final_group_ids
+                group_id__in=final_group_ids, bot_id=bot.self_id if bot else None
             ).all()
             resolved_groups = [(g.group_id, g.group_name) for g in groups_from_db]
 
@@ -475,7 +475,7 @@ class TagManager:
             ids_from_q: set[str] | None = None
             if current_and_q.children:
                 q_filtered_groups = await GroupConsole.filter(
-                    current_and_q
+                    current_and_q, bot_id=bot.self_id if bot else None
                 ).values_list("group_id", flat=True)
                 ids_from_q = {str(gid) for gid in q_filtered_groups}
 
@@ -493,7 +493,7 @@ class TagManager:
             final_ids.update(clause_result_ids)
 
         if bot:
-            bot_groups, _ = await PlatformUtils.get_group_list(bot)
+            bot_groups = await PlatformUtils.get_group_list(bot)
             bot_group_ids = {g.group_id for g in bot_groups if g.group_id}
             final_ids.intersection_update(bot_group_ids)
 
@@ -515,10 +515,10 @@ class TagManager:
         """
         if name == "@all":
             if bot:
-                all_groups, _ = await PlatformUtils.get_group_list(bot)
+                all_groups = await PlatformUtils.get_group_list(bot)
                 return [str(g.group_id) for g in all_groups if g.group_id]
             else:
-                all_group_ids = await GroupConsole.all().values_list(
+                all_group_ids = await GroupConsole.filter(bot_id=bot.self_id if bot else None).values_list(
                     "group_id", flat=True
                 )
                 return [str(gid) for gid in all_group_ids]
@@ -541,7 +541,7 @@ class TagManager:
         if tag.is_blacklist:
             all_groups_query = GroupConsole.all()
             if bot:
-                bot_groups, _ = await PlatformUtils.get_group_list(bot)
+                bot_groups = await PlatformUtils.get_group_list(bot)
                 bot_group_ids = {str(g.group_id) for g in bot_groups if g.group_id}
                 if bot_group_ids:
                     all_groups_query = all_groups_query.filter(

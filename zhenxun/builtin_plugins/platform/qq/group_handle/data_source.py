@@ -116,6 +116,7 @@ class GroupManager:
                 return
             await GroupConsole.update_or_create(
                 group_id=group_info["group_id"],
+                bot_id=bot.self_id,
                 defaults={
                     "group_name": group_info["group_name"],
                     "max_member_count": group_info["max_member_count"],
@@ -195,7 +196,7 @@ class GroupManager:
                     "强制拉群或未有群信息，退出群聊成功", "入群检测", group_id=group_id
                 )
                 await FgRequest.filter(
-                    group_id=group_id, handle_type__isnull=True
+                    group_id=group_id, handle_type__isnull=True, bot_id=bot.self_id
                 ).update(handle_type=RequestHandleType.IGNORE)
             except Exception as e:
                 logger.error(
@@ -357,7 +358,7 @@ class GroupManager:
             operator_name = user.user_name
         else:
             operator_name = "None"
-        group = await GroupConsole.get_group_db(group_id)
+        group = await GroupConsole.get_group(bot_id=bot.self_id, group_id=group_id)
         group_name = group.group_name if group else ""
         if group:
             await group.delete()

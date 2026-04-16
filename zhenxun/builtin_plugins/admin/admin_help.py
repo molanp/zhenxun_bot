@@ -31,9 +31,10 @@ __plugin_meta__ = PluginMetadata(
 )
 
 
-async def build_html_help() -> bytes:
+async def build_html_help(bot_id: str) -> bytes:
     """构建管理员帮助图片"""
     return await create_plugin_help_image(
+        bot_id=bot_id,
         plugin_types=[PluginType.ADMIN, PluginType.SUPER_AND_ADMIN],
         page_title="群管理员帮助手册",
     )
@@ -53,7 +54,7 @@ async def _(
     arparma: Arparma,
 ):
     try:
-        image_bytes = await build_html_help()
+        image_bytes = await build_html_help(session.bot_id)
         await MessageUtils.build_message(image_bytes).send()
     except EmptyError:
         await MessageUtils.build_message("当前管理员帮助为空...").finish(reply_to=True)

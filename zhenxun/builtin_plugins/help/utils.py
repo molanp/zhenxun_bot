@@ -45,7 +45,11 @@ async def classify_plugin(
     """
     sort_data = await sort_type()
     classify: dict[str, list] = {}
-    group = await GroupConsole.get_group(group_id=group_id) if group_id else None
+    group = (
+        await GroupConsole.get_group(bot_id=session.self_id, group_id=group_id)
+        if group_id
+        else None
+    )
     bot = await BotConsole.get_or_none(bot_id=session.self_id)
     for menu, value in sort_data.items():
         for plugin in value:

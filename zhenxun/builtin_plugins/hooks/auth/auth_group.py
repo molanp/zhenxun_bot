@@ -3,7 +3,6 @@ import time
 
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.plugin_info import PluginInfo
-from zhenxun.services.cache.runtime_cache import GroupSnapshot
 from zhenxun.services.log import logger
 
 from .config import LOGGER_COMMAND, WARNING_THRESHOLD, SwitchEnum
@@ -31,7 +30,7 @@ def _is_group_wake_command(plugin: PluginInfo, text: str) -> bool:
 
 async def auth_group(
     plugin: PluginInfo,
-    group: GroupConsole | GroupSnapshot | None,
+    group: GroupConsole | None,
     text: str | None,
     group_id: str | None,
 ):

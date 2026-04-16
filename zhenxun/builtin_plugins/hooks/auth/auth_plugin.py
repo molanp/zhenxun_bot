@@ -5,7 +5,6 @@ from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.plugin_info import PluginInfo
-from zhenxun.services.cache.runtime_cache import GroupSnapshot, _parse_block_modules
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import BlockType
 
@@ -14,27 +13,11 @@ from .exception import IsSuperuserException, SkipPluginException
 from .utils import freq, is_poke, send_message
 
 
-def _get_group_block_sets(
-    group: GroupConsole | GroupSnapshot,
-) -> tuple[frozenset[str], frozenset[str]]:
-    block_set = getattr(group, "block_plugin_set", None)
-    super_block_set = getattr(group, "superuser_block_plugin_set", None)
-    if block_set is None:
-        block_set = _parse_block_modules(getattr(group, "block_plugin", "") or "")
-        setattr(group, "block_plugin_set", block_set)
-    if super_block_set is None:
-        super_block_set = _parse_block_modules(
-            getattr(group, "superuser_block_plugin", "") or ""
-        )
-        setattr(group, "superuser_block_plugin_set", super_block_set)
-    return block_set, super_block_set
-
-
 class GroupCheck:
     def __init__(
         self,
         plugin: PluginInfo,
-        group: GroupConsole | GroupSnapshot,
+        group: GroupConsole,
         session: Uninfo,
         is_poke: bool,
         skip_group_block: bool,
@@ -45,10 +28,8 @@ class GroupCheck:
         self.group_data = group
         self.group_id = group.group_id
         self.skip_group_block = skip_group_block
-        (
-            self.block_plugin_set,
-            self.superuser_block_plugin_set,
-        ) = _get_group_block_sets(group)
+        self.block_plugin = group.block_plugin
+        self.superuser_block_plugin = group.superuser_block_plugin
 
     async def check(self):
         start_time = time.time()
@@ -57,7 +38,7 @@ class GroupCheck:
                 # 检查超级用户禁用
                 if (
                     self.group_data
-                    and self.plugin.module in self.superuser_block_plugin_set
+                    and self.plugin.module in self.superuser_block_plugin
                 ):
                     if freq.is_send_limit_message(
                         self.plugin, self.group_id, self.is_poke
@@ -74,7 +55,7 @@ class GroupCheck:
                     )
 
                 # 检查普通禁用
-                if self.group_data and self.plugin.module in self.block_plugin_set:
+                if self.group_data and self.plugin.module in self.block_plugin:
                     if freq.is_send_limit_message(
                         self.plugin, self.group_id, self.is_poke
                     ):
@@ -112,7 +93,7 @@ class GroupCheck:
 
 class PluginCheck:
     def __init__(
-        self, group: GroupConsole | GroupSnapshot | None, session: Uninfo, is_poke: bool
+        self, group: GroupConsole | None, session: Uninfo, is_poke: bool
     ):
         self.session = session
         self.is_poke = is_poke
@@ -180,7 +161,7 @@ class PluginCheck:
 
 async def auth_plugin(
     plugin: PluginInfo,
-    group: GroupConsole | GroupSnapshot | None,
+    group: GroupConsole | None,
     session: Uninfo,
     event: Event,
     *,
@@ -199,7 +180,8 @@ async def auth_plugin(
         user_check = PluginCheck(group, session, is_poke_event)
 
         if group:
-            block_set, super_block_set = _get_group_block_sets(group)
+            block_set = group.block_plugin
+            super_block_set = group.superuser_block_plugin
             if (
                 plugin.status
                 and plugin.block_type != BlockType.GROUP

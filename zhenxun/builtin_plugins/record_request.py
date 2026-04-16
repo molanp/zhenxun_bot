@@ -103,7 +103,7 @@ async def _(bot: v12Bot | v11Bot, event: FriendRequestEvent, session: EventSessi
         await asyncio.sleep(random.randint(1, 10))
         await bot.set_friend_add_request(flag=event.flag, approve=True)
         await FriendUser.create(
-            user_id=str(user["user_id"]), user_name=user["nickname"]
+            user_id=str(user["user_id"]), user_name=user["nickname"], bot_id=bot.self_id
         )
     else:
         # 旧请求全部设置为过期
@@ -111,6 +111,7 @@ async def _(bot: v12Bot | v11Bot, event: FriendRequestEvent, session: EventSessi
             request_type=RequestType.FRIEND,
             user_id=str(event.user_id),
             handle_type__isnull=True,
+            bot_id=bot.self_id,
         ).update(handle_type=RequestHandleType.EXPIRE)
         f = await FgRequest.create(
             request_type=RequestType.FRIEND,
@@ -163,7 +164,8 @@ async def _(bot: v12Bot | v11Bot, event: GroupRequestEvent, session: EventSessio
                 target=event.group_id,
             )
             group, _ = await GroupConsole.update_or_create(
-                group_id=str(event.group_id),
+                group_id=event.group_id,
+                bot_id=bot.self_id,
                 defaults={
                     "group_name": "",
                     "max_member_count": 0,
@@ -199,7 +201,9 @@ async def _(bot: v12Bot | v11Bot, event: GroupRequestEvent, session: EventSessio
             "AUTO_ADD_GROUP"
         ):
             # 非超级用户邀请自动加入群组
-            nickname = await FriendUser.get_user_name(str(event.user_id))
+            nickname = await FriendUser.get_user_name(
+                user_id=str(event.user_id), bot_id=bot.self_id
+            )
             f = await FgRequest.create(
                 request_type=RequestType.GROUP,
                 platform=session.platform,
@@ -232,7 +236,9 @@ async def _(bot: v12Bot | v11Bot, event: GroupRequestEvent, session: EventSessio
             "群聊请求",
             target=event.group_id,
         )
-        nickname = await FriendUser.get_user_name(str(event.user_id))
+        nickname = await FriendUser.get_user_name(
+            user_id=str(event.user_id), bot_id=bot.self_id
+        )
         await bot.send_private_msg(
             user_id=event.user_id,
             message=f"想要邀请我偷偷入群嘛~已经提醒{BotConfig.self_nickname}的管理员大人了\n"
@@ -245,6 +251,7 @@ async def _(bot: v12Bot | v11Bot, event: GroupRequestEvent, session: EventSessio
             user_id=str(event.user_id),
             group_id=str(event.group_id),
             handle_type__isnull=True,
+            bot_id=bot.self_id,
         ).update(handle_type=RequestHandleType.EXPIRE)
         f = await FgRequest.create(
             request_type=RequestType.GROUP,

@@ -112,11 +112,11 @@ class ApiDataSource:
         # 群聊数量
         try:
             select_bot.group_count = len(
-                (await PlatformUtils.get_group_list(select_bot.bot, True))[0]
+                await PlatformUtils.get_group_list(select_bot.bot, True)
             )
             # 好友数量
             select_bot.friend_count = len(
-                (await PlatformUtils.get_friend_list(select_bot.bot))[0]
+                await PlatformUtils.get_friend_list(select_bot.bot)
             )
         except Exception as e:
             logger.warning("获取bot好友/群组数量失败...", "WebUi", e=e)
@@ -307,7 +307,7 @@ class ApiDataSource:
         id2name = {}
         if data_list:
             if info_list := await GroupConsole.filter(
-                group_id__in=[x[0] for x in data_list]
+                group_id__in=[x[0] for x in data_list], bot_id=bot_id
             ).all():
                 for group_info in info_list:
                     id2name[group_info.group_id] = group_info.group_name

@@ -45,7 +45,7 @@ async def _(bot_id: str) -> Result:
     group_list_result = []
     try:
         bot = nonebot.get_bot(bot_id)
-        group_list, _ = await PlatformUtils.get_group_list(bot)
+        group_list = await PlatformUtils.get_group_list(bot)
         for g in group_list:
             ava_url = GROUP_AVA_URL.format(g.group_id, g.group_id)
             group_list_result.append(
@@ -70,6 +70,7 @@ async def _(bot_id: str) -> Result:
 )
 async def _(group: UpdateGroup) -> Result[str]:
     try:
+        raise NotImplementedError("尚未实现，需要 webui 返回 bot_id")
         await ApiDataSource.update_group(group)
         return Result.ok(info="已完成记录!")
     except Exception as e:
@@ -87,7 +88,7 @@ async def _(group: UpdateGroup) -> Result[str]:
 async def _(bot_id: str) -> Result[list[Friend]]:
     try:
         bot = nonebot.get_bot(bot_id)
-        friend_list, _ = await PlatformUtils.get_friend_list(bot)
+        friend_list = await PlatformUtils.get_friend_list(bot)
         result_list = []
         for f in friend_list:
             ava_url = AVA_URL.format(f.user_id)
@@ -114,8 +115,10 @@ async def _(bot_id: str) -> Result[list[Friend]]:
 )
 async def _() -> Result[dict[str, int]]:
     try:
+        raise NotImplementedError("尚未实现，需要 webui 返回 bot_id")
         f_count = await FgRequest.filter(
-            request_type=RequestType.FRIEND, handle_type__isnull=True
+            request_type=RequestType.FRIEND,
+            handle_type__isnull=True,
         ).count()
         g_count = await FgRequest.filter(
             request_type=RequestType.GROUP, handle_type__isnull=True
@@ -209,12 +212,15 @@ async def _(param: HandleRequest) -> Result:
         if not (req := await FgRequest.get_or_none(id=param.id)):
             return Result.warning_("未找到此Id请求...")
         if req.request_type == RequestType.GROUP:
-            if group := await GroupConsole.get_group_db(group_id=req.group_id):
+            if group := await GroupConsole.get_group(
+                bot_id=bot.self_id, group_id=req.group_id
+            ):
                 group.group_flag = 1
                 await group.save(update_fields=["group_flag"])
             else:
                 await GroupConsole.update_or_create(
                     group_id=req.group_id,
+                    bot_id=bot.self_id,
                     defaults={"group_flag": 1},
                 )
         try:
@@ -243,7 +249,7 @@ async def _(param: LeaveGroup) -> Result:
         platform = PlatformUtils.get_platform(bot)
         if platform != "qq":
             return Result.warning_("该平台不支持退群操作...")
-        group_list, _ = await PlatformUtils.get_group_list(bot)
+        group_list = await PlatformUtils.get_group_list(bot)
         if param.group_id not in [g.group_id for g in group_list]:
             return Result.warning_("Bot未在该群聊中...")
         await bot.set_group_leave(group_id=param.group_id)
@@ -268,7 +274,7 @@ async def _(param: DeleteFriend) -> Result:
         platform = PlatformUtils.get_platform(bot)
         if platform != "qq":
             return Result.warning_("该平台不支持删除好友操作...")
-        friend_list, _ = await PlatformUtils.get_friend_list(bot)
+        friend_list = await PlatformUtils.get_friend_list(bot)
         if param.user_id not in [f.user_id for f in friend_list]:
             return Result.warning_("Bot未有其好友...")
         await bot.delete_friend(user_id=param.user_id)
@@ -311,6 +317,7 @@ async def _(bot_id: str, user_id: str) -> Result[UserDetail]:
 )
 async def _(group_id: str) -> Result[GroupDetail]:
     try:
+        raise NotImplementedError("尚未实现，需要 webui 返回 bot_id")
         return Result.ok(await ApiDataSource.get_group_detail(group_id), "拿到信息啦!")
     except Exception as e:
         logger.error(f"{router.prefix}/get_group_detail 调用错误", "WebUi", e=e)

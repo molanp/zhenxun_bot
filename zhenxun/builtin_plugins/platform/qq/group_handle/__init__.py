@@ -109,7 +109,7 @@ async def _(
     if session.user.id == bot.self_id:
         """新成员为bot本身"""
         group, _ = await GroupConsole.get_or_create(
-            group_id=str(event.group_id), channel_id__isnull=True
+            group_id=str(event.group_id), channel_id__isnull=True, bot_id=bot.self_id
         )
         try:
             await GroupManager.add_bot(

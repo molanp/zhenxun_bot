@@ -545,7 +545,9 @@ async def get_broadcast_target_groups(
         if not tagged_group_ids:
             return [], []
 
-        valid_groups = await GroupConsole.filter(group_id__in=tagged_group_ids)
+        valid_groups = await GroupConsole.filter(
+            group_id__in=tagged_group_ids, bot_id=bot.self_id
+        )
 
         if current_group_id:
             target_groups_console = [
@@ -573,7 +575,7 @@ async def get_broadcast_target_groups(
             )
             logger.info(broadcast_msg, "广播", session=session)
     else:
-        all_groups, _ = await BroadcastManager.get_all_groups(bot)
+        all_groups = await BroadcastManager.get_all_groups(bot)
 
         if current_group_id:
             target_groups_console = [

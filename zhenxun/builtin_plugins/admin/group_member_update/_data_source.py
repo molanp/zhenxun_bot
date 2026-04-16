@@ -106,7 +106,9 @@ class MemberUpdateManage:
 
             try:
                 group_console, _ = await GroupConsole.get_or_create(
-                    group_id=group_id, defaults={"platform": platform}
+                    group_id=group_id,
+                    defaults={"platform": platform},
+                    bot_id=bot.self_id,
                 )
                 group_console.member_count = len(members)
                 group_console.group_name = group_scene.name or ""

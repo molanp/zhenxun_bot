@@ -40,7 +40,7 @@ async def _():
     update_list = []
     if modules := await TaskInfo.annotate().values_list("module", flat=True):
         for bot in nonebot.get_bots().values():
-            group_list, _ = await PlatformUtils.get_group_list(bot, True)
+            group_list = await PlatformUtils.get_group_list(bot, True)
             for group in group_list:
                 try:
                     last_message = (
@@ -53,10 +53,12 @@ async def _():
                         now = datetime.now(pytz.timezone("Asia/Shanghai"))
                         if now - timedelta(days=2) > last_message.create_time:
                             _group, _ = await GroupConsole.get_or_create(
-                                group_id=group.group_id, channel_id__isnull=True
+                                group_id=group.group_id,
+                                channel_id__isnull=True,
+                                bot_id=bot.self_id,
                             )
                             modules = [f"<{module}" for module in modules]
-                            _group.block_task = ",".join(modules) + ","  # type: ignore
+                            _group.block_task = ",".join(modules) + ","
                             update_list.append(_group)
                             logger.info(
                                 "群组两日内未发送任何消息，关闭该群全部被动",

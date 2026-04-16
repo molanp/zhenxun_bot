@@ -49,7 +49,7 @@ async def _(bot: Bot):
     logger.debug(f"更新Bot: {bot_id} 的群认证...", "群认证同步")
 
     # 实际在用的群列表（当前 bot 连接可见的群）
-    current_group_list, _ = await PlatformUtils.get_group_list(bot)
+    current_group_list = await PlatformUtils.get_group_list(bot)
     current_group_ids = {g.group_id for g in current_group_list}
 
     # 数据库中已有的群记录

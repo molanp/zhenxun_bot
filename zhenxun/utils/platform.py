@@ -311,14 +311,13 @@ class PlatformUtils:
         """
         create_list = []
         update_list = []
-        group_list, platform = await cls.get_group_list(bot)
+        group_list = await cls.get_group_list(bot)
         if group_list:
-            db_group = await GroupConsole.all()
+            db_group = await GroupConsole.filter(bot_id=bot.self_id)
             db_group_id: list[tuple[str, str]] = [
                 (group.group_id, group.channel_id) for group in db_group
             ]
             for group in group_list:
-                group.platform = platform
                 if (group.group_id, group.channel_id) not in db_group_id:
                     create_list.append(group)
                     logger.debug(
@@ -385,7 +384,7 @@ class PlatformUtils:
     @classmethod
     async def get_group_list(
         cls, bot: Bot, only_group: bool = False
-    ) -> tuple[list[GroupConsole], str]:
+    ) -> list[GroupConsole]:
         """获取群组列表
 
         参数:
@@ -393,10 +392,10 @@ class PlatformUtils:
             only_group: 是否只获取群组（不获取channel）
 
         返回:
-            tuple[list[GroupConsole], str]: 群组列表, 平台
+            list[GroupConsole]: 群组列表
         """
         if not (interface := get_interface(bot)):
-            return [], ""
+            return []
         platform = cls.get_platform(bot)
         result_list = []
         scenes = await interface.get_scenes(SceneType.GROUP)
@@ -407,6 +406,7 @@ class PlatformUtils:
                     bot_id=bot.self_id,
                     group_id=scene.id,
                     group_name=scene.name,
+                    platform=platform,
                 )
             )
             if not only_group and platform != "qq":
@@ -417,10 +417,11 @@ class PlatformUtils:
                             group_id=scene.id,
                             group_name=channel.name,
                             channel_id=channel.id,
+                            platform=platform,
                         )
                         for channel in channel_list
                     )
-        return result_list, platform
+        return result_list
 
     @classmethod
     async def update_friend(cls, bot: Bot) -> int:
@@ -433,19 +434,20 @@ class PlatformUtils:
             int: 更新个数
         """
         create_list = []
-        friend_list, platform = await cls.get_friend_list(bot)
+        friend_list = await cls.get_friend_list(bot)
         if friend_list:
-            user_id_list = await FriendUser.all().values_list("user_id", flat=True)
-            for friend in friend_list:
-                friend.platform = platform
-                if friend.user_id not in user_id_list:
-                    create_list.append(friend)
+            user_id_list = await FriendUser.filter(bot_id=bot.self_id).values_list(
+                "user_id", flat=True
+            )
+            create_list.extend(
+                friend for friend in friend_list if friend.user_id not in user_id_list
+            )
         if create_list:
             await FriendUser.bulk_create(create_list, 10)
         return len(create_list)
 
     @classmethod
-    async def get_friend_list(cls, bot: Bot) -> tuple[list[FriendUser], str]:
+    async def get_friend_list(cls, bot: Bot) -> list[FriendUser]:
         """获取好友列表
 
         参数:
@@ -456,10 +458,17 @@ class PlatformUtils:
         """
         if interface := get_interface(bot):
             user_list = await interface.get_users()
+            platform = cls.get_platform(bot)
             return [
-                FriendUser(user_id=u.id, user_name=u.name) for u in user_list
-            ], cls.get_platform(bot)
-        return [], ""
+                FriendUser(
+                    user_id=u.id,
+                    user_name=u.name,
+                    bot_id=bot.self_id,
+                    platform=platform,
+                )
+                for u in user_list
+            ]
+        return []
 
     @classmethod
     def get_target(
@@ -596,7 +605,7 @@ class BroadcastEngine:
         for bot in self.bot_list:
             if self.platform and self.platform != PlatformUtils.get_platform(bot):
                 continue
-            group_list, _ = await PlatformUtils.get_group_list(bot)
+            group_list = await PlatformUtils.get_group_list(bot)
             if not group_list:
                 continue
             for group in group_list:
