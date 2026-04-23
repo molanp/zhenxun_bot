@@ -148,6 +148,7 @@ async def clean_chat_history(
     # 只取最多 max_delete 条记录的 id，然后删除这些记录，避免一次删太多
     ids = (
         await ChatHistory.filter(group_id__not_in=group_ids)
+        .order_by("create_time")
         .limit(max_delete)
         .values_list("id", flat=True)
     )
