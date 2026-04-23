@@ -18,20 +18,20 @@ if TYPE_CHECKING:
 
 LOG_COMMAND = "RuntimeCache"
 
-PLUGININFO_MEM_REFRESH_INTERVAL = 300
+PLUGININFO_MEM_REFRESH_INTERVAL = 1800  # 30分钟 - 插件信息很少变化
 BAN_MEM_REFRESH_INTERVAL = 60
 BAN_MEM_CLEAN_INTERVAL = 60
 BAN_MEM_CLEANUP_DB = True
 BAN_MEM_NEGATIVE_TTL = 5
-BOT_MEM_REFRESH_INTERVAL = 60
+BOT_MEM_REFRESH_INTERVAL = 300  # 5分钟
 BOT_MEM_NEGATIVE_TTL = 60
-GROUP_MEM_REFRESH_INTERVAL = 60
+GROUP_MEM_REFRESH_INTERVAL = 300  # 5分钟 - 群组信息很少变化
 GROUP_MEM_NEGATIVE_TTL = 60
-LEVEL_MEM_REFRESH_INTERVAL = 120
+LEVEL_MEM_REFRESH_INTERVAL = 300  # 5分钟 - 用户等级很少变化
 LEVEL_MEM_NEGATIVE_TTL = 60
 TASK_MEM_REFRESH_INTERVAL = 900
 TASK_MEM_NEGATIVE_TTL = 60
-LIMIT_MEM_REFRESH_INTERVAL = 60
+LIMIT_MEM_REFRESH_INTERVAL = 300  # 5分钟
 LIMIT_MEM_NEGATIVE_TTL = 30
 RUNTIME_CACHE_SYNC_ENABLED = True
 RUNTIME_CACHE_SYNC_CHANNEL = "ZHENXUN_RUNTIME_CACHE_SYNC"
@@ -368,35 +368,47 @@ class PluginLimitSnapshot:
 
 @dataclass(frozen=True)
 class TaskInfoSnapshot:
+    id: int
     module: str
+    name: str
     status: bool
     load_status: bool
     default_status: bool
+    run_time: str | None
 
     @classmethod
     def from_model(cls, model) -> "TaskInfoSnapshot":
         return cls(
+            id=int(getattr(model, "id", 0) or 0),
             module=str(model.module),
+            name=str(getattr(model, "name", "") or ""),
             status=bool(getattr(model, "status", True)),
             load_status=bool(getattr(model, "load_status", True)),
             default_status=bool(getattr(model, "default_status", True)),
+            run_time=getattr(model, "run_time", None),
         )
 
     def to_payload(self) -> dict[str, Any]:
         return {
+            "id": self.id,
             "module": self.module,
+            "name": self.name,
             "status": self.status,
             "load_status": self.load_status,
             "default_status": self.default_status,
+            "run_time": self.run_time,
         }
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "TaskInfoSnapshot":
         return cls(
+            id=int(payload.get("id", 0) or 0),
             module=str(payload.get("module", "")),
+            name=str(payload.get("name", "") or ""),
             status=bool(payload.get("status", True)),
             load_status=bool(payload.get("load_status", True)),
             default_status=bool(payload.get("default_status", True)),
+            run_time=payload.get("run_time"),
         )
 
 
@@ -1208,6 +1220,7 @@ class LevelUserMemoryCache:
 class TaskInfoMemoryCache:
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _by_module: ClassVar[dict[str, TaskInfoSnapshot]] = {}
+    _by_name: ClassVar[dict[str, TaskInfoSnapshot]] = {}
     _negative: ClassVar[dict[str, float]] = {}
     _loaded: ClassVar[bool] = False
     _refresh_task: ClassVar[asyncio.Task | None] = None
@@ -1246,7 +1259,15 @@ class TaskInfoMemoryCache:
 
         async with cls._lock:
             records = await TaskInfo.all()
-            cls._by_module = {r.module: TaskInfoSnapshot.from_model(r) for r in records}
+            by_module: dict[str, TaskInfoSnapshot] = {}
+            by_name: dict[str, TaskInfoSnapshot] = {}
+            for record in records:
+                entry = TaskInfoSnapshot.from_model(record)
+                by_module[entry.module] = entry
+                if entry.name:
+                    by_name[entry.name] = entry
+            cls._by_module = by_module
+            cls._by_name = by_name
             cls._negative = {}
             cls._loaded = True
             logger.debug(
@@ -1276,6 +1297,21 @@ class TaskInfoMemoryCache:
         return None
 
     @classmethod
+    async def get_by_name(cls, name: str | None) -> TaskInfoSnapshot | None:
+        name = (name or "").strip()
+        if not name:
+            return None
+        if not cls._loaded:
+            await cls.ensure_loaded()
+        return cls._by_name.get(name)
+
+    @classmethod
+    async def get_all(cls) -> list[TaskInfoSnapshot]:
+        if not cls._loaded:
+            await cls.ensure_loaded()
+        return sorted(cls._by_module.values(), key=lambda item: (item.id, item.module))
+
+    @classmethod
     async def is_disabled(cls, module: str | None) -> bool:
         entry = await cls.get(module)
         if not entry:
@@ -1287,6 +1323,8 @@ class TaskInfoMemoryCache:
         entry = TaskInfoSnapshot.from_model(record)
         async with cls._lock:
             cls._by_module[entry.module] = entry
+            if entry.name:
+                cls._by_name[entry.name] = entry
             cls._negative.pop(entry.module, None)
         RuntimeCacheSync.publish_event("task", "upsert", entry.to_payload())
 
@@ -1297,6 +1335,8 @@ class TaskInfoMemoryCache:
             return
         async with cls._lock:
             cls._by_module[entry.module] = entry
+            if entry.name:
+                cls._by_name[entry.name] = entry
             cls._negative.pop(entry.module, None)
 
     @classmethod
@@ -1305,7 +1345,11 @@ class TaskInfoMemoryCache:
         if not module:
             return
         async with cls._lock:
-            cls._by_module.pop(module, None)
+            removed = cls._by_module.pop(module, None)
+            if removed and removed.name:
+                current = cls._by_name.get(removed.name)
+                if current and current.module == removed.module:
+                    cls._by_name.pop(removed.name, None)
         RuntimeCacheSync.publish_event("task", "delete", {"module": module})
 
     @classmethod
@@ -1837,37 +1881,27 @@ class BanMemoryCache:
             await cls.refresh()
 
 
+async def _safe_refresh(cache_cls: type, label: str) -> None:
+    """安全地刷新单个缓存，异常不影响其他缓存。"""
+    try:
+        await cache_cls.refresh()
+    except Exception as exc:
+        logger.error(f"{label} cache init failed", LOG_COMMAND, e=exc)
+
+
 @PriorityLifecycle.on_startup(priority=6)
 async def _init_runtime_cache():
     await RuntimeCacheSync.start()
-    try:
-        await PluginInfoMemoryCache.refresh()
-    except Exception as exc:
-        logger.error("plugin cache init failed", LOG_COMMAND, e=exc)
-    try:
-        await BotMemoryCache.refresh()
-    except Exception as exc:
-        logger.error("bot cache init failed", LOG_COMMAND, e=exc)
-    try:
-        await GroupMemoryCache.refresh()
-    except Exception as exc:
-        logger.error("group cache init failed", LOG_COMMAND, e=exc)
-    try:
-        await LevelUserMemoryCache.refresh()
-    except Exception as exc:
-        logger.error("level cache init failed", LOG_COMMAND, e=exc)
-    try:
-        await TaskInfoMemoryCache.refresh()
-    except Exception as exc:
-        logger.error("task info cache init failed", LOG_COMMAND, e=exc)
-    try:
-        await PluginLimitMemoryCache.refresh()
-    except Exception as exc:
-        logger.error("plugin limit cache init failed", LOG_COMMAND, e=exc)
-    try:
-        await BanMemoryCache.refresh()
-    except Exception as exc:
-        logger.error("ban cache init failed", LOG_COMMAND, e=exc)
+    # 并发刷新所有缓存，互不依赖
+    await asyncio.gather(
+        _safe_refresh(PluginInfoMemoryCache, "plugin"),
+        _safe_refresh(BotMemoryCache, "bot"),
+        _safe_refresh(GroupMemoryCache, "group"),
+        _safe_refresh(LevelUserMemoryCache, "level"),
+        _safe_refresh(TaskInfoMemoryCache, "task info"),
+        _safe_refresh(PluginLimitMemoryCache, "plugin limit"),
+        _safe_refresh(BanMemoryCache, "ban"),
+    )
     PluginInfoMemoryCache.start_refresh_task()
     BotMemoryCache.start_tasks()
     GroupMemoryCache.start_tasks()

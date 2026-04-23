@@ -153,7 +153,7 @@ class BaseRepoManager(ABC):
             return ""
 
         try:
-            async with aiofiles.open(version_file) as f:
+            async with aiofiles.open(version_file, encoding="utf-8") as f:
                 return (await f.read()).strip()
         except Exception as e:
             logger.error(f"读取版本文件失败: {e}")
@@ -174,10 +174,10 @@ class BaseRepoManager(ABC):
 
         try:
             version_bb = "vNone"
-            async with aiofiles.open(version_file) as rf:
+            async with aiofiles.open(version_file, encoding="utf-8") as rf:
                 if text := await rf.read():
                     version_bb = text.strip().split("-")[0]
-            async with aiofiles.open(version_file, "w") as f:
+            async with aiofiles.open(version_file, "w", encoding="utf-8") as f:
                 await f.write(f"{version_bb}-{version[:6]}")
             return True
         except Exception as e:
@@ -261,9 +261,9 @@ class BaseRepoManager(ABC):
             # 检查本地目录是否存在
             if not await AsyncPath(local_path).exists():
                 # 如果不存在，则克隆仓库
-                logger.info(f"克隆仓库 {repo_url} 到 {local_path}", LOG_COMMAND)
+                logger.info(f"正在克隆仓库 {repo_url}，请耐心等待...", LOG_COMMAND)
                 success, _stdout, stderr = await run_git_command(
-                    f"clone -b {branch} {repo_url} {local_path}"
+                    f"clone --progress -b {branch} {repo_url} {local_path}"
                 )
                 if not success:
                     return RepoUpdateResult(
@@ -375,11 +375,28 @@ class BaseRepoManager(ABC):
 
             # 拉取最新代码
             logger.info(f"拉取最新代码: {repo_url}", LOG_COMMAND)
-            pull_cmd = f"pull origin {branch}"
             if force:
-                pull_cmd = f"fetch --all && git reset --hard origin/{branch}"
                 logger.info("使用强制拉取模式", LOG_COMMAND)
-            success, _, stderr = await run_git_command(pull_cmd, cwd=local_path)
+                # 强制模式需要两步：先 fetch，再 reset，不能用 shell && 链式写法
+                success, _, stderr = await run_git_command(
+                    "fetch --all", cwd=local_path
+                )
+                if not success:
+                    return RepoUpdateResult(
+                        repo_type=repo_type or RepoType.GITHUB,
+                        repo_name=repo_name,
+                        owner=owner or "",
+                        old_version=old_version.strip(),
+                        new_version="",
+                        error_message=f"拉取最新代码失败: {stderr}",
+                    )
+                success, _, stderr = await run_git_command(
+                    f"reset --hard origin/{branch}", cwd=local_path
+                )
+            else:
+                success, _, stderr = await run_git_command(
+                    f"pull origin {branch}", cwd=local_path
+                )
             if not success:
                 return RepoUpdateResult(
                     repo_type=repo_type or RepoType.GITHUB,

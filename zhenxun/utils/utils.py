@@ -184,7 +184,7 @@ def change_img_md5(path_file: str | Path) -> bool:
         bool: 是否修改成功
     """
     try:
-        with open(path_file, "a") as f:
+        with open(path_file, "a", encoding="utf-8") as f:
             f.write(str(int(time.time() * 1000)))
         return True
     except Exception as e:

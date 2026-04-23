@@ -58,7 +58,7 @@ class ZhenxunRepoConfig:
     # 备份杂项
     BACKUP_FILES: ClassVar[list[str]] = [
         "pyproject.toml",
-        "poetry.lock",
+        "uv.lock",
         "requirements.txt",
         ".env.dev",
         ".env.example",
@@ -89,7 +89,7 @@ class ZhenxunRepoConfig:
     PYPROJECT_FILE_STRING = "pyproject.toml"
     PYPROJECT_FILE = Path() / PYPROJECT_FILE_STRING
 
-    PYPROJECT_LOCK_FILE_STRING = "poetry.lock"
+    PYPROJECT_LOCK_FILE_STRING = "uv.lock"
     PYPROJECT_LOCK_FILE = Path() / PYPROJECT_LOCK_FILE_STRING
 
 
@@ -363,13 +363,16 @@ class ZhenxunRepoManagerClass:
         download_url = await GithubUtils.parse_github_url(
             self.config.RESOURCE_GITHUB_URL
         ).get_archive_download_urls()
-        logger.debug("开始下载resources资源包...", LOG_COMMAND)
+        logger.info("开始下载资源压缩包...", LOG_COMMAND)
         if await AsyncHttpx.download_file(
-            download_url, self.config.RESOURCE_ZIP_FILE, stream=True
+            download_url,
+            self.config.RESOURCE_ZIP_FILE,
+            stream=True,
+            show_progress=True,
         ):
-            logger.debug("下载resources资源文件压缩包成功!", LOG_COMMAND)
+            logger.info("下载资源压缩包成功!", LOG_COMMAND)
         else:
-            raise ZhenxunUpdateException("下载resources资源包失败...")
+            raise ZhenxunUpdateException("下载资源压缩包失败...")
 
     async def resources_unzip(self):
         """解压资源文件"""
@@ -428,13 +431,16 @@ class ZhenxunRepoManagerClass:
         source: Literal["git", "ali"] = "ali",
         branch: str = "main",
         force: bool = False,
-    ):
+    ) -> RepoUpdateResult | None:
         """更新资源文件
 
         参数:
             source: 更新源，git 为 git 更新，ali 为阿里云更新
             branch: 分支名称
             force: 是否强制更新
+
+        返回:
+            RepoUpdateResult | None: git 更新时返回结果，zip 更新时返回 None
         """
         critical_dir = self.config.RESOURCE_PATH / "themes" / "default"
         if not critical_dir.exists() or not any(critical_dir.iterdir()):
@@ -445,11 +451,30 @@ class ZhenxunRepoManagerClass:
             force = True
 
         if await check_git():
-            await self.resources_git_update(source, branch, force)
-            logger.debug("使用git更新资源文件!", LOG_COMMAND)
+            result = await self.resources_git_update(source, branch, force)
+            if result.success:
+                logger.info("使用git更新资源文件完成!", LOG_COMMAND)
+                return result
+            else:
+                logger.warning(
+                    f"使用git更新资源文件失败: {result.error_message}，"
+                    "尝试回退到zip下载...",
+                    LOG_COMMAND,
+                )
+                # git 失败时回退 zip，确保资源文件一定能获取到
+                try:
+                    await self.resources_zip_update()
+                    logger.info("回退zip下载资源文件完成!", LOG_COMMAND)
+                    result.success = True
+                    result.error_message = ""
+                    return result
+                except Exception as e:
+                    logger.error("回退zip下载资源文件也失败", LOG_COMMAND, e=e)
+                    return result
         else:
             await self.resources_zip_update()
-            logger.debug("使用zip更新资源文件!", LOG_COMMAND)
+            logger.info("使用zip更新资源文件完成!", LOG_COMMAND)
+            return None
 
     # ==================== Web UI 管理相关方法 ====================
 

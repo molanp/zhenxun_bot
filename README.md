@@ -158,11 +158,11 @@ git clone https://github.com/HibiKier/zhenxun_bot.git
 cd zhenxun_bot
 
 # 安装依赖
-pip install poetry      # 安装 poetry
-poetry install          # 安装依赖
+pip install uv          # 安装 uv
+uv sync                 # 安装依赖
 
 # 开始运行
-poetry run python bot.py
+uv run zx
 ```
 
 ## 📝 简单配置

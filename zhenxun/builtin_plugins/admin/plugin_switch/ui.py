@@ -8,7 +8,7 @@ from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.task_info import TaskInfo
 from zhenxun.ui.models import LayoutData, StatusBadgeCell, TextCell
 from zhenxun.utils.enum import PluginType
-from zhenxun.utils.exception import GroupInfoNotFound
+from zhenxun.utils.exception import GroupConsoleNotFound
 from zhenxun.utils.platform import PlatformUtils
 
 from .strategy import get_strategy
@@ -28,7 +28,11 @@ async def build_plugin() -> bytes:
         "版本",
         "金币花费",
     ]
-    plugin_list = await PluginInfo.filter(plugin_type__not=PluginType.HIDDEN).all()
+    plugin_list = await PluginInfo.get_plugins(
+        load_status=None,
+        filter_parent=False,
+        plugin_type__not=PluginType.HIDDEN,
+    )
     rows = []
     for plugin in plugin_list:
         status_cell = StatusBadgeCell(
@@ -76,13 +80,13 @@ async def build_plugin() -> bytes:
 
 async def build_task(group_id: str | None) -> bytes:
     """构造被动技能状态图片"""
-    task_list = await TaskInfo.all()
+    task_list = await TaskInfo.get_tasks(load_status=None)
     column_name = ["ID", "模块", "名称", "群组状态", "全局状态", "运行时间"]
     group = None
     if group_id:
         group = await GroupConsole.get_group_db(group_id=group_id)
         if not group:
-            raise GroupInfoNotFound()
+            raise GroupConsoleNotFound()
     else:
         column_name.remove("群组状态")
     rows = []

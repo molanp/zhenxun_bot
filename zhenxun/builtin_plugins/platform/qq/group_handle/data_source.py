@@ -40,9 +40,7 @@ _REFRESH_TASKS: set[asyncio.Task] = set()
 
 
 def _normalize_platform(platform: str | set[str] | None) -> str | None:
-    if isinstance(platform, set):
-        return next(iter(platform), None)
-    return platform
+    return next(iter(platform), None) if isinstance(platform, set) else platform
 
 
 async def _safe_get_group_member_info(bot: Bot, group_id: str, user_id: str) -> dict:
@@ -105,7 +103,11 @@ class GroupManager:
             await group.save(update_fields=["group_flag"])
         else:
             block_plugin = ""
-            if plugin_list := await PluginInfo.filter(default_status=False).all():
+            if plugin_list := await PluginInfo.get_plugins(
+                load_status=None,
+                filter_parent=False,
+                default_status=False,
+            ):
                 for plugin in plugin_list:
                     block_plugin += f"<{plugin.module},"
             group_info = await _safe_get_group_info(bot, group_id)
@@ -409,12 +411,11 @@ class GroupManager:
                 operator_user = await GroupInfoUser.get_or_none(
                     user_id=operator_id, group_id=group_id
                 )
-                if operator_user:
-                    operator_name = (
-                        operator_user.nickname or operator_user.user_name or operator_id
-                    )
-                else:
-                    operator_name = operator_id
+                operator_name = (
+                    (operator_user.user_name or operator_id)
+                    if operator_user
+                    else operator_id
+                )
             else:
                 operator_name = ""
             return f"{user_name} 被 {operator_name} 送走了."

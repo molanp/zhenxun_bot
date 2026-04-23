@@ -2,7 +2,7 @@ from collections.abc import Callable
 import os
 from pathlib import Path
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from jinja2 import (
     ChoiceLoader,
@@ -258,6 +258,34 @@ class ComponentRenderStrategy(RenderStrategy):
 class TemplateFileRenderStrategy(RenderStrategy):
     """独立模板文件渲染策略。"""
 
+    _env_cache: ClassVar[dict[Path, "RelativePathEnvironment"]] = {}
+    _ENV_CACHE_MAX = 32
+
+    @classmethod
+    def _get_or_create_env(
+        cls,
+        template_dir: Path,
+        base_loader: Any,
+    ) -> "RelativePathEnvironment":
+        env = cls._env_cache.get(template_dir)
+        if env is not None:
+            return env
+
+        temp_loader = FileSystemLoader(str(template_dir))
+        temp_env_loader = (
+            ChoiceLoader([temp_loader, base_loader]) if base_loader else temp_loader
+        )
+        env = RelativePathEnvironment(
+            loader=temp_env_loader,
+            enable_async=True,
+            autoescape=select_autoescape(["html", "xml"]),
+        )
+
+        if len(cls._env_cache) >= cls._ENV_CACHE_MAX:
+            cls._env_cache.pop(next(iter(cls._env_cache)))
+        cls._env_cache[template_dir] = env
+        return env
+
     async def render(self, context: "RenderContext") -> RenderResult:
         component = context.component
         template_path = getattr(component, "template_path")
@@ -265,16 +293,9 @@ class TemplateFileRenderStrategy(RenderStrategy):
         logger.debug(f"正在渲染独立模板: '{template_path}'", "RendererService")
 
         template_dir = template_path.parent
-        temp_loader = FileSystemLoader(str(template_dir))
         base_loader = context.template_engine.env.loader
-        temp_env_loader = (
-            ChoiceLoader([temp_loader, base_loader]) if base_loader else temp_loader
-        )
-        temp_env = RelativePathEnvironment(
-            loader=temp_env_loader,
-            enable_async=True,
-            autoescape=select_autoescape(["html", "xml"]),
-        )
+
+        temp_env = self._get_or_create_env(template_dir, base_loader)
         temp_env.globals.update(context.template_engine.env.globals)
         temp_env.filters.update(context.template_engine.env.filters)
         temp_env.globals["asset"] = (

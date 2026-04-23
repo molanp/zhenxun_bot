@@ -1,7 +1,8 @@
 import asyncio
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 import contextlib
+from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
@@ -9,6 +10,7 @@ from pathlib import Path
 import time
 from typing import Any, ClassVar, cast
 
+import nonebot_plugin_htmlrender as htmlrender_module
 import nonebot_plugin_htmlrender.browser as htmlrender_browser
 import psutil
 
@@ -16,6 +18,98 @@ from zhenxun.configs.config import Config
 from zhenxun.services.log import logger
 
 from .types import BaseScreenshotEngine
+
+_PLAYWRIGHT_DISCONNECT_ERROR = "Connection closed while reading from the driver"
+_UNRETRIEVED_FUTURE_MESSAGE = "Future exception was never retrieved"
+_LOOP_EXCEPTION_FILTER_STATE_ATTR = "_zhenxun_playwright_exception_filter_state"
+_DISCONNECT_SUPPRESSION_WINDOW_SECONDS = 10.0
+
+
+class HtmlrenderTaskTracker:
+    """只追踪 htmlrender 渲染任务的轻量运行时。"""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._idle_event = asyncio.Event()
+        self._idle_event.set()
+        self._active_tasks = 0
+        self._draining = False
+        self._drain_reason: str | None = None
+
+    @property
+    def active_tasks(self) -> int:
+        return self._active_tasks
+
+    @property
+    def is_draining(self) -> bool:
+        return self._draining
+
+    async def reset(self) -> None:
+        async with self._lock:
+            self._draining = False
+            self._drain_reason = None
+            if self._active_tasks == 0:
+                self._idle_event.set()
+
+    async def resume(self) -> None:
+        async with self._lock:
+            self._draining = False
+            self._drain_reason = None
+
+    async def mark_draining(self, reason: str) -> None:
+        async with self._lock:
+            self._draining = True
+            self._drain_reason = reason
+
+    async def begin(self, owner: str) -> None:
+        async with self._lock:
+            if self._draining:
+                reason = self._drain_reason or "unknown"
+                message = (
+                    "htmlrender 正在排空，拒绝新的渲染任务: "
+                    f"owner={owner}, reason={reason}"
+                )
+                raise RuntimeError(message)
+            self._active_tasks += 1
+            self._idle_event.clear()
+
+    async def end(self) -> None:
+        async with self._lock:
+            self._active_tasks = max(0, self._active_tasks - 1)
+            if self._active_tasks == 0:
+                self._idle_event.set()
+
+    async def wait_for_idle(self) -> None:
+        await self._idle_event.wait()
+
+    @contextlib.asynccontextmanager
+    async def track(self, owner: str):
+        await self.begin(owner)
+        try:
+            yield
+        finally:
+            await self.end()
+
+
+_HTMLRENDER_TASK_TRACKER = HtmlrenderTaskTracker()
+
+
+@dataclass(slots=True)
+class ContextGeneration:
+    generation_id: int
+    context_pool: asyncio.LifoQueue[Any] = field(default_factory=asyncio.LifoQueue)
+    all_contexts: set[Any] = field(default_factory=set)
+    active_leases: int = 0
+    retiring: bool = False
+
+    def snapshot(self) -> dict[str, int | bool]:
+        return {
+            "generation_id": self.generation_id,
+            "pool_size": self.context_pool.qsize(),
+            "context_count": len(self.all_contexts),
+            "active_leases": self.active_leases,
+            "retiring": self.retiring,
+        }
 
 
 async def _await_if_needed(value: Any) -> Any:
@@ -32,35 +126,95 @@ async def _get_browser_instance() -> Any:
     raise RuntimeError("nonebot_plugin_htmlrender.browser 未提供可用浏览器获取函数。")
 
 
-async def _shutdown_browser_instance() -> None:
-    for attr_name in (
-        "shutdown_htmlrender",
-        "shutdown_browser",
-        "close_browser",
-        "close_htmlrender",
-    ):
-        shutdown_func = getattr(htmlrender_browser, attr_name, None)
-        if callable(shutdown_func):
-            try:
-                await _await_if_needed(shutdown_func())
-            finally:
-                with contextlib.suppress(Exception):
-                    setattr(htmlrender_browser, "_browser", None)
-                with contextlib.suppress(Exception):
-                    setattr(htmlrender_browser, "_playwright", None)
+def _is_ignorable_playwright_disconnect(ctx: dict[str, Any]) -> bool:
+    exc = ctx.get("exception")
+    return (
+        ctx.get("message") == _UNRETRIEVED_FUTURE_MESSAGE
+        and isinstance(exc, Exception)
+        and _PLAYWRIGHT_DISCONNECT_ERROR in str(exc)
+    )
+
+
+def _get_loop_exception_filter_state(
+    loop: asyncio.AbstractEventLoop,
+) -> dict[str, Any] | None:
+    state = getattr(loop, _LOOP_EXCEPTION_FILTER_STATE_ATTR, None)
+    if isinstance(state, dict):
+        return state
+    return None
+
+
+def _ensure_loop_exception_filter(
+    loop: asyncio.AbstractEventLoop,
+) -> dict[str, Any]:
+    state = _get_loop_exception_filter_state(loop)
+    if state is not None:
+        return state
+
+    state = {
+        "original_handler": loop.get_exception_handler(),
+        "suppress_until": 0.0,
+    }
+
+    def _filter(lp: asyncio.AbstractEventLoop, ctx: dict[str, Any]) -> None:
+        if _is_ignorable_playwright_disconnect(ctx):
+            suppress_until = float(state.get("suppress_until", 0.0))
+            if suppress_until >= time.monotonic():
+                return
+        original_handler = state.get("original_handler")
+        if callable(original_handler):
+            original_handler(lp, ctx)
             return
+        lp.default_exception_handler(ctx)
+
+    loop.set_exception_handler(_filter)
+    setattr(loop, _LOOP_EXCEPTION_FILTER_STATE_ATTR, state)
+    return state
+
+
+def _arm_disconnect_exception_suppression(
+    loop: asyncio.AbstractEventLoop,
+    *,
+    seconds: float = _DISCONNECT_SUPPRESSION_WINDOW_SECONDS,
+) -> None:
+    state = _ensure_loop_exception_filter(loop)
+    deadline = time.monotonic() + max(seconds, 0.0)
+    state["suppress_until"] = max(float(state.get("suppress_until", 0.0)), deadline)
+
+
+async def _shutdown_browser_instance() -> None:
+    loop = asyncio.get_running_loop()
+    _arm_disconnect_exception_suppression(loop)
 
     browser_obj = getattr(htmlrender_browser, "_browser", None)
+    playwright_obj = getattr(htmlrender_browser, "_playwright", None)
+    if browser_obj is not None:
+        is_connected_fn = getattr(browser_obj, "is_connected", None)
+        if callable(is_connected_fn) and not is_connected_fn():
+            with contextlib.suppress(Exception):
+                setattr(htmlrender_browser, "_browser", None)
+            with contextlib.suppress(Exception):
+                setattr(htmlrender_browser, "_playwright", None)
+            return
+
+    if browser_obj is None and playwright_obj is None:
+        return
+
     close_func = getattr(browser_obj, "close", None) if browser_obj else None
     if callable(close_func):
-        with contextlib.suppress(Exception):
+        try:
             await _await_if_needed(close_func())
+        except Exception as e:
+            if _PLAYWRIGHT_DISCONNECT_ERROR not in str(e):
+                logger.debug(f"关闭浏览器实例时忽略异常: {e}")
 
-    playwright_obj = getattr(htmlrender_browser, "_playwright", None)
     stop_func = getattr(playwright_obj, "stop", None) if playwright_obj else None
     if callable(stop_func):
-        with contextlib.suppress(Exception):
+        try:
             await _await_if_needed(stop_func())
+        except Exception as e:
+            if _PLAYWRIGHT_DISCONNECT_ERROR not in str(e):
+                logger.debug(f"关闭 Playwright 实例时忽略异常: {e}")
 
     with contextlib.suppress(Exception):
         setattr(htmlrender_browser, "_browser", None)
@@ -68,15 +222,55 @@ async def _shutdown_browser_instance() -> None:
         setattr(htmlrender_browser, "_playwright", None)
 
     if callable(close_func) or callable(stop_func):
+        await asyncio.sleep(0)
+
+
+def _patch_htmlrender_task_tracking() -> None:
+    if getattr(htmlrender_browser, "_zhenxun_task_tracking_patched", False):
         return
 
-    logger.debug(
-        "未找到 htmlrender 浏览器关闭函数，跳过 shutdown。",
-        "PlaywrightEngine",
-    )
+    try:
+        import nonebot_plugin_htmlrender.data_source as htmlrender_data_source
+    except Exception as e:
+        logger.warning("导入 htmlrender.data_source 失败，跳过任务追踪补丁。", e=e)
+        return
+
+    original_get_new_page = getattr(htmlrender_browser, "get_new_page", None)
+    if not callable(original_get_new_page):
+        logger.warning("htmlrender 未提供 get_new_page，跳过任务追踪补丁。")
+        return
+    original_get_new_page = cast(Callable[..., Any], original_get_new_page)
+
+    @contextlib.asynccontextmanager
+    async def _tracked_get_new_page(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        async with _HTMLRENDER_TASK_TRACKER.track("htmlrender"):
+            page_context = cast(Any, original_get_new_page(*args, **kwargs))
+            async with page_context as page:
+                yield page
+
+    setattr(htmlrender_browser, "get_new_page", _tracked_get_new_page)
+    setattr(htmlrender_module, "get_new_page", _tracked_get_new_page)
+    setattr(htmlrender_data_source, "get_new_page", _tracked_get_new_page)
+    setattr(htmlrender_browser, "_zhenxun_task_tracking_patched", True)
+
+
+def _patch_htmlrender_shutdown() -> None:
+    if getattr(htmlrender_browser, "_zhenxun_shutdown_patched", False):
+        return
+
+    async def _patched_shutdown_browser() -> None:
+        if _HTMLRENDER_TASK_TRACKER.is_draining:
+            await _HTMLRENDER_TASK_TRACKER.wait_for_idle()
+        await _shutdown_browser_instance()
+
+    setattr(htmlrender_browser, "shutdown_browser", _patched_shutdown_browser)
+    setattr(htmlrender_module, "shutdown_browser", _patched_shutdown_browser)
+    setattr(htmlrender_browser, "_zhenxun_shutdown_patched", True)
 
 
 def _patch_playwright_env_check_once() -> None:
+    _patch_htmlrender_task_tracking()
+    _patch_htmlrender_shutdown()
     if getattr(htmlrender_browser, "_zhenxun_check_once_patched", False):
         return
 
@@ -155,9 +349,9 @@ def _patch_playwright_env_check_once() -> None:
 class PlaywrightEngine(BaseScreenshotEngine):
     """使用 nonebot-plugin-htmlrender 实现的截图引擎。"""
 
-    _MAX_CONCURRENT_RENDER = 2
-    _CONTEXT_POOL_SIZE = 2
-    _PREWARM_CONTEXT_COUNT = 1
+    _MAX_CONCURRENT_RENDER = 4
+    _CONTEXT_POOL_SIZE = 4
+    _PREWARM_CONTEXT_COUNT = 2
     _SET_CONTENT_WAIT_UNTIL = "domcontentloaded"
     _READY_STATE_TIMEOUT_MS = 2_000
     _IMAGE_READY_TIMEOUT_MS = 1_800
@@ -183,7 +377,6 @@ class PlaywrightEngine(BaseScreenshotEngine):
     _IDLE_CHECK_INTERVAL_SECONDS = 15
     _IDLE_RECYCLE_SECONDS = 180
     _POOL_UNSAFE_OPTION_KEYS: ClassVar[set[str]] = {
-        "device_scale_factor",
         "color_scheme",
         "extra_http_headers",
         "forced_colors",
@@ -209,6 +402,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
         "timezone_id",
         "user_agent",
     }
+    _POOL_DEVICE_SCALE_FACTOR = 2
 
     def __init__(self):
         _patch_playwright_env_check_once()
@@ -224,8 +418,9 @@ class PlaywrightEngine(BaseScreenshotEngine):
         self._rss_baseline_bytes: int | None = None
         self._recent_results: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self._inflight_tasks: dict[str, asyncio.Task[bytes]] = {}
-        self._context_pool: asyncio.LifoQueue[Any] = asyncio.LifoQueue()
-        self._all_contexts: set[Any] = set()
+        self._generation_counter = 0
+        self._active_generation: ContextGeneration | None = None
+        self._retiring_generations: list[ContextGeneration] = []
         self._idle_recycle_task: asyncio.Task[None] | None = None
         self._closing = False
         self._process = psutil.Process()
@@ -311,16 +506,62 @@ class PlaywrightEngine(BaseScreenshotEngine):
         if current_rss >= threshold:
             self._recycle_pending = True
 
+    async def get_runtime_snapshot(self) -> dict[str, Any]:
+        async with self._state_lock:
+            active_generation = (
+                self._active_generation.snapshot()
+                if self._active_generation is not None
+                else None
+            )
+            retiring_generations = [
+                generation.snapshot() for generation in self._retiring_generations
+            ]
+            return {
+                "closing": self._closing,
+                "active_renders": self._active_renders,
+                "render_count": self._render_count,
+                "recycle_pending": self._recycle_pending,
+                "last_recycle_at": self._last_recycle_at,
+                "generation_counter": self._generation_counter,
+                "active_generation": active_generation,
+                "retiring_generations": retiring_generations,
+                "retiring_generation_count": len(retiring_generations),
+                "inflight_task_count": len(self._inflight_tasks),
+                "recent_result_count": len(self._recent_results),
+                "htmlrender_active_tasks": _HTMLRENDER_TASK_TRACKER.active_tasks,
+                "htmlrender_draining": _HTMLRENDER_TASK_TRACKER.is_draining,
+            }
+
+    async def _log_runtime_snapshot(self, reason: str) -> None:
+        snapshot = await self.get_runtime_snapshot()
+        logger.trace(
+            f"截图引擎状态快照[{reason}]: {snapshot}",
+        )
+
+    def _create_generation_nolock(self) -> ContextGeneration:
+        self._generation_counter += 1
+        return ContextGeneration(generation_id=self._generation_counter)
+
+    def _ensure_active_generation_nolock(self) -> ContextGeneration:
+        if self._active_generation is None:
+            self._active_generation = self._create_generation_nolock()
+        return self._active_generation
+
     async def initialize(self) -> None:
         async with self._state_lock:
             if self._idle_recycle_task and not self._idle_recycle_task.done():
                 return
             self._closing = False
+            self._generation_counter = 0
+            self._active_generation = None
+            self._retiring_generations.clear()
             self._last_render_finished_at = time.monotonic()
             if current_rss := self._get_total_rss():
                 self._rss_baseline_bytes = current_rss
             self._idle_recycle_task = asyncio.create_task(self._idle_recycle_loop())
-        await self._prewarm_browser_and_pool()
+        await _HTMLRENDER_TASK_TRACKER.reset()
+        await self._log_runtime_snapshot("initialize")
+        # 浏览器在首次 _acquire_context 时按需启动，无需预热
 
     async def close(self) -> None:
         idle_task: asyncio.Task[None] | None = None
@@ -328,21 +569,34 @@ class PlaywrightEngine(BaseScreenshotEngine):
             self._closing = True
             idle_task = self._idle_recycle_task
             self._idle_recycle_task = None
-            for task in self._inflight_tasks.values():
-                task.cancel()
-            self._inflight_tasks.clear()
             self._recent_results.clear()
             self._recycle_pending = False
+
+        await _HTMLRENDER_TASK_TRACKER.mark_draining("engine_close")
 
         if idle_task:
             idle_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
 
+        await _HTMLRENDER_TASK_TRACKER.wait_for_idle()
+
+        async with self._state_lock:
+            inflight_tasks = list(self._inflight_tasks.values())
+
+        if inflight_tasks:
+            await asyncio.gather(*inflight_tasks, return_exceptions=True)
+
+        async with self._state_lock:
+            self._inflight_tasks.clear()
+
+        await self._log_runtime_snapshot("close:before_dispose")
         await self._dispose_context_pool()
         await _shutdown_browser_instance()
+        await self._log_runtime_snapshot("close:after_shutdown")
 
     async def _on_render_begin(self) -> None:
+        await _HTMLRENDER_TASK_TRACKER.begin("zhenxun_renderer")
         async with self._state_lock:
             self._active_renders += 1
 
@@ -354,10 +608,11 @@ class PlaywrightEngine(BaseScreenshotEngine):
             now = time.monotonic()
             self._last_render_finished_at = now
             self._mark_recycle_if_needed_nolock(now)
-            if self._recycle_pending and self._active_renders == 0:
+            if self._recycle_pending and _HTMLRENDER_TASK_TRACKER.active_tasks == 0:
                 self._recycle_pending = False
                 self._last_recycle_at = now
                 should_recycle = True
+        await _HTMLRENDER_TASK_TRACKER.end()
         if should_recycle:
             await self._recycle_browser("active")
 
@@ -378,6 +633,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
         options.pop("disable_animations", None)
         if pooled:
             options.pop("base_url", None)
+            options.pop("device_scale_factor", None)
         return options
 
     @staticmethod
@@ -413,6 +669,9 @@ class PlaywrightEngine(BaseScreenshotEngine):
         for key in cls._POOL_UNSAFE_OPTION_KEYS:
             if key in render_options:
                 return False
+        dsf = render_options.get("device_scale_factor")
+        if dsf is not None and dsf != cls._POOL_DEVICE_SCALE_FACTOR:
+            return False
         return True
 
     async def _render_with_page(
@@ -424,7 +683,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
     ) -> bytes:
         if self._debug_console_log:
             page.on("console", lambda msg: logger.debug(f"浏览器控制台: {msg.text}"))
-        await page.goto(template_path, wait_until="domcontentloaded")
+        await page.goto(template_path, wait_until="commit")
         await page.set_content(html, wait_until=self._SET_CONTENT_WAIT_UNTIL)
         if bool(render_options.get("disable_animations", False)):
             await self._disable_page_animations(page)
@@ -477,13 +736,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
                     current_height = int(viewport.get("height") or 0)
                     if target_height > current_height:
                         await page.set_viewport_size(
-                            {
-                                "width": width,
-                                "height": min(
-                                    target_height,
-                                    self._FULL_PAGE_VIEWPORT_MAX_HEIGHT,
-                                ),
-                            }
+                            {"width": width, "height": target_height}
                         )
 
         if clip_padding <= 0:
@@ -510,18 +763,76 @@ class PlaywrightEngine(BaseScreenshotEngine):
         return await element.screenshot(**element_screenshot_options)
 
     async def _wait_for_visual_stability(self, page: Any) -> None:
+        # 先做一次快速预检，判断页面是否有外部图片和自定义字体
+        resource_hints: dict[str, bool] | None = None
+        with contextlib.suppress(Exception):
+            resource_hints = await page.evaluate(
+                """
+                () => {
+                    const imgs = document.images || [];
+                    let hasUnloadedImages = false;
+                    for (let i = 0; i < imgs.length; i++) {
+                        if (!imgs[i].complete) { hasUnloadedImages = true; break; }
+                    }
+                    const hasCustomFonts = !!(
+                        document.fonts && document.fonts.size > 0
+                    );
+                    return {
+                        ready: document.readyState === 'complete',
+                        images: hasUnloadedImages,
+                        fonts: hasCustomFonts,
+                    };
+                }
+                """
+            )
+
+        # 如果预检已知全部就绪，直接返回
+        if (
+            isinstance(resource_hints, dict)
+            and resource_hints.get("ready") is True
+            and resource_hints.get("images") is not True
+            and resource_hints.get("fonts") is not True
+        ):
+            return
+
+        # 对需要的等待项并行执行
+        waiters: list[Coroutine[Any, Any, None]] = []
+
+        need_ready = not (
+            isinstance(resource_hints, dict) and resource_hints.get("ready") is True
+        )
+        need_images = (
+            not isinstance(resource_hints, dict) or resource_hints.get("images") is True
+        )
+        need_fonts = (
+            not isinstance(resource_hints, dict) or resource_hints.get("fonts") is True
+        )
+
+        if need_ready:
+            waiters.append(self._wait_ready_state(page))
+        if need_images:
+            waiters.append(self._wait_images_loaded(page))
+        if need_fonts:
+            waiters.append(self._wait_fonts_ready(page))
+
+        if waiters:
+            await asyncio.gather(*waiters)
+
+    async def _wait_ready_state(self, page: Any) -> None:
         with contextlib.suppress(Exception):
             await page.wait_for_function(
                 "() => document.readyState === 'complete'",
                 timeout=self._READY_STATE_TIMEOUT_MS,
             )
 
+    async def _wait_images_loaded(self, page: Any) -> None:
         with contextlib.suppress(Exception):
             await page.wait_for_function(
                 "() => Array.from(document.images || []).every(img => img.complete)",
                 timeout=self._IMAGE_READY_TIMEOUT_MS,
             )
 
+    async def _wait_fonts_ready(self, page: Any) -> None:
         with contextlib.suppress(Exception):
             await page.evaluate(
                 """
@@ -595,15 +906,12 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 content_height, int
             ):
                 return
-            if (
-                content_width < 10
-                or content_height < 10
-                or content_width > self._FULL_PAGE_VIEWPORT_MAX_WIDTH
-                or content_height > self._FULL_PAGE_VIEWPORT_MAX_HEIGHT
-            ):
+            if content_width < 10 or content_height < 10:
                 return
 
-            target_width = max(width, content_width)
+            target_width = min(
+                max(width, content_width), self._FULL_PAGE_VIEWPORT_MAX_WIDTH
+            )
             target_height = max(height, content_height)
             await page.set_viewport_size(
                 {"width": target_width, "height": target_height}
@@ -627,17 +935,116 @@ class PlaywrightEngine(BaseScreenshotEngine):
             with contextlib.suppress(Exception):
                 await page.close()
 
-    async def _acquire_context(self) -> Any:
-        try:
-            return self._context_pool.get_nowait()
-        except asyncio.QueueEmpty:
-            pass
+    async def _dispose_generation(self, generation: ContextGeneration) -> None:
+        contexts = list(generation.all_contexts)
+        generation.all_contexts.clear()
+        while True:
+            try:
+                generation.context_pool.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
+        for context in contexts:
+            with contextlib.suppress(Exception):
+                await context.close()
+
+    async def _cleanup_retiring_generations(self) -> None:
+        disposable: list[ContextGeneration] = []
         async with self._state_lock:
-            if len(self._all_contexts) < self._CONTEXT_POOL_SIZE:
-                create_new = True
-            else:
-                create_new = False
+            remaining: list[ContextGeneration] = []
+            for generation in self._retiring_generations:
+                if generation.active_leases <= 0:
+                    disposable.append(generation)
+                else:
+                    remaining.append(generation)
+            self._retiring_generations = remaining
+
+        for generation in disposable:
+            await self._dispose_generation(generation)
+
+    async def _dispose_context_pool(self) -> None:
+        async with self._state_lock:
+            generations: list[ContextGeneration] = []
+            if self._active_generation is not None:
+                generations.append(self._active_generation)
+                self._active_generation = None
+            generations.extend(self._retiring_generations)
+            self._retiring_generations = []
+
+        for generation in generations:
+            await self._dispose_generation(generation)
+
+    async def _build_generation(self) -> ContextGeneration:
+        async with self._state_lock:
+            generation = self._create_generation_nolock()
+
+        if self._closing:
+            return generation
+
+        try:
+            browser = await _get_browser_instance()
+        except Exception as e:
+            logger.warning("截图引擎浏览器预热失败。", "PlaywrightEngine", e=e)
+            return generation
+
+        for _ in range(self._PREWARM_CONTEXT_COUNT):
+            if self._closing:
+                break
+            if len(generation.all_contexts) >= self._CONTEXT_POOL_SIZE:
+                break
+
+            context = None
+            try:
+                context = await browser.new_context(
+                    viewport={"width": 800, "height": 10},
+                    device_scale_factor=2,
+                )
+                page = await context.new_page()
+                await page.goto("about:blank", wait_until="domcontentloaded")
+                await page.set_content(
+                    "<html><body></body></html>",
+                    wait_until="domcontentloaded",
+                )
+                await page.close()
+            except Exception as e:
+                logger.warning("截图引擎上下文预热失败。", "PlaywrightEngine", e=e)
+                if context is not None:
+                    with contextlib.suppress(Exception):
+                        await context.close()
+                break
+
+            generation.all_contexts.add(context)
+            generation.context_pool.put_nowait(context)
+
+        return generation
+
+    async def _swap_generation(self, reason: str) -> None:
+        new_generation = await self._build_generation()
+        async with self._state_lock:
+            old_generation = self._active_generation
+            if old_generation is not None:
+                old_generation.retiring = True
+                self._retiring_generations.append(old_generation)
+            self._active_generation = new_generation
+
+        await self._cleanup_retiring_generations()
+        logger.debug(
+            f"截图引擎触发代际切换({reason})，新代={new_generation.generation_id}",
+            "PlaywrightEngine",
+        )
+        await self._log_runtime_snapshot(f"swap_generation:{reason}")
+
+    async def _acquire_context(self) -> tuple[ContextGeneration, Any]:
+        generation: ContextGeneration | None = None
+        create_new = False
+        async with self._state_lock:
+            generation = self._ensure_active_generation_nolock()
+            try:
+                context = generation.context_pool.get_nowait()
+                generation.active_leases += 1
+                return generation, context
+            except asyncio.QueueEmpty:
+                create_new = len(generation.all_contexts) < self._CONTEXT_POOL_SIZE
 
         if create_new:
             browser = await _get_browser_instance()
@@ -646,47 +1053,47 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 device_scale_factor=2,
             )
             async with self._state_lock:
-                self._all_contexts.add(context)
-            return context
-        return await self._context_pool.get()
+                target_generation = generation
+                if target_generation.retiring and self._active_generation is not None:
+                    target_generation = self._active_generation
+                target_generation.all_contexts.add(context)
+                target_generation.active_leases += 1
+                return target_generation, context
 
-    async def _release_context(self, context: Any, broken: bool = False) -> None:
-        if broken:
-            await self._discard_context(context)
-            return
-
+        context = await generation.context_pool.get()
         async with self._state_lock:
-            if self._closing:
-                broken = True
-            elif context not in self._all_contexts:
-                broken = True
-            else:
-                self._context_pool.put_nowait(context)
-                return
+            generation.active_leases += 1
+        return generation, context
 
-        if broken:
-            await self._discard_context(context)
-
-    async def _discard_context(self, context: Any) -> None:
+    async def _release_context(
+        self,
+        generation: ContextGeneration,
+        context: Any,
+        broken: bool = False,
+    ) -> None:
+        should_discard = broken
         async with self._state_lock:
-            existed = context in self._all_contexts
+            generation.active_leases = max(0, generation.active_leases - 1)
+            if self._closing or generation.retiring:
+                should_discard = True
+            elif context not in generation.all_contexts:
+                should_discard = True
+            elif not should_discard:
+                generation.context_pool.put_nowait(context)
+
+        if should_discard:
+            await self._discard_context(generation, context)
+
+        await self._cleanup_retiring_generations()
+
+    async def _discard_context(
+        self, generation: ContextGeneration, context: Any
+    ) -> None:
+        async with self._state_lock:
+            existed = context in generation.all_contexts
             if existed:
-                self._all_contexts.remove(context)
+                generation.all_contexts.remove(context)
         if existed:
-            with contextlib.suppress(Exception):
-                await context.close()
-
-    async def _dispose_context_pool(self) -> None:
-        async with self._state_lock:
-            contexts = list(self._all_contexts)
-            self._all_contexts.clear()
-            while True:
-                try:
-                    self._context_pool.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
-        for context in contexts:
             with contextlib.suppress(Exception):
                 await context.close()
 
@@ -696,7 +1103,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
         template_path: str,
         render_options: dict[str, Any],
     ) -> bytes:
-        context = await self._acquire_context()
+        generation, context = await self._acquire_context()
         page = None
         broken = False
         try:
@@ -718,7 +1125,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
             if page is not None:
                 with contextlib.suppress(Exception):
                     await page.close()
-            await self._release_context(context, broken=broken)
+            await self._release_context(generation, context, broken=broken)
 
     async def _render_html(
         self,
@@ -735,66 +1142,35 @@ class PlaywrightEngine(BaseScreenshotEngine):
     async def _recycle_browser(self, reason: str) -> None:
         async with self._recycle_lock:
             try:
-                await self._dispose_context_pool()
-                await _shutdown_browser_instance()
+                await self._swap_generation(reason)
                 current_rss = self._get_total_rss()
                 if current_rss is not None:
                     self._update_rss_baseline_nolock(current_rss)
-                await self._prewarm_browser_and_pool()
-                logger.debug(
-                    f"截图引擎触发回收({reason})，已重建浏览器实例。",
-                    "PlaywrightEngine",
-                )
+                await self._log_runtime_snapshot(f"recycle:{reason}")
             except Exception as e:
                 logger.warning("浏览器实例重建失败。", "PlaywrightEngine", e=e)
 
     async def _prewarm_browser_and_pool(self) -> None:
         if self._closing:
             return
-        try:
-            browser = await _get_browser_instance()
-        except Exception as e:
-            logger.warning("截图引擎浏览器预热失败。", "PlaywrightEngine", e=e)
+        async with self._state_lock:
+            has_active_generation = self._active_generation is not None
+        if has_active_generation:
             return
 
-        for _ in range(self._PREWARM_CONTEXT_COUNT):
-            async with self._state_lock:
-                if self._closing:
-                    return
-                if len(self._all_contexts) >= self._CONTEXT_POOL_SIZE:
-                    return
-                if self._context_pool.qsize() >= self._PREWARM_CONTEXT_COUNT:
-                    return
-
-            context = None
-            try:
-                context = await browser.new_context(
-                    viewport={"width": 800, "height": 10},
-                    device_scale_factor=2,
-                )
-                page = await context.new_page()
-                await page.goto("about:blank", wait_until="domcontentloaded")
-                await page.set_content(
-                    "<html><body></body></html>",
-                    wait_until="domcontentloaded",
-                )
-                await page.close()
-            except Exception as e:
-                logger.warning("截图引擎上下文预热失败。", "PlaywrightEngine", e=e)
-                if context is not None:
-                    with contextlib.suppress(Exception):
-                        await context.close()
+        generation = await self._build_generation()
+        dispose_generation = False
+        async with self._state_lock:
+            if self._closing:
+                dispose_generation = True
+            elif self._active_generation is None:
+                self._active_generation = generation
                 return
+            else:
+                dispose_generation = True
 
-            async with self._state_lock:
-                if self._closing:
-                    with contextlib.suppress(Exception):
-                        await context.close()
-                    return
-                if context in self._all_contexts:
-                    continue
-                self._all_contexts.add(context)
-                self._context_pool.put_nowait(context)
+        if dispose_generation:
+            await self._dispose_generation(generation)
 
     async def _idle_recycle_loop(self) -> None:
         while True:
@@ -804,7 +1180,7 @@ class PlaywrightEngine(BaseScreenshotEngine):
                 if self._closing:
                     return
                 now = time.monotonic()
-                if self._active_renders > 0:
+                if _HTMLRENDER_TASK_TRACKER.active_tasks > 0:
                     continue
                 if now - self._last_recycle_at < self._RECYCLE_COOLDOWN_SECONDS:
                     continue
@@ -850,6 +1226,9 @@ class PlaywrightEngine(BaseScreenshotEngine):
         return result
 
     async def render(self, html: str, base_url_path: Path, **render_options) -> bytes:
+        if self._closing or _HTMLRENDER_TASK_TRACKER.is_draining:
+            raise RuntimeError("截图引擎正在排空/关闭，暂不接受新的渲染任务。")
+
         base_url_for_browser = self._normalize_base_url(base_url_path)
 
         final_render_options = {
@@ -908,6 +1287,12 @@ class EngineManager:
             self._instance = self._engine_class()
             await self._instance.initialize()
         return self._instance
+
+    async def get_runtime_snapshot(self) -> dict[str, Any]:
+        engine = await self.get_engine()
+        if isinstance(engine, PlaywrightEngine):
+            return await engine.get_runtime_snapshot()
+        return {"engine": type(engine).__name__}
 
     async def close(self):
         if self._instance:

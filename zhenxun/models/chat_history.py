@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import ClassVar, Literal
 from typing_extensions import Self
 
 from tortoise import fields
@@ -29,6 +29,11 @@ class ChatHistory(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "chat_history"
         table_description = "聊天记录数据表"
+        indexes: ClassVar = [
+            ("user_id", "create_time"),
+            ("group_id", "create_time"),
+            ("user_id", "group_id"),
+        ]
 
     @classmethod
     async def get_group_msg_rank(

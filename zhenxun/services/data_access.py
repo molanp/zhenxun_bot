@@ -1,3 +1,4 @@
+import re
 from typing import Any, ClassVar, Generic, TypeVar, cast
 
 from zhenxun.services.cache import Cache, CacheRoot, cache_config
@@ -6,8 +7,6 @@ from zhenxun.services.db_context import Model, with_db_timeout
 from zhenxun.services.log import logger
 
 T = TypeVar("T", bound=Model)
-
-cache = CacheRoot.cache_dict("DB_TEST_BAN", 10, int)
 
 
 class DataAccess(Generic[T]):
@@ -387,8 +386,6 @@ class DataAccess(Generic[T]):
         # 构建键参数字典
         key_parts = []
         # 从格式字符串中提取所需的字段名
-        import re
-
         field_names = re.findall(r"{([^}]+)}", cache_model.key_format)
 
         # 收集所有字段值

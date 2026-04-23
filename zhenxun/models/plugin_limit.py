@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 from tortoise import fields
 
 from zhenxun.services.cache.runtime_cache import PluginLimitMemoryCache
@@ -39,6 +41,7 @@ class PluginLimit(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "plugin_limit"
         table_description = "插件限制"
+        indexes: ClassVar = [("module", "status")]
 
     @classmethod
     async def create(cls, *args, **kwargs):

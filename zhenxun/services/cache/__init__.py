@@ -19,7 +19,7 @@ users = await level_cache.get({"user_id": "123", "group_id": "456"})
 await level_cache.set({"user_id": "123", "group_id": "456"}, users)
 ```
 
-2. 使用CacheDict作为全局字典
+2. 使用CacheDict作为内存字典缓存
 ```python
 from zhenxun.services.cache.cache_containers import CacheDict
 
@@ -29,51 +29,18 @@ config_dict = CacheDict("global_config")
 # 创建有过期时间的缓存字典（1小时后过期）
 temp_dict = CacheDict("temp_config", expire=3600)
 
-# 使用字典操作
 config_dict["key"] = "value"
-value = config_dict["key"]
-
-# 保存缓存数据（可选）
-await config_dict.save()
+value = config_dict.get("key")
 ```
 
-3. 使用CacheList作为全局列表
-```python
-from zhenxun.services.cache.cache_containers import CacheList
-
-# 创建缓存列表（默认永不过期）
-message_list = CacheList("recent_messages")
-
-# 创建有过期时间的缓存列表（30分钟后过期）
-temp_list = CacheList("temp_messages", expire=1800)
-
-# 使用列表操作
-message_list.append("新消息")
-message = message_list[0]
-
-# 保存缓存数据（可选）
-await message_list.save()
-```
-
-4. 使用CacheManager的类型化缓存方法
+3. 使用CacheRoot直接操作缓存后端
 ```python
 from zhenxun.services.cache import CacheRoot
 
-# 获取字符串类型的缓存字典（向后兼容）
-str_cache = CacheRoot.cache_dict("string_cache")
-
-# 获取类型化的缓存字典（推荐）
-int_cache = CacheRoot.cache_dict_typed("int_cache", value_type=int)
-user_cache = CacheRoot.cache_dict_typed("user_cache", value_type=User)
-
-# 获取类型化的缓存列表
-message_list = CacheRoot.cache_list_typed("messages", value_type=str)
-user_list = CacheRoot.cache_list_typed("users", value_type=User)
-
-# 使用类型化的缓存
-int_cache["count"] = 42  # 类型安全
-user_cache["user1"] = User(name="Alice")  # 类型安全
-message_list.append("Hello")  # 类型安全
+# 获取/设置缓存后端数据（需先通过 CacheRegistry.register 注册类型）
+await CacheRoot.get(cache_type, key)
+await CacheRoot.set(cache_type, key, value)
+await CacheRoot.invalidate_cache(cache_type, key)
 ```
 """
 
@@ -95,7 +62,7 @@ from pydantic import BaseModel
 
 from zhenxun.services.log import logger
 
-from .cache_containers import CacheDict, CacheList
+from .cache_containers import CacheDict
 from .config import (
     CACHE_KEY_PREFIX,
     CACHE_KEY_SEPARATOR,
@@ -108,9 +75,7 @@ from .config import (
 
 __all__ = [
     "Cache",
-    "CacheData",
     "CacheDict",
-    "CacheList",
     "CacheManager",
     "CacheRegistry",
     "CacheRoot",
@@ -168,129 +133,12 @@ class CacheModel(BaseModel):
         arbitrary_types_allowed = True
 
 
-"""
-CacheData类是缓存系统的核心组件，它负责管理单个缓存项的数据和生命周期。
-
-设计思路：
-1. 每个CacheData实例代表一个具名的缓存项，如"用户列表"、"配置数据"等
-2. 它提供了数据的懒加载、自动过期和持久化等功能
-3. 可以通过func参数提供一个获取数据的函数，在数据不存在或过期时自动调用
-4. 支持直接设置_data属性，方便外部直接操作数据
-
-主要用途：
-1. 作为CacheDict和CacheList的后端存储
-2. 被CacheManager管理，实现统一的缓存生命周期控制
-3. 提供数据过期和自动刷新机制
-
-通常情况下，用户不需要直接使用CacheData，而是通过Cache、CacheDict或CacheList来操作缓存。
-"""
-
-
-class CacheData:
-    """缓存数据类"""
-
-    def __init__(
-        self,
-        name: str,
-        func: Callable,
-        expire: int = DEFAULT_EXPIRE,
-        lazy_load: bool = True,
-        cache: BaseCache | AioCache | None = None,
-    ):
-        """初始化缓存数据
-
-        参数:
-            name: 缓存名称
-            func: 获取数据的函数
-            expire: 过期时间（秒）
-            lazy_load: 是否延迟加载
-            cache: 缓存后端
-        """
-        self.name = name.upper()
-        self.func = func
-        self.expire = expire
-        self.lazy_load = lazy_load
-        self.cache = cache
-        self._data = None
-        self._last_update = 0
-
-        # 如果不是延迟加载，立即加载数据
-        if not lazy_load:
-            import asyncio
-
-            try:
-                loop = asyncio.get_event_loop()
-                if not loop.is_running():
-                    loop.run_until_complete(self.get_data())
-            except Exception:
-                pass
-
-    async def get_data(self) -> Any:
-        """获取数据
-
-        返回:
-            Any: 缓存数据
-        """
-        # 检查是否需要更新
-        now = datetime.now().timestamp()
-        if self._data is None or (
-            self.expire > 0 and now - self._last_update > self.expire
-        ):
-            # 更新数据
-            try:
-                self._data = await self.func()
-                self._last_update = now
-            except Exception as e:
-                logger.error(f"获取缓存数据 {self.name} 失败", LOG_COMMAND, e=e)
-
-        return self._data
-
-    async def set_data(self, data: Any) -> bool:
-        """设置数据
-
-        参数:
-            data: 缓存数据
-
-        返回:
-            bool: 是否成功
-        """
-        try:
-            self._data = data
-            self._last_update = datetime.now().timestamp()
-            # 如果有缓存后端，保存到缓存
-            if self.cache and cache_config.cache_mode != CacheMode.NONE:
-                await self.cache.set(self.name, data, ttl=self.expire)  # type: ignore
-            return True
-        except Exception as e:
-            logger.error(f"设置缓存数据 {self.name} 失败", LOG_COMMAND, e=e)
-            return False
-
-    async def clear(self) -> bool:
-        """清除数据
-
-        返回:
-            bool: 是否成功
-        """
-        try:
-            self._data = None
-            self._last_update = 0
-            # 如果有缓存后端，清除缓存
-            if self.cache and cache_config.cache_mode != CacheMode.NONE:
-                await self.cache.delete(self.name)  # type: ignore
-            return True
-        except Exception as e:
-            logger.error(f"清除缓存数据 {self.name} 失败", LOG_COMMAND, e=e)
-            return False
-
-
 class CacheManager:
     """缓存管理器"""
 
     _instance: ClassVar["CacheManager | None"] = None
     _cache_backend: BaseCache | AioCache | None = None
     _registry: ClassVar[dict[str, CacheModel]] = {}
-    _data: ClassVar[dict[str, CacheData]] = {}
-    _list_caches: ClassVar[dict[str, "CacheList"]] = {}
     _dict_caches: ClassVar[dict[str, "CacheDict"]] = {}
     _enabled = False  # 缓存启用标记
 
@@ -336,105 +184,6 @@ class CacheManager:
             self._dict_caches[cache_type] = CacheDict[value_type](cache_type, expire)
         return self._dict_caches[cache_type]
 
-    def cache_list(
-        self, cache_type: str, expire: int = 0, value_type: type[U] = str
-    ) -> CacheList[U]:
-        """获取缓存列表
-        参数:
-            cache_type: 缓存类型
-            expire: 过期时间（秒）
-            value_type: 值类型
-
-        返回:
-            CacheList: 缓存列表
-        """
-        if cache_type not in self._list_caches:
-            self._list_caches[cache_type] = CacheList[value_type](cache_type, expire)
-        return self._list_caches[cache_type]
-
-    def listener(self, cache_type: str):
-        """缓存监听器装饰器
-
-        在方法调用后自动刷新缓存数据
-
-        参数:
-            cache_type: 缓存类型
-
-        返回:
-            Callable: 装饰器
-        """
-
-        def decorator(func: Callable):
-            @wraps(func)
-            async def wrapper(cls, *args, **kwargs):
-                # 执行原函数
-                result = await func(cls, *args, **kwargs)
-
-                obj = None
-                # 如果启用了缓存，自动刷新缓存
-                if cache_config.cache_mode != CacheMode.NONE:
-                    # 根据返回值类型处理
-                    if isinstance(result, tuple) and len(result) > 0:
-                        # 处理返回元组的情况，如 update_or_create 返回 (obj, created)
-                        obj = result[0]
-                else:
-                    # 处理返回单个对象的情况
-                    obj = result
-
-                # 获取缓存键并刷新缓存
-                if (
-                    obj
-                    and hasattr(cls, "get_cache_key")
-                    and hasattr(obj, cls.get_cache_key_field())
-                ):
-                    key = cls.get_cache_key(obj)
-                    if key is not None:
-                        await self.invalidate_cache(cache_type, key)
-
-                return result
-
-            return wrapper
-
-        return decorator
-
-    async def get_cache(self, cache_type: str) -> Any:
-        """获取指定类型的缓存对象
-
-        此方法返回一个简单的缓存对象，具有 update 方法
-
-        参数:
-            cache_type: 缓存类型
-
-        返回:
-            Any: 缓存对象
-        """
-
-        class CacheAdapter:
-            """缓存适配器"""
-
-            def __init__(self, cache_manager: CacheManager, cache_type: str):
-                self.cache_manager = cache_manager
-                self.cache_type = cache_type
-
-            async def update(self, key: Any, value: Any) -> None:
-                """更新缓存
-
-                参数:
-                    key: 缓存键
-                    value: 缓存值
-                """
-                # 先清除旧缓存
-                await self.cache_manager.invalidate_cache(self.cache_type, key)
-
-                # 如果需要，可以在这里添加重新设置缓存的逻辑
-                # 目前我们只清除缓存，让下次查询时自动重建
-
-        return (
-            CacheAdapter(self, cache_type)
-            if cache_config.cache_mode != CacheMode.NONE
-            else None
-        )
-
     @property
     def cache_backend(self) -> BaseCache | AioCache:
         """获取缓存后端"""
@@ -478,35 +227,6 @@ class CacheManager:
                 ttl=ttl,
             )
         return self._cache_backend
-
-    @property
-    def _cache(self) -> BaseCache | AioCache:
-        """获取缓存后端（别名）"""
-        return self.cache_backend
-
-    async def get_cache_data(self, name: str) -> Any:
-        """获取缓存数据
-
-        参数:
-            name: 缓存名称
-
-        返回:
-            Any: 缓存数据
-        """
-        name = name.upper()
-        # 检查是否存在缓存数据
-        if name in self._data:
-            return await self._data[name].get_data()
-
-        # 尝试从缓存后端获取
-        if cache_config.cache_mode != CacheMode.NONE:
-            try:
-                data = await self.cache_backend.get(name)  # type: ignore
-                if data is not None:
-                    return data
-            except Exception as e:
-                logger.error(f"从缓存后端获取数据 {name} 失败", LOG_COMMAND, e=e)
-        return None
 
     async def invalidate_cache(
         self, cache_type: str, key: str | dict[str, Any] | None = None
@@ -680,29 +400,28 @@ class CacheManager:
         """清除缓存
 
         参数:
-            cache_type: 缓存类型，为None时清除所有缓存
+            cache_type: 缓存类型，为None时清除所有缓存。
+                注意：受 aiocache 限制，无法按类型精确删除，
+                指定 cache_type 时仅清除整个 backend（行为与不指定相同）。
 
         返回:
             bool: 是否成功
         """
-        # 如果缓存被禁用或缓存模式为NONE，直接返回False
+        # 如果缓存被禁用或缓存模式为NONE，直接返回True（无需操作）
         if not self.enabled or cache_config.cache_mode == CacheMode.NONE:
-            return False
+            return True
 
         try:
             if cache_type:
-                # 清除指定类型的缓存
-                # pattern = f"{cache_type.upper()}{CACHE_KEY_SEPARATOR}*"
-                # 由于aiocache可能没有delete_pattern方法，使用其他方式清除
-                # 这里简化处理，直接清除所有缓存
-                await self.cache_backend.clear()  # type: ignore
-            else:
-                # 清除所有缓存
-                await self.cache_backend.clear()  # type: ignore
+                logger.debug(
+                    f"清除缓存类型 {cache_type}"
+                    "（aiocache 不支持按前缀删除，清除整个 backend）",
+                    LOG_COMMAND,
+                )
+            await self.cache_backend.clear()  # type: ignore
             return True
         except Exception as e:
-            if f"缓存类型 {cache_type} 不存在" not in str(e):
-                logger.warning("清除缓存失败", LOG_COMMAND, e=e)
+            logger.warning("清除缓存失败", LOG_COMMAND, e=e)
             return False
 
     async def close(self):

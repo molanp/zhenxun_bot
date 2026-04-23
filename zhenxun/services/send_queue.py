@@ -76,3 +76,13 @@ async def _start_send_queue():
     patch_send_queue()
     for idx in range(_WORKERS):
         _WORKER_TASKS.append(asyncio.create_task(_worker(idx)))
+
+
+@driver.on_shutdown
+async def _stop_send_queue():
+    tasks = _WORKER_TASKS.copy()
+    _WORKER_TASKS.clear()
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)

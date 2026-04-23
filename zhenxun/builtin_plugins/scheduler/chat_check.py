@@ -38,7 +38,7 @@ async def _():
         return
     """检测群组发言时间并禁用全部被动"""
     update_list = []
-    if modules := await TaskInfo.annotate().values_list("module", flat=True):
+    if modules := await TaskInfo.get_modules(load_status=None):
         for bot in nonebot.get_bots().values():
             group_list, _ = await PlatformUtils.get_group_list(bot, True)
             for group in group_list:
@@ -69,3 +69,7 @@ async def _():
                     )
     if update_list:
         await GroupConsole.bulk_update(update_list, ["block_task"], 10)
+        from zhenxun.services.cache.runtime_cache import GroupMemoryCache
+
+        for group in update_list:
+            await GroupMemoryCache.upsert_from_model(group)

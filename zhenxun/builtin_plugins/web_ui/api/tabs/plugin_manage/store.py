@@ -3,7 +3,6 @@ from fastapi.responses import JSONResponse
 from nonebot import require
 from nonebot.compat import model_dump
 
-from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.services.log import logger
 
 from ....base_model import Result
@@ -30,9 +29,7 @@ async def _() -> Result[dict]:
             {**model_dump(plugin), "name": plugin.name, "id": idx}
             for idx, plugin in enumerate(plugin_list + extra_plugin_list)
         ]
-        modules = await PluginInfo.filter(load_status=True).values_list(
-            "module", flat=True
-        )
+        modules = list((await StoreManager.get_installed_plugins()).keys())
         return Result.ok({"install_module": modules, "plugin_list": plugin_list})
     except Exception as e:
         logger.error("获取插件商店插件信息失败", "WebUi", e=e)
@@ -51,7 +48,7 @@ async def _(param: PluginIr) -> Result:
         require("plugin_store")
         from zhenxun.builtin_plugins.plugin_store import StoreManager
 
-        result = await StoreManager.add_plugin(param.id)  # type: ignore
+        result = await StoreManager.add_plugin(str(param.id))  # type: ignore
         return Result.ok(info=result)
     except Exception as e:
         return Result.fail(f"安装插件失败: {type(e)}: {e}")
@@ -69,7 +66,7 @@ async def _(param: PluginIr) -> Result:
         require("plugin_store")
         from zhenxun.builtin_plugins.plugin_store import StoreManager
 
-        result = await StoreManager.update_plugin(param.id)  # type: ignore
+        result = await StoreManager.update_plugin(str(param.id))  # type: ignore
         return Result.ok(info=result)
     except Exception as e:
         return Result.fail(f"更新插件失败: {type(e)}: {e}")
@@ -87,11 +84,7 @@ async def _(param: PluginIr) -> Result:
         require("plugin_store")
         from zhenxun.builtin_plugins.plugin_store import StoreManager
 
-        plugin_info = await PluginInfo.get_plugin(id=param.id)
-        if not plugin_info:
-            return Result.fail("插件不存在")
-
-        result = await StoreManager.remove_plugin(plugin_info.module)  # type: ignore
+        result = await StoreManager.remove_plugin(str(param.id))  # type: ignore
         return Result.ok(info=result)
     except Exception as e:
         return Result.fail(f"移除插件失败: {type(e)}: {e}")

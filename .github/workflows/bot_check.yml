@@ -7,78 +7,71 @@ on:
       - zhenxun/**
       - tests/**
       - .github/workflows/bot_check.yml
-      - bot.py
   pull_request:
     branches: ["main"]
     paths:
       - zhenxun/**
       - tests/**
       - .github/workflows/bot_check.yml
-      - bot.py
 
 jobs:
   bot-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     name: bot check
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
       - name: Setup Python
-        id: setup_python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
+        run: uv python install 3.10
 
-      - name: Install Poetry
-        run: pip install poetry
-
-      # Poetry cache depends on OS, Python version and Poetry version.
-      - name: Cache Poetry cache
-        id: cache-poetry
-        uses: actions/cache@v3
+      - name: Cache uv
+        uses: actions/cache@v4
         with:
-          path: ~/.cache/pypoetry
-          key: poetry-cache-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}-${{ hashFiles('pyproject.toml') }}
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-
 
       - name: Cache playwright cache
         id: cache-playwright
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-cache-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}
+          key: playwright-cache-${{ runner.os }}
 
       - name: Cache Data cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: data
-          key: data-cache-${{ runner.os }}-${{ steps.setup_python.outputs.python-version }}
+          key: data-cache-${{ runner.os }}
 
       - name: Install dependencies
-        if: steps.cache-poetry.outputs.cache-hit != 'true'
-        run: |
-          rm -rf poetry.lock
-          poetry source remove aliyun
-          poetry install --no-root
+        run: uv sync --frozen
 
       - name: Install playwright
         if: steps.cache-playwright.outputs.cache-hit != 'true'
         run: |
-          poetry run sudo apt-get update
-          poetry run sudo apt-get install -y libgstreamer-plugins-base1.0-0 libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav flite x264 libx264-dev
-          poetry run pip install playwright
-          poetry run playwright install-deps
-          poetry run playwright install
+          sudo apt-get update
+          sudo apt-get install -y libgstreamer-plugins-base1.0-0 libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav flite x264 libx264-dev
+          uv run playwright install-deps
+          uv run playwright install
 
       - name: Run tests
-        run: poetry run pytest --cov=zhenxun --cov-report xml
+        timeout-minutes: 10
+        run: uv run pytest --cov=zhenxun --cov-report xml
 
       - name: Check bot run
+        timeout-minutes: 3
         id: bot_check_run
         run: |
           mv scripts/bot_check.py bot_check.py
+          cp .env.example .env.dev
           sed -i "s|^.*\?DB_URL.*|DB_URL=\"${{ env.DB_URL }}\"|g" .env.dev
           sed -i "s/^.*\?LOG_LEVEL.*/LOG_LEVEL=${{ env.LOG_LEVEL }}/g" .env.dev
-          poetry run python3 bot_check.py
+          uv run python3 bot_check.py
         env:
           DB_URL: "sqlite://:memory:"
           LOG_LEVEL: DEBUG

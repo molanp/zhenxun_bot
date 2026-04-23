@@ -6,6 +6,8 @@ import os
 import anyio.to_thread
 from nonebot.drivers import Driver
 
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
+
 DEFAULT_EXECUTOR_MIN_WORKERS = 16
 DEFAULT_EXECUTOR_MAX_WORKERS = 64
 DEFAULT_ANYIO_MIN_TOKENS = 32
@@ -76,7 +78,7 @@ def register_runtime_bootstrap(driver: Driver) -> None:
             limiter = anyio.to_thread.current_default_thread_limiter()
             limiter.total_tokens = _get_anyio_tokens(workers)
 
-    @driver.on_shutdown
+    @PriorityLifecycle.on_shutdown(priority=50)
     async def _shutdown_runtime_concurrency() -> None:
         global _thread_executor
         executor = _thread_executor

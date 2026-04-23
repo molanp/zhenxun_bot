@@ -6,7 +6,6 @@ on:
       - .github/workflows/update_version_pr.yml
       - zhenxun/**
       - resources/**
-      - bot.py
     branches:
       - main
       - dev

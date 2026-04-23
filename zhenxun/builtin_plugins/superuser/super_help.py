@@ -8,7 +8,6 @@ from zhenxun.services.help_service import create_plugin_help_image
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.exception import EmptyError
-from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
 
 __plugin_meta__ = PluginMetadata(
@@ -31,14 +30,6 @@ async def build_html_help() -> bytes:
         plugin_types=[PluginType.SUPERUSER, PluginType.SUPER_AND_ADMIN],
         page_title="超级用户帮助手册",
     )
-
-
-@PriorityLifecycle.on_startup(priority=15)
-async def _prewarm_super_help_cache() -> None:
-    try:
-        await build_html_help()
-    except Exception as e:
-        logger.warning("预热超级用户帮助缓存失败", "超级用户帮助", e=e)
 
 
 _matcher = on_alconna(

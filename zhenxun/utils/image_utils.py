@@ -5,7 +5,6 @@ from pathlib import Path
 import random
 import re
 
-import imagehash
 from nonebot.utils import is_coroutine_callable, run_sync
 from PIL import Image
 
@@ -355,6 +354,15 @@ def get_img_hash(image_file: str | Path) -> str:
     返回:
         str: 哈希值
     """
+    try:
+        import imagehash
+    except ImportError:
+        logger.warning(
+            "imagehash 未安装或其依赖（numpy/scipy/PyWavelets）不可用，"
+            "图片哈希功能不可用",
+            "禁言检测",
+        )
+        return ""
     hash_value = ""
     try:
         with open(image_file, "rb") as fp:

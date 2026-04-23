@@ -69,21 +69,25 @@ _blmt = BanCheckLimiter(
 async def _(
     matcher: Matcher, bot: Bot, session: EventSession, state: T_State, event: Event
 ):
-    module = None
-    if plugin := matcher.plugin:
-        module = plugin.module_name
-        if not (metadata := plugin.metadata):
-            return
-        extra = metadata.extra
-        if extra.get("plugin_type") in [
-            PluginType.HIDDEN,
-            PluginType.DEPENDANT,
-            PluginType.ADMIN,
-            PluginType.SUPERUSER,
-        ]:
-            return
+    # 提前判断 notice 类型，直接跳过
     if matcher.type == "notice":
         return
+
+    # 提前判断插件类型，跳过不需要检测的插件
+    if plugin := matcher.plugin:
+        if metadata := plugin.metadata:
+            extra = metadata.extra
+            if extra.get("plugin_type") in [
+                PluginType.HIDDEN,
+                PluginType.DEPENDANT,
+                PluginType.ADMIN,
+                PluginType.SUPERUSER,
+            ]:
+                return
+        module = plugin.module_name
+    else:
+        return
+
     user_id = session.id1
     group_id = session.id3 or session.id2
     malicious_ban_time = Config.get_config("hook", "MALICIOUS_BAN_TIME")

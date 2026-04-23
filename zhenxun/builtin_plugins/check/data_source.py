@@ -22,8 +22,11 @@ VERSION_FILE = Path() / "__version__"
 
 
 def get_arm_cpu_freq_safe():
-    """获取ARM设备CPU频率"""
-    # 方法1: 优先从系统频率文件读取
+    """获取ARM设备CPU频率（仅限 Linux/macOS）"""
+    if platform.system().lower() == "windows":
+        return 0
+
+    # 方法1: 优先从系统频率文件读取（Linux sysfs）
     freq_files = [
         "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
         "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq",
@@ -33,20 +36,21 @@ def get_arm_cpu_freq_safe():
 
     for freq_file in freq_files:
         try:
-            with open(freq_file) as f:
+            with open(freq_file, encoding="utf-8") as f:
                 frequency = int(f.read().strip())
                 return round(frequency / 1000000, 2)  # 转换为GHz
         except (OSError, ValueError):
             continue
 
-    # 方法2: 解析/proc/cpuinfo
+    # 方法2: 解析/proc/cpuinfo（Linux）
     with contextlib.suppress(OSError, FileNotFoundError, ValueError, PermissionError):
-        with open("/proc/cpuinfo") as f:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
             for line in f:
                 if "CPU MHz" in line:
                     freq = float(line.split(":")[1].strip())
                     return round(freq / 1000, 2)  # 转换为GHz
-    # 方法3: 使用lscpu命令
+
+    # 方法3: 使用lscpu命令（Linux）
     with contextlib.suppress(OSError, subprocess.SubprocessError, ValueError):
         env = os.environ.copy()
         env["LC_ALL"] = "C"
@@ -127,8 +131,9 @@ class DiskInfo:
 
     @classmethod
     def get_disk_info(cls):
-        disk_total = round(psutil.disk_usage("/").total / (1024**3), 2)
-        disk_usage = round(psutil.disk_usage("/").used / (1024**3), 2)
+        disk_root = Path().resolve().anchor  # 跨平台：取当前工作目录所在盘的根
+        disk_total = round(psutil.disk_usage(disk_root).total / (1024**3), 2)
+        disk_usage = round(psutil.disk_usage(disk_root).used / (1024**3), 2)
 
         return DiskInfo(total=disk_total, usage=disk_usage)
 
