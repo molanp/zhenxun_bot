@@ -143,7 +143,17 @@ class SignManage:
             log_time = new_log.create_time.astimezone(
                 pytz.timezone("Asia/Shanghai")
             ).date()
-        if not is_card_view and (not new_log or (log_time and log_time != now.date())):
+        if is_card_view:
+            return await get_card(
+                user,
+                session,
+                nickname,
+                -1,
+                user_console.gold,
+                "",
+                is_card_view=is_card_view,
+            )
+        if not new_log or (log_time and log_time != now.date()):
             return await cls._handle_sign_in(user, nickname, session)
         return [
             Text(
