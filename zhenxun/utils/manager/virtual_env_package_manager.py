@@ -96,7 +96,6 @@ class VirtualEnvPackageManager:
         # pip: pip install -r requirements.txt
         return [*base, "install", "-r", req_str]
 
-
     @classmethod
     def __build_list_command(cls) -> list[str]:
         base, mode = cls.__get_base_command()
@@ -227,7 +226,7 @@ class VirtualEnvPackageManager:
         异常:
             FileNotFoundError: 文件不存在
         """
-        if not requirement_file.exists():  # noqa: ASYNC240
+        if not requirement_file.exists():
             raise FileNotFoundError(f"依赖文件 {requirement_file} 不存在", LOG_COMMAND)
         # 清理 requirements 文件中的非ASCII注释，防止 Windows GBK 编码问题
         cls._clean_requirements_file(requirement_file)
