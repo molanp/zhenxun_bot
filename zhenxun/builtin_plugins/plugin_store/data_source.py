@@ -58,13 +58,11 @@ class StoreManager:
     ) -> Path:
         """将商店插件信息映射到本地插件文件/目录路径。"""
         plugin_name = plugin_info.module_path.split(".")[-1] or plugin_info.module
-        if is_external and plugin_info.is_dir and plugin_info.module_path == ".":
+
+        if plugin_info.is_dir:
             return BASE_PATH / "plugins" / plugin_name
 
-        relative_parts = [part for part in plugin_info.module_path.split(".") if part]
-        relative_path = Path(*relative_parts) if relative_parts else Path(plugin_name)
-        path = BASE_PATH.parent / relative_path
-        return path if plugin_info.is_dir else path.parent / f"{plugin_name}.py"
+        return BASE_PATH / "plugins" / f"{plugin_name}.py"
 
     @classmethod
     async def get_data(cls) -> tuple[list[StorePluginInfo], list[StorePluginInfo]]:
@@ -345,21 +343,28 @@ class StoreManager:
         github_url = plugin_info.github_url
         assert github_url
         replace_module_path = module_path.replace(".", "/").lstrip("/")
-        plugin_name = module_path.split(".")[-1] or plugin_info.module
+        plugin_module = plugin_info.module
         if is_dir:
             files = await RepoFileManager.list_directory_files(
                 github_url, replace_module_path, branch, repo_type=repo_type
             )
         else:
             files = [RepoFileInfo(path=f"{replace_module_path}.py", is_dir=False)]
-        if not is_external:
-            target_dir = BASE_PATH
-        elif is_dir and module_path == ".":
-            target_dir = BASE_PATH / "plugins" / plugin_name
+        if is_dir:
+            target_dir = BASE_PATH / "plugins" / plugin_module
         else:
             target_dir = BASE_PATH / "plugins"
         files = [file for file in files if not file.is_dir]
-        download_files = [(file.path, target_dir / file.path) for file in files]
+        download_files: list[tuple[str, Path]] = []
+
+        for file in files:
+            src_path = file.path
+            if is_dir:
+                dst_path = target_dir / Path(src_path).relative_to(replace_module_path)
+            else:
+                dst_path = target_dir / f"{plugin_module}.py"
+
+            download_files.append((src_path, dst_path))
         result = await RepoFileManager.download_files(
             github_url,
             download_files,
