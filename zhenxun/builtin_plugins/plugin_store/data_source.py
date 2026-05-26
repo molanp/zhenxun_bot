@@ -57,7 +57,7 @@ class StoreManager:
         cls, plugin_info: StorePluginInfo, *, is_external: bool
     ) -> Path:
         """将商店插件信息映射到本地插件文件/目录路径。"""
-        plugin_name = plugin_info.module_path.split(".")[-1] or plugin_info.module
+        plugin_name = plugin_info.module
 
         if plugin_info.is_dir:
             return BASE_PATH / "plugins" / plugin_name
