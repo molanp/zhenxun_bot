@@ -2,18 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.core.exceptions import (
     AbortException,
     ControlFlowExit,
-    GuardrailViolationError,
     LLMException,
     ModelRetry,
     ResponseParseException,
-    SchemaParseError,
     ToolFatalError,
     ToolFinishException,
     ToolRetryError,
@@ -279,18 +277,52 @@ class ReflexionCapability(AbstractCapability):
     """自愈反思与验证引擎 (Reflexion Engine)。
     统一处理结构化解析失败和语义护栏拦截。"""
 
+    _PROMPT_TEMPLATES: ClassVar[dict[str, str]] = {
+        "schema_validation_error": (
+            "### ⚠️ [数据内容校验失败]\n"
+            "你输出的 JSON 格式完全正确，但部分字段的内容未能通过业务规则约束。\n\n"
+            "**失败详情：**\n"
+            "> {error_msg}\n\n"
+            "**修正要求：** 请仔细阅读上述失败详情，你必须打破先前的部分指令限制以满足上述规则，"  # noqa: E501
+            "调整报错字段的值并重新输出."
+        ),
+        "schema_parse_error": (
+            "### ❌ [格式解析失败]\n"
+            "你输出的结构化数据（JSON）格式损坏或字段类型不匹配，未能通过校验。\n\n"
+            "**解析错误报告：**\n"
+            "> {error_msg}\n\n"
+            "**修正要求：** 请仔细检查缺失的必填字段、错误的数据类型或未闭合的括号，"
+            "严格参考你可用的 Schema 定义，重新输出正确格式的数据。"
+        ),
+        "guardrail_violation": (
+            "### 🛡️ [业务护栏违规]\n"
+            "你输出的数据格式完全正确，但在业务逻辑层触发了合规/风控护栏。\n\n"
+            "**拦截原因报告：**\n"
+            "> {error_msg}\n\n"
+            "**修正要求：** 请结合上述反馈报告，反思你的决策逻辑或内容生成，"
+            "在保持数据格式正确的前提下，重新生成符合护栏规范的内容。"
+        ),
+        "default_retry": (
+            "### ❌ [输出内容或格式验证失败]\n"
+            "你的上一次输出未能通过系统的校验与规则检查。请立即启动修正流程：\n\n"
+            "**错误反馈报告：**\n"
+            "> {error_msg}\n\n"
+            "**修正要求：** 请结合反馈报告，仔细反思你的输出内容或格式，"
+            "并重新生成正确的数据以满足所有的规则与规范。"
+        ),
+    }
+
     async def wrap_tool_execute(self, context, tool_name, arguments, handler):
         try:
             return await handler(arguments)
         except Exception as error:
-            from zhenxun.services.ai.core.engine.structured_parser import (
-                DEFAULT_IVR_TEMPLATE,
-            )
             from zhenxun.services.ai.tools.models import ToolResult
 
             if isinstance(error, ToolRetryError | ModelRetry):
                 error_msg = getattr(error, "message", str(error))
-                feedback_prompt = DEFAULT_IVR_TEMPLATE.format(error_msg=error_msg)
+                feedback_prompt = self._PROMPT_TEMPLATES["default_retry"].format(
+                    error_msg=error_msg
+                )
                 context.run.add_system_prompt(feedback_prompt)
                 return ToolResult(
                     output=f"执行失败：{error_msg}",
@@ -337,41 +369,22 @@ class ReflexionCapability(AbstractCapability):
         self, e: Exception, error_msg: str, error_template: str | None
     ) -> str:
         """
-        根据不同的异常类型生成针对性的自愈反思提示词 (Feedback Prompt)
+        基于异常多态与模板字典生成自愈反思提示词
         """
-        if isinstance(e, SchemaParseError):
-            if "数据内容未通过规则校验" in error_msg:
-                return f"""### ⚠️ [数据内容校验失败]
-你输出的 JSON 格式完全正确，但部分字段的内容未能通过业务规则约束。
+        if error_template:
+            return error_template.format(error_msg=error_msg)
 
-**失败详情：**
-> {error_msg}
+        template_name = (
+            e.get_template_name() if isinstance(e, ModelRetry) else "default_retry"
+        )
 
-**修正要求：** 请仔细阅读上述失败详情，你必须打破先前的部分指令限制以满足上述规则，调整报错字段的值并重新输出。"""  # noqa: E501
-            else:
-                return f"""### ❌ [格式解析失败]
-你输出的结构化数据（JSON）格式损坏或字段类型不匹配，未能通过校验。
+        template = self._PROMPT_TEMPLATES.get(
+            template_name, self._PROMPT_TEMPLATES["default_retry"]
+        )
+        context_data = e.get_feedback_context() if isinstance(e, ModelRetry) else {}
+        context_data["error_msg"] = error_msg
 
-**解析错误报告：**
-> {error_msg}
-
-**修正要求：** 请仔细检查缺失的必填字段、错误的数据类型或未闭合的括号，严格参考你可用的 Schema 定义，重新输出正确格式的数据。"""  # noqa: E501
-        elif isinstance(e, GuardrailViolationError):
-            return f"""### 🛡️ [业务护栏违规]
-你输出的数据格式完全正确，但在业务逻辑层触发了合规/风控护栏。
-
-**拦截原因报告：**
-> {error_msg}
-
-**修正要求：** 请结合上述反馈报告，反思你的决策逻辑或内容生成，在保持数据格式正确的前提下，重新生成符合护栏规范的内容。"""  # noqa: E501
-        else:
-            if error_template:
-                return error_template.format(error_msg=error_msg)
-            from zhenxun.services.ai.core.engine.structured_parser import (
-                DEFAULT_IVR_TEMPLATE,
-            )
-
-            return DEFAULT_IVR_TEMPLATE.format(error_msg=error_msg)
+        return template.format(**context_data)
 
     async def wrap_model_request(
         self,

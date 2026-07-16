@@ -10,6 +10,7 @@ from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.context.knowledge.base import BaseKnowledge
 from zhenxun.services.ai.context.memory.builder import MemoryBuilder
 from zhenxun.services.ai.context.memory.models import MemoryConfig
+from zhenxun.services.ai.core.engine.token_counter import token_counter
 from zhenxun.services.ai.core.exceptions import (
     ControlFlowExit,
 )
@@ -29,6 +30,7 @@ from zhenxun.services.ai.flow.core.base import BaseRunnable
 from zhenxun.services.ai.flow.core.models import InterventionPolicy
 from zhenxun.services.ai.guardrails import GuardrailSource, parse_guardrails
 from zhenxun.services.ai.llm.builder import IntentBuilder
+from zhenxun.services.ai.llm.manager import resolve_model_capabilities
 from zhenxun.services.ai.message_builder import MessageBuilder
 from zhenxun.services.ai.run import (
     AgentRunResult,
@@ -700,6 +702,10 @@ class Agent(
                 self.model_name() if callable(self.model_name) else self.model_name
             )
 
+        resources.model_capabilities = await resolve_model_capabilities(
+            context.run.current_model
+        )
+
         return state, resources
 
     async def on_context_build(
@@ -752,10 +758,29 @@ class Agent(
         if tool_payload.injected_prompts:
             static_prompts_list.extend(tool_payload.injected_prompts)
 
+        final_tools = await ToolBuilder.prepare_effective_tools(
+            effective_tools, context, self.tool_filters, run_scoped_cap
+        )
+
+        base_overhead = 0
+        for sp in static_prompts_list:
+            if sp:
+                base_overhead += token_counter._count_text(str(sp))
+        for m in dynamic_messages:
+            base_overhead += token_counter.count_message(
+                m, context.run.current_model or ""
+            )
+        for t in final_tools:
+            t_def = getattr(t, "_dynamic_def", None)
+            if t_def and getattr(t_def, "parameters", None):
+                base_overhead += token_counter.count_tools_schema(t_def.parameters)
+
         messages_for_run = (
             await memory_context.read(
                 model_name=context.run.current_model or "",
+                capabilities=resources.model_capabilities,
                 override_history=resources.config.message_history,
+                base_overhead=base_overhead,
             )
             if memory_context
             else []
@@ -772,17 +797,14 @@ class Agent(
                 if resources.memory_context:
                     await resources.memory_context.write([msgs[-1]])
 
-        final_tools = await ToolBuilder.prepare_effective_tools(
-            effective_tools, context, self.tool_filters, run_scoped_cap
-        )
         context.session.append_only_manager.build(static_prompts_list, final_tools)
         context.session.append_only_manager.sync_messages(messages_for_run)
 
-        state.messages = messages_for_run
+        context.run.messages = messages_for_run
         state.tools = final_tools
         state.static_system_prompt = static_prompts_list
         state.dynamic_system_messages = dynamic_messages
-        state.origin_msg_len = len(messages_for_run)
+        state._origin_msg_len = len(messages_for_run)
 
     async def on_execute(
         self, state: AgentState, resources: AgentRunResources
@@ -793,7 +815,7 @@ class Agent(
         for tk in resources.toolkits:
             if hasattr(tk, "before_llm_request"):
                 await DependencyInjector.invoke(
-                    tk.before_llm_request, {"messages": state.messages}, context
+                    tk.before_llm_request, {"messages": context.run.messages}, context
                 )
 
         config_exec = resources.config.executor if resources.config else None
@@ -802,12 +824,11 @@ class Agent(
             or self.executor
             or StandardAgentExecutor(directive_handlers=self.directive_handlers)
         )
-        resources.model_name = context.run.current_model
         raw_result: AgentRunResult[Any] = await executor.run(
             state=state, resources=resources
         )
 
-        new_msgs = raw_result.messages[state.origin_msg_len :]
+        new_msgs = raw_result.messages[state._origin_msg_len :]
         if resources.memory_context:
             await resources.memory_context.write(new_msgs)
 

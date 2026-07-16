@@ -3,6 +3,7 @@ LLM Token 动态预估与上下文管理模块
 """
 
 from collections.abc import Sequence
+import json
 import math
 import re
 from typing import Any
@@ -56,17 +57,11 @@ class TokenCounter:
     @classmethod
     def count_tools_schema(cls, obj: dict | list | str | Any) -> int:
         """递归计算 JSON Schema 结构在被大模型作为工具时的 Token 开销。"""
-        if isinstance(obj, dict):
-            cost = len(obj.keys()) * 12
-            for k, v in obj.items():
-                if k == "description" and isinstance(v, str):
-                    cost += int(len(v) * 0.3)
-                else:
-                    cost += cls.count_tools_schema(v)
-            return cost
-        elif isinstance(obj, list):
-            return sum(cls.count_tools_schema(item) for item in obj)
-        return 0
+        try:
+            json_str = json.dumps(obj, ensure_ascii=False)
+            return int(cls._count_text(json_str) * 1.2) + 15
+        except Exception:
+            return 50
 
     @classmethod
     def count_message(cls, msg: LLMMessage, model_name: str) -> int:

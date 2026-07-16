@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from zhenxun.services.ai.capabilities import CapabilitySource, CombinedCapability
 from zhenxun.services.ai.context.memory.builder import MemoryBuilder
@@ -18,10 +18,11 @@ from zhenxun.services.ai.core.messages import (
     ToolCallPart,
     UsageInfo,
 )
+from zhenxun.services.ai.core.models import ModelCapabilities
 from zhenxun.services.ai.core.options import GenerationConfig
 from zhenxun.services.ai.flow.core.models import BaseRuntimeConfig
 from zhenxun.services.ai.run import RunContext
-from zhenxun.services.ai.run.models import AgentRunResult, AgentTask, HandoffPayload
+from zhenxun.services.ai.run.models import AgentRunResult, AgentTask
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
 from zhenxun.services.ai.tools.engine.registry import ToolCollection
 from zhenxun.utils.pydantic_compat import model_copy
@@ -121,27 +122,15 @@ class AgentState(BaseModel):
     tools: ToolCollection | None = None
     """当前轮次生效的、已完成鉴权和过滤的工具集合"""
 
-    messages: list[AgentMessage] = Field(default_factory=list)
-    """大模型将看到的完整历史消息列表 (执行历史)"""
-    usage: UsageInfo = Field(default_factory=UsageInfo)
-    """累计的 Token 消耗"""
-    structured_result: Any | None = None
-    """拦截到的结构化输出结果"""
-    early_result_output: Any | None = None
-    """拦截到的早期终止输出结果"""
-    should_terminate: bool = False
-    """标记是否应提前终止循环"""
-    handoff_triggered: HandoffPayload | None = None
-    """标记是否触发了移交"""
-    is_finished: bool = False
-    """标记大模型循环是否彻底结束"""
-    final_result: AgentRunResult[Any] | None = None
-    """最终的运行结果 (AgentRunResult)"""
-    origin_msg_len: int = 0
-    """初始进入循环时的消息历史长度 (用于增量保存记忆)"""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    """供第三方开发者或生命周期钩子使用的自定义插槽，
+    在单个 Agent FSM 循环中存取临时变量"""
+
+    _origin_msg_len: int = PrivateAttr(default=0)
+    """内部变量：初始进入循环时的消息历史长度 (用于增量保存记忆，防止被外部业务篡改)"""
+
     current_cycle: int = 0
     """当前思考循环的轮次索引"""
-
     current_request_messages: list[AgentMessage] = Field(default_factory=list)
     """当前即将发往大模型的实际请求消息"""
     current_request_extra: dict[str, Any] = Field(default_factory=dict)
@@ -152,6 +141,17 @@ class AgentState(BaseModel):
     """当前轮次被提取出准备执行的客户端工具调用"""
     current_tool_results: list[Any] = Field(default_factory=list)
     """当前轮次工具执行的结果或异常收集"""
+
+    should_reset_cycle: bool = False
+    """标记是否需要重置当前思考循环（例如由于外部干预插入了新消息）"""
+    is_finished: bool = False
+    """标记大模型循环是否彻底结束"""
+    pending_result: AgentRunResult[Any] | None = None
+    """单一数据源：等待返回的最终运行结果 (SSOT)"""
+    usage: UsageInfo = Field(default_factory=UsageInfo)
+    """累计的 Token 消耗"""
+    token_drift: int = 0
+    """动态 Token 校准偏移量 (真实 - 预估)"""
 
 
 class AgentRunResources(BaseModel):
@@ -175,5 +175,5 @@ class AgentRunResources(BaseModel):
     """Agent 全局与运行时的统一策略配置"""
     generation_config: GenerationConfig | None = None
     """大模型生成配置"""
-    model_name: str | None = None
-    """当前实际调用的模型名称"""
+    model_capabilities: ModelCapabilities | None = None
+    """当前底层大模型的能力配置（合并了用户自定义覆盖）"""

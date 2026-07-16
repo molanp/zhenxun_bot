@@ -3,6 +3,7 @@ from typing import cast
 
 from zhenxun.services.ai.core.engine.context_renderer import ContextConverter
 from zhenxun.services.ai.core.messages import AgentMessage
+from zhenxun.services.ai.core.models import ModelCapabilities
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.utils.logger import log_memory as logger
 from zhenxun.utils.pydantic_compat import model_copy
@@ -42,7 +43,9 @@ class SessionMemoryContext:
     async def read(
         self,
         model_name: str,
+        capabilities: ModelCapabilities | None = None,
         override_history: Sequence[AgentMessage] | None = None,
+        base_overhead: int = 0,
     ) -> list[AgentMessage]:
         """
         拉取短期对话历史，并执行 Token 压缩与管线修剪。
@@ -69,14 +72,16 @@ class SessionMemoryContext:
                 )
 
             pipeline = CondenserPipeline.create_from_configs(
-                self.memory_config, model_name
+                self.memory_config, capabilities, model_name
             )
             if pipeline.reducers:
                 flattened_to_reduce = ContextConverter.flatten_to_llm_messages(
                     current_history
                 )
                 new_history, changed = await pipeline.run(
-                    flattened_to_reduce, model_name=model_name, base_overhead=0
+                    flattened_to_reduce,
+                    model_name=model_name,
+                    base_overhead=base_overhead,
                 )
                 if changed:
                     await chat_context.set_messages(self.session_meta, new_history)

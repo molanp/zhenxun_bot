@@ -8,20 +8,11 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 
 from zhenxun.services.ai.core.exceptions import (
     SchemaParseError,
+    SchemaValidationError,
 )
 from zhenxun.services.ai.core.messages.types import OutputDataT
 from zhenxun.services.ai.utils.logger import log_core as logger
 from zhenxun.utils.pydantic_compat import model_json_schema, model_validate
-
-DEFAULT_IVR_TEMPLATE = (
-    "### ❌ [输出内容或格式验证失败]\n"
-    "你的上一次输出未能通过系统的校验与规则检查。请立即启动修正流程：\n\n"
-    "**错误反馈报告：**\n"
-    "> {error_msg}\n\n"
-    "**修正要求：** 请结合反馈报告，"
-    "仔细反思你的输出内容或格式，\n"
-    "并重新生成正确的数据以满足所有的规则与规范。"
-)
 
 
 class BaseOutputProcessor(Generic[OutputDataT]):
@@ -47,7 +38,7 @@ class BaseOutputProcessor(Generic[OutputDataT]):
                 如果不为 None 则跳过根据 response_model 生成，默认 None。
         """  # noqa: E501
         self.original_model = response_model
-        self.error_template = error_template or DEFAULT_IVR_TEMPLATE
+        self.error_template = error_template
         self.raw_schema = raw_schema
         self.target_model = None
         self.is_union_wrapped = False
@@ -120,7 +111,7 @@ class BaseOutputProcessor(Generic[OutputDataT]):
                         msg = err.get("msg", "")
                         error_msgs.append(f"字段 `{loc}`: {msg}")
                     clean_error_str = "\n".join(error_msgs)
-                    raise SchemaParseError(
+                    raise SchemaValidationError(
                         f"数据内容未通过规则校验:\n{clean_error_str}"
                     )
 

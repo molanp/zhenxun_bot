@@ -17,7 +17,18 @@ from zhenxun.services.ai.core.exceptions import (
     ToolFatalError,
     ToolRetryError,
 )
-from zhenxun.services.ai.core.messages import AnyLLMMessage, LLMMessage, ToolCallPart
+from zhenxun.services.ai.core.messages import (
+    AnyLLMMessage,
+    AudioPart,
+    FilePart,
+    ImagePart,
+    LLMMessage,
+    TextPart,
+    ToolCallPart,
+    ToolMessage,
+    UsageInfo,
+    VideoPart,
+)
 from zhenxun.services.ai.core.stream_events import (
     EventBus,
     ToolCallEndEvent,
@@ -37,6 +48,7 @@ from zhenxun.services.ai.tools.models import (
     ValidatedToolCall,
 )
 from zhenxun.services.ai.utils.logger import log_tool as logger
+from zhenxun.utils.pydantic_compat import dump_json_safely
 
 from .registry import ToolCollection
 
@@ -50,6 +62,49 @@ class ToolExecutor:
     def __init__(self):
         """初始化工具执行器。"""
         pass
+
+    @staticmethod
+    def assemble_tool_message(
+        original_call: ToolCallPart,
+        res_or_exc: BaseException | tuple[ToolCallPart, ToolResult],
+        tool_res: ToolResult | None,
+    ) -> tuple[ToolMessage, UsageInfo | None]:
+        """负责处理异常、解析多模态、序列化，并装配为最终的工具消息载体"""
+        media_parts = []
+        final_content = "Success"
+        usage = None
+
+        if isinstance(res_or_exc, BaseException):
+            if isinstance(res_or_exc, ControlFlowExit):
+                raise res_or_exc
+            final_content = json.dumps(
+                {"error": str(res_or_exc), "status": "failed"},
+                ensure_ascii=False,
+            )
+        elif tool_res is not None:
+            if isinstance(tool_res.output, list):
+                texts = []
+                for item in tool_res.output:
+                    if isinstance(item, ImagePart | AudioPart | VideoPart | FilePart):
+                        media_parts.append(item)
+                    elif isinstance(item, TextPart):
+                        texts.append(item.text)
+                    else:
+                        texts.append(str(item))
+                final_content = " ".join(texts) if texts else "Success"
+            elif isinstance(tool_res.output, str):
+                final_content = tool_res.output
+            else:
+                final_content = dump_json_safely(tool_res.output, ensure_ascii=False)
+
+            usage = getattr(tool_res, "usage", None)
+
+        msg = LLMMessage.tool_response(
+            original_call.id, original_call.tool_name, final_content
+        )
+        if media_parts:
+            msg.content.extend(media_parts)
+        return msg, usage
 
     def _get_combined_capability(
         self, executable: Any, context: RunContext
@@ -396,15 +451,15 @@ class ToolExecutor:
                     ToolResult(output=f"Crash: {result_pair}").as_error(),
                 )
 
-            tool_call_result = cast(tuple[ToolCallPart, ToolResult], result_pair)
-            _, tool_result = tool_call_result
-            tool_messages.append(
-                LLMMessage.tool_response(
-                    tool_call_id=original_call.id,
-                    function_name=func_name,
-                    result=tool_result.output,
-                )
+            tool_res = None
+            if not isinstance(result_pair, BaseException):
+                _, raw_tool_res = cast(tuple[ToolCallPart, ToolResult], result_pair)
+                tool_res = raw_tool_res
+
+            msg, _ = ToolExecutor.assemble_tool_message(
+                original_call, result_pair, tool_res
             )
+            tool_messages.append(msg)
         return tool_messages
 
 

@@ -7,6 +7,7 @@ from zhenxun.services.ai.core.models import (
 )
 from zhenxun.utils.pydantic_compat import model_copy
 
+CTX_1_05M = 1_050_000
 CTX_1M = 1_000_000
 CTX_400K = 400_000
 CTX_256K = 256_000
@@ -283,18 +284,23 @@ _ROUTING_TABLE: list[tuple[list[str], ModelCapabilities, int]] = [
     (["*MiniMax-M3*"], CAP_MINIMAX_MULTIMODAL, CTX_1M),
     (["mimo-v2.5-pro*", "mimo-v2-pro*", "mimo-v2-flash*"], CAP_MIMO_TEXT, CTX_1M),
     (["mimo-v2.5", "mimo-v2-omni*"], CAP_MIMO_MULTIMODAL, CTX_1M),
-    (["gpt-5.5*", "gpt-5.4*"], CAP_OPENAI_MULTIMODAL, CTX_1M),
+    (
+        ["gpt-5.3-chat*", "gpt-5.3-instant*", "*codex-spark*"],
+        CAP_OPENAI_MULTIMODAL,
+        CTX_128K,
+    ),
+    (
+        ["gpt-[5-9]*mini*", "gpt-[5-9]*nano*", "gpt-[5-9]*-instant*", "*codex*"],
+        CAP_OPENAI_MULTIMODAL,
+        CTX_400K,
+    ),
+    (["gpt-[5-9]*"], CAP_OPENAI_MULTIMODAL, CTX_1_05M),
     (["gemini-3*pro*"], CAP_GEMINI_3_PRO, CTX_1M),
     (["gemini-3*"], CAP_GEMINI_3_FLASH, CTX_1M),
     (
         ["gemini-2.5-pro*", "gemini-2.5-flash*"],
         CAP_GEMINI_2_5,
         CTX_1M,
-    ),
-    (
-        ["gpt-5*", "gpt-5-mini*", "gpt-5-nano*", "*codex*"],
-        CAP_OPENAI_MULTIMODAL,
-        CTX_400K,
     ),
     (
         ["kimi-k2.7*", "kimi-k2.6*", "kimi-k2.5*"],

@@ -11,11 +11,11 @@ from zhenxun.services.ai.config import (
     get_llm_config,
 )
 from zhenxun.services.ai.core.exceptions import ConfigurationException
-from zhenxun.services.ai.core.models import ModelDetail
+from zhenxun.services.ai.core.models import ModelCapabilities, ModelDetail
 from zhenxun.services.ai.core.options import GenerationConfig
 from zhenxun.services.ai.utils.logger import log_llm as logger
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
-from zhenxun.utils.pydantic_compat import model_dump
+from zhenxun.utils.pydantic_compat import model_copy, model_dump
 
 from .system.cache import clear_model_cache, get_or_create_model
 from .system.capabilities import get_model_capabilities
@@ -189,6 +189,40 @@ def get_default_model(task: str = "chat") -> str | None:
     """根据任务类型获取默认模型名称"""
     config = get_llm_config()
     return getattr(config.default_models, task, None)
+
+
+async def resolve_model_capabilities(
+    provider_model_name: str | None = None, task: str = "chat"
+) -> ModelCapabilities:
+    """解析并合并带有用户自定义覆盖(如 max_input_tokens) 的模型能力。"""
+    resolved_name = provider_model_name
+    if resolved_name is None:
+        resolved_name = get_default_model(task)
+        if resolved_name is None:
+            avail = list_available_models()
+            if not avail:
+                return get_model_capabilities("unknown")
+            resolved_name = avail[0]["full_name"]
+
+    group_name = _get_group_name(resolved_name)
+    if group_name is not None:
+        model_names = _resolve_model_group(group_name)
+        if model_names:
+            resolved_name = model_names[0]
+
+    prov_name, mod_name = parse_provider_model_string(resolved_name)
+    caps = get_model_capabilities(mod_name or resolved_name)
+
+    if prov_name and mod_name:
+        config_tuple = find_model_config(prov_name, mod_name)
+        if config_tuple:
+            _, model_detail = config_tuple
+            if model_detail.max_input_tokens is not None:
+                caps = model_copy(
+                    caps, update={"max_input_tokens": model_detail.max_input_tokens}
+                )
+
+    return caps
 
 
 async def get_key_usage_stats() -> dict[str, Any]:

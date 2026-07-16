@@ -65,10 +65,10 @@ async def handle_submit_structured(
     )
     logger.debug("✅ 拦截到结构化结果提交，结束循环。")
     state.is_finished = True
-    state.final_result = model_construct(
+    state.pending_result = model_construct(
         AgentRunResult,
         output=None,
-        messages=state.messages,
+        messages=list(resources.run_context.run.messages),
         structured_data=parsed_obj,
         usage=state.usage,
     )
@@ -85,10 +85,10 @@ async def handle_end_run(
     )
     logger.debug("✅ 捕获到工具发出的终止信号，提前结束推理循环。")
     state.is_finished = True
-    state.final_result = model_construct(
+    state.pending_result = model_construct(
         AgentRunResult,
         output=output,
-        messages=state.messages,
+        messages=list(resources.run_context.run.messages),
         usage=state.usage,
     )
 
@@ -106,10 +106,10 @@ async def handle_handoff(
     output_text = f"已触发控制权移交 -> {handoff.target}。原因: {handoff.reason}"
     logger.info(f"✅ 拦截到移交(Handoff)信号: 移交给 -> {handoff.target}。结束循环。")
     state.is_finished = True
-    state.final_result = model_construct(
+    state.pending_result = model_construct(
         AgentRunResult,
         output=output_text,
-        messages=state.messages,
+        messages=list(resources.run_context.run.messages),
         usage=state.usage,
         handoff=handoff,
     )

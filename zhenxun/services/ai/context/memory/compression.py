@@ -4,6 +4,7 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, Field
 
+from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.context.memory.models import MemoryConfig
 from zhenxun.services.ai.core.engine.token_counter import token_counter
 from zhenxun.services.ai.core.messages import (
@@ -15,7 +16,10 @@ from zhenxun.services.ai.core.messages import (
     TextPart,
     VideoPart,
 )
+from zhenxun.services.ai.core.models import ModelCapabilities
+from zhenxun.services.ai.llm.api import chat, generate_structured
 from zhenxun.services.ai.llm.manager import get_default_model
+from zhenxun.services.ai.llm.system.capabilities import get_model_capabilities
 from zhenxun.services.ai.utils.logger import log_memory as logger
 from zhenxun.utils.pydantic_compat import model_copy
 
@@ -396,8 +400,6 @@ class LLMSummarizerReducer(AbstractSummarizerReducer):
             prompt_text += f"[{speaker}]: {c_str}\n"
         prompt_text += "</需要合并的旧对话记录>\n"
 
-        from zhenxun.services.ai.llm.api import chat
-
         try:
             model_to_use = self.summarization_model or get_default_model("chat")
             response = await chat(
@@ -474,8 +476,6 @@ class StructuredSummaryReducer(AbstractSummarizerReducer, Generic[_T_Summary]):
             prev_summary=prev_summary, dialogue=dialogue_text
         )
 
-        from zhenxun.services.ai.llm.api import generate_structured
-
         try:
             model_to_use = self.summarization_model or get_default_model("chat")
             summary_obj = await generate_structured(
@@ -513,15 +513,19 @@ class CondenserPipeline:
 
     @classmethod
     def create_from_configs(
-        cls, memory_config: MemoryConfig | None, model_name: str
+        cls,
+        memory_config: MemoryConfig | None,
+        capabilities: ModelCapabilities | None,
+        model_name: str,
     ) -> "CondenserPipeline":
         """基于全局和局部配置组装压缩管线工厂方法"""
-        from zhenxun.services.ai.config import get_llm_config
-        from zhenxun.services.ai.llm.system.capabilities import get_model_capabilities
-
         config = get_llm_config().context_settings
         pipeline_reducers = []
-        caps = get_model_capabilities(model_name)
+        caps = (
+            capabilities
+            if capabilities is not None
+            else get_model_capabilities(model_name)
+        )
 
         vw = config.vision_window_size
         if memory_config and memory_config.compression.vision_window is not None:

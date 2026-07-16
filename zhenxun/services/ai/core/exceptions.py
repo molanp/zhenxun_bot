@@ -8,41 +8,70 @@ from typing import Any
 class ModelRetry(Exception):
     """用于通知大模型修正并重试的异常"""
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, payload: dict[str, Any] | None = None):
         """
         初始化用于通知大模型重试的异常。
 
         参数：
             message: 用于提示大模型的具体重试和自我纠错信息。
+            payload: 携带产生错误时的上下文状态字典，用于渲染反馈提示词。
         """
         self.message = message
-        super().__init__(message)
+        self.payload = payload or {}
+        super().__init__(self.message)
+
+    def get_template_name(self) -> str:
+        """多态：子类告诉渲染引擎，自己应该使用哪个 Prompt 模板标识"""
+        return "default_retry"
+
+    def get_feedback_context(self) -> dict[str, Any]:
+        """多态：子类提供渲染模板所需的领域数据上下文"""
+        return {"error_msg": self.message, **self.payload}
 
 
 class SchemaParseError(ModelRetry):
     """格式解析异常。当大模型返回的 JSON 损坏或不符合 Schema 时抛出。"""
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, payload: dict[str, Any] | None = None):
         """
         初始化 Schema 格式解析错误异常。
 
         参数：
             message: 详细的 JSON 解析失败或 Schema 校验报错信息。
         """
-        super().__init__(message)
+        super().__init__(message, payload)
+
+    def get_template_name(self) -> str:
+        return "schema_parse_error"
+
+
+class SchemaValidationError(ModelRetry):
+    """数据校验异常。当大模型返回的 JSON 格式正确，但业务字段约束不满足时抛出。"""
+
+    def __init__(self, message: str, payload: dict[str, Any] | None = None):
+        """
+        初始化 Schema 业务字段约束验证错误异常。
+        """
+        super().__init__(message, payload)
+
+    def get_template_name(self) -> str:
+        return "schema_validation_error"
 
 
 class GuardrailViolationError(ModelRetry):
     """护栏违规异常。当大模型返回的数据格式正确，但违反业务规则时抛出。"""
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, payload: dict[str, Any] | None = None):
         """
         初始化安全护栏校验未通过的异常。
 
         参数：
             message: 触发业务护栏违规拦截的详细原因说明。
         """
-        super().__init__(message)
+        super().__init__(message, payload)
+
+    def get_template_name(self) -> str:
+        return "guardrail_violation"
 
 
 class ControlFlowExit(BaseException):

@@ -1,8 +1,7 @@
 from abc import ABC, abstractmethod
 import asyncio
-from collections.abc import Awaitable, Callable
-import json
-from typing import Any, Literal, cast
+from collections.abc import Iterable
+from typing import Any, cast
 
 from zhenxun.services.ai.capabilities import CombinedCapability
 from zhenxun.services.ai.core.engine.context_renderer import ContextConverter
@@ -11,22 +10,15 @@ from zhenxun.services.ai.core.engine.token_counter import (
     token_counter,
 )
 from zhenxun.services.ai.core.exceptions import (
-    ControlFlowExit,
     UpstreamServerException,
 )
 from zhenxun.services.ai.core.messages import (
     AgentMessage,
     AssistantMessage,
-    AudioPart,
     ChatRequest,
     ChatResponse,
-    FilePart,
-    ImagePart,
     LLMMessage,
-    TextPart,
-    ToolCallPart,
     ToolReturnPart,
-    VideoPart,
 )
 from zhenxun.services.ai.core.models import CancellationToken, LLMContext, ToolChoice
 from zhenxun.services.ai.core.options import GenerationConfig
@@ -40,11 +32,11 @@ from zhenxun.services.ai.flow.agent.models import AgentRunResources, AgentState
 from zhenxun.services.ai.llm.engine.router import LLMOrchestrator
 from zhenxun.services.ai.run import AgentRunResult, RunContext
 from zhenxun.services.ai.run.models import OutputDataT
-from zhenxun.services.ai.run.session import SessionInfo, session_manager
+from zhenxun.services.ai.run.session import session_manager
 from zhenxun.services.ai.tools.engine.executor import ToolExecutor
 from zhenxun.services.ai.tools.models import ToolResult
 from zhenxun.services.ai.utils.logger import log_agent as logger
-from zhenxun.utils.pydantic_compat import dump_json_safely, model_construct
+from zhenxun.utils.pydantic_compat import model_construct
 
 from .directive import (
     DirectiveHandlerFunc,
@@ -68,29 +60,42 @@ class BaseAgentExecutor(ABC):
         await self.on_start(state, resources)
 
         try:
-            for cycle_index in range(resources.config.max_cycles):
-                state.current_cycle = cycle_index
+            cycle_count = 0
+            while cycle_count < resources.config.max_cycles:
+                state.current_cycle = cycle_count
+                state.should_reset_cycle = False
                 await self.on_cycle_start(state, resources)
 
                 await self.build_llm_request(state, resources)
                 await self.execute_llm(state, resources)
 
                 await self.handle_llm_response(state, resources)
+                if state.should_reset_cycle:
+                    cycle_count = 0
+                    continue
                 if state.is_finished:
-                    assert state.final_result is not None
-                    return state.final_result
+                    assert state.pending_result is not None
+                    return state.pending_result
 
                 await self.filter_tool_calls(state, resources)
+                if state.should_reset_cycle:
+                    cycle_count = 0
+                    continue
                 if state.is_finished:
-                    assert state.final_result is not None
-                    return state.final_result
+                    assert state.pending_result is not None
+                    return state.pending_result
 
                 await self.execute_tools(state, resources)
 
                 await self.handle_tool_results(state, resources)
+                if state.should_reset_cycle:
+                    cycle_count = 0
+                    continue
                 if state.is_finished:
-                    assert state.final_result is not None
-                    return state.final_result
+                    assert state.pending_result is not None
+                    return state.pending_result
+
+                cycle_count += 1
 
             return await self.on_fallback(state, resources)
         except Exception as e:
@@ -179,23 +184,45 @@ class StandardAgentExecutor(BaseAgentExecutor):
             directive_handlers or {}
         )
 
+    @staticmethod
+    def _calculate_tool_overhead(tools: Iterable[Any] | None) -> int:
+        """辅助方法：计算工具集合的 Schema Token 开销"""
+        if not tools:
+            return 0
+        overhead = 0
+        for t in tools:
+            if isinstance(t, dict) and "function" in t:
+                overhead += token_counter.count_tools_schema(
+                    t["function"].get("parameters", {})
+                )
+            elif hasattr(t, "get_definition"):
+                t_def = getattr(t, "_dynamic_def", None)
+                if t_def and getattr(t_def, "parameters", None):
+                    overhead += token_counter.count_tools_schema(t_def.parameters)
+        return overhead
+
     def _can_retry_via_llm(self, result: ToolResult) -> bool:
         """通过新版的专属字段直接判断是否允许重试"""
         return result.is_retryable
 
-    def _check_follow_up(
-        self, state: AgentState, resources: AgentRunResources, session_info: SessionInfo
+    async def _check_follow_up(
+        self, state: AgentState, resources: AgentRunResources
     ) -> bool:
-        """检查追加队列，排空并合并数据到上下文，返回是否发现新消息"""
+        """检查追加队列，排空并合并数据到上下文，更新状态机标志位"""
+        session_id = resources.run_context.session_id or "default_session"
+        session_info = await session_manager.get_or_create(session_id)
         follow_ups = session_info.follow_up_queue.drain()
         if follow_ups:
             for fm in follow_ups:
-                state.messages.append(LLMMessage.user(f"💬 [用户追加指示]：{fm}"))
+                resources.run_context.run.messages.append(
+                    LLMMessage.user(f"💬 [用户追加指示]：{fm}")
+                )
             resources.run_context.session.append_only_manager.sync_messages(
-                state.messages
+                resources.run_context.run.messages
             )
             state.is_finished = False
-            state.final_result = None
+            state.pending_result = None
+            state.should_reset_cycle = True
             return True
         return False
 
@@ -224,13 +251,13 @@ class StandardAgentExecutor(BaseAgentExecutor):
 
         await run_context.run.emit(
             LLMStartEvent(
-                model_name=resources.model_name or "unknown",
+                model_name=resources.run_context.run.current_model or "unknown",
                 messages=flattened_messages,
             )
         )
 
         response = await self._execute_model_request(
-            model_name=resources.model_name,
+            model_name=resources.run_context.run.current_model,
             messages=flattened_messages,
             config=resources.generation_config or GenerationConfig(),
             run_context=run_context,
@@ -266,8 +293,16 @@ class StandardAgentExecutor(BaseAgentExecutor):
         if usage_obj.completion_tokens > 0:
             assistant_message.token_cost = usage_obj.completion_tokens
 
-        state.messages.append(assistant_message)
-        run_context.session.append_only_manager.sync_messages(state.messages)
+        if usage_obj.prompt_tokens > 0:
+            est_prompt_tokens = token_counter.count_context(
+                messages, resources.run_context.run.current_model or "", base_overhead=0
+            )
+            tool_overhead = self._calculate_tool_overhead(tools)
+            est_total = est_prompt_tokens + tool_overhead
+            state.token_drift = usage_obj.prompt_tokens - est_total
+
+        run_context.run.messages.append(assistant_message)
+        run_context.session.append_only_manager.sync_messages(run_context.run.messages)
 
         return response
 
@@ -308,97 +343,53 @@ class StandardAgentExecutor(BaseAgentExecutor):
         )
 
     async def on_start(self, state: AgentState, resources: AgentRunResources) -> None:
-        resources.run_context.run.messages = state.messages
-
-    async def _execute_phase(
-        self,
-        phase_func: Callable[[AgentState, AgentRunResources], Awaitable[None]],
-        state: AgentState,
-        resources: AgentRunResources,
-        session_info: SessionInfo,
-    ) -> Literal["NEXT", "RESET_CYCLE", "FINISH"]:
-        """统一处理阶段执行与状态机完成/追加检查的高阶函数"""
-        await phase_func(state, resources)
-        if state.is_finished:
-            if self._check_follow_up(state, resources, session_info):
-                return "RESET_CYCLE"
-            return "FINISH"
-        return "NEXT"
-
-    async def run(
-        self, state: AgentState, resources: AgentRunResources
-    ) -> AgentRunResult[OutputDataT]:
-        """覆盖基类的模板方法，实现灵活的 while 控制流和 FOLLOW_UP 合并"""
-        await self.on_start(state, resources)
-        session_info = await session_manager.get_or_create(
-            resources.run_context.session_id or "default_session"
-        )
-
-        try:
-            cycle_count = 0
-            while cycle_count < resources.config.max_cycles:
-                state.current_cycle = cycle_count
-                await self.on_cycle_start(state, resources)
-
-                await self.build_llm_request(state, resources)
-                await self.execute_llm(state, resources)
-
-                status = await self._execute_phase(
-                    self.handle_llm_response, state, resources, session_info
-                )
-                if status == "RESET_CYCLE":
-                    cycle_count = 0
-                    continue
-                if status == "FINISH":
-                    assert state.final_result is not None
-                    return state.final_result
-
-                status = await self._execute_phase(
-                    self.filter_tool_calls, state, resources, session_info
-                )
-                if status == "RESET_CYCLE":
-                    cycle_count = 0
-                    continue
-                if status == "FINISH":
-                    assert state.final_result is not None
-                    return state.final_result
-
-                await self.execute_tools(state, resources)
-
-                status = await self._execute_phase(
-                    self.handle_tool_results, state, resources, session_info
-                )
-                if status == "RESET_CYCLE":
-                    cycle_count = 0
-                    continue
-                if status == "FINISH":
-                    assert state.final_result is not None
-                    return state.final_result
-
-                cycle_count += 1
-
-            if self._check_follow_up(state, resources, session_info):
-                return await self.run(state, resources)
-
-            return await self.on_fallback(state, resources)
-        except Exception as e:
-            raise e
+        pass
 
     async def on_cycle_start(
         self, state: AgentState, resources: AgentRunResources
     ) -> None:
+        state.current_request_messages = []
+        state.current_response = None
+        state.current_tool_calls = []
+        state.current_tool_results = []
+        state.should_reset_cycle = False
+
         cancellation_token = resources.run_context.run.cancellation_token
         if cancellation_token:
             cancellation_token.raise_if_cancelled()
 
         try:
-            est_tokens = token_counter.count_context(
-                state.messages, resources.model_name or "", base_overhead=0
+            base_overhead = 0
+            if state.static_system_prompt:
+                sp_list = (
+                    state.static_system_prompt
+                    if isinstance(state.static_system_prompt, list)
+                    else [state.static_system_prompt]
+                )
+                for sp in sp_list:
+                    if sp:
+                        base_overhead += token_counter._count_text(str(sp))
+            for m in state.dynamic_system_messages:
+                base_overhead += token_counter.count_message(
+                    m, resources.run_context.run.current_model or ""
+                )
+            base_overhead += self._calculate_tool_overhead(state.tools)
+
+            est_tokens = (
+                token_counter.count_context(
+                    resources.run_context.run.messages,
+                    resources.run_context.run.current_model or "",
+                    base_overhead=base_overhead,
+                )
+                + state.token_drift
             )
+
+            est_tokens = max(est_tokens, 0)
+
             logger.debug(
                 f"(Iter {state.current_cycle + 1}) "
                 f"预估将消耗 {est_tokens} Token "
-                f"(Model: {resources.model_name or 'Unknown'})"
+                f"(Model: {resources.run_context.run.current_model or 'Unknown'})"
             )
         except Exception:
             pass
@@ -413,8 +404,12 @@ class StandardAgentExecutor(BaseAgentExecutor):
         steer_msgs = session_info.steer_queue.drain()
         if steer_msgs:
             for sm in steer_msgs:
-                state.messages.append(LLMMessage.user(f"💬 [用户实时修正指示]：{sm}"))
-            run_context.session.append_only_manager.sync_messages(state.messages)
+                run_context.run.messages.append(
+                    LLMMessage.user(f"💬 [用户实时修正指示]：{sm}")
+                )
+            run_context.session.append_only_manager.sync_messages(
+                run_context.run.messages
+            )
 
         messages_to_send = []
         if state.static_system_prompt:
@@ -439,7 +434,7 @@ class StandardAgentExecutor(BaseAgentExecutor):
                 if prompt_text and prompt_text.strip():
                     messages_to_send.append(LLMMessage.system(prompt_text))
 
-        messages_to_send.extend(state.messages)
+        messages_to_send.extend(run_context.run.messages)
 
         state.current_request_messages = messages_to_send
 
@@ -466,12 +461,15 @@ class StandardAgentExecutor(BaseAgentExecutor):
         if not response.tool_calls:
             logger.debug("✅ 模型未请求工具调用，推理循环结束。")
             state.is_finished = True
-            state.final_result = model_construct(
+            state.pending_result = model_construct(
                 AgentRunResult,
                 output=response.text,
-                messages=state.messages,
+                messages=list(resources.run_context.run.messages),
                 usage=state.usage,
             )
+
+        if state.is_finished:
+            await self._check_follow_up(state, resources)
 
     async def filter_tool_calls(
         self, state: AgentState, resources: AgentRunResources
@@ -522,14 +520,16 @@ class StandardAgentExecutor(BaseAgentExecutor):
             logger.info("✅ 无本地客户端工具需执行，推理循环平滑结束。")
 
             state.is_finished = True
-            state.final_result = model_construct(
+            state.pending_result = model_construct(
                 AgentRunResult,
                 output=response.text,
-                messages=state.messages,
+                messages=list(resources.run_context.run.messages),
                 usage=state.usage,
             )
 
         state.current_tool_calls = client_tool_calls
+        if state.is_finished:
+            await self._check_follow_up(state, resources)
 
     async def execute_tools(
         self, state: AgentState, resources: AgentRunResources
@@ -565,51 +565,6 @@ class StandardAgentExecutor(BaseAgentExecutor):
         tool_results = await asyncio.gather(*exec_tasks, return_exceptions=True)
         state.current_tool_results = tool_results
 
-    def _assemble_tool_message(
-        self,
-        original_call: ToolCallPart,
-        res_or_exc: BaseException | tuple[ToolCallPart, ToolResult],
-        tool_res: ToolResult | None,
-        state: AgentState,
-    ) -> LLMMessage:
-        """负责处理异常、解析多模态、序列化，并装配为最终的工具消息载体"""
-        media_parts = []
-        final_content = "Success"
-
-        if isinstance(res_or_exc, BaseException):
-            if isinstance(res_or_exc, ControlFlowExit):
-                raise res_or_exc
-            final_content = json.dumps(
-                {"error": str(res_or_exc), "status": "failed"},
-                ensure_ascii=False,
-            )
-        elif tool_res is not None:
-            if isinstance(tool_res.output, list):
-                texts = []
-                for item in tool_res.output:
-                    if isinstance(item, ImagePart | AudioPart | VideoPart | FilePart):
-                        media_parts.append(item)
-                    elif isinstance(item, TextPart):
-                        texts.append(item.text)
-                    else:
-                        texts.append(str(item))
-                final_content = " ".join(texts) if texts else "Success"
-            elif isinstance(tool_res.output, str):
-                final_content = tool_res.output
-            else:
-                final_content = dump_json_safely(tool_res.output, ensure_ascii=False)
-
-            tool_usage = getattr(tool_res, "usage", None)
-            if tool_usage is not None:
-                state.usage += tool_usage
-
-        msg = LLMMessage.tool_response(
-            original_call.id, original_call.tool_name, final_content
-        )
-        if media_parts:
-            msg.content.extend(media_parts)
-        return msg
-
     async def handle_tool_results(
         self, state: AgentState, resources: AgentRunResources
     ) -> None:
@@ -627,10 +582,12 @@ class StandardAgentExecutor(BaseAgentExecutor):
                 _, raw_tool_res = res_or_exc
                 tool_res = raw_tool_res
 
-            msg = self._assemble_tool_message(
-                original_call, res_or_exc, tool_res, state
+            msg, usage = ToolExecutor.assemble_tool_message(
+                original_call, res_or_exc, tool_res
             )
-            state.messages.append(msg)
+            if usage:
+                state.usage += usage
+            resources.run_context.run.messages.append(msg)
 
             if tool_res and getattr(tool_res, "directive", None):
                 ns = getattr(resources.run_context.session, "namespace", "global")
@@ -642,8 +599,10 @@ class StandardAgentExecutor(BaseAgentExecutor):
                     await handler(state, resources, tool_res)
                     if state.is_finished:
                         resources.run_context.session.append_only_manager.sync_messages(
-                            state.messages
+                            resources.run_context.run.messages
                         )
+                        if state.is_finished:
+                            await self._check_follow_up(state, resources)
                         return
                 else:
                     logger.warning(
@@ -651,7 +610,11 @@ class StandardAgentExecutor(BaseAgentExecutor):
                         f"的指令处理器 (Namespace: {ns})"
                     )
 
-        resources.run_context.session.append_only_manager.sync_messages(state.messages)
+        resources.run_context.session.append_only_manager.sync_messages(
+            resources.run_context.run.messages
+        )
+        if state.is_finished:
+            await self._check_follow_up(state, resources)
 
     async def on_fallback(
         self, state: AgentState, resources: AgentRunResources
@@ -680,12 +643,12 @@ class StandardAgentExecutor(BaseAgentExecutor):
             "请**诚实地**向用户总结：你目前进行到了哪一步？遇到了什么困难导致循环耗尽？还有哪些预期步骤未能完成？\n"
             "**绝对禁止**对用户撒谎声声称你已经完成了任务。严禁再次尝试调用任何工具！请直接输出纯文本结果。"
         )
-        state.messages.append(fallback_msg)
+        run_context.run.messages.append(fallback_msg)
 
         fallback_response = await self._invoke_and_record_llm(
             state=state,
             resources=resources,
-            messages=state.messages,
+            messages=run_context.run.messages,
             tools=[],
             tool_choice="none",
         )
@@ -695,7 +658,7 @@ class StandardAgentExecutor(BaseAgentExecutor):
             model_construct(
                 AgentRunResult,
                 output=fallback_response.text,
-                messages=state.messages,
+                messages=list(run_context.run.messages),
                 structured_data=None,
                 usage=state.usage,
             ),
