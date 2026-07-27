@@ -76,10 +76,10 @@ class StoreManager:
         if cached_data := await _PLUGIN_STORE_DATA_CACHE.get(cache_key):
             return cached_data
 
-        plugins = await RepoFileManager.get_file_content(
+        plugins = await RepoFileManager.get_text_content(
             DEFAULT_GITHUB_URL, "plugins.json"
         )
-        extra_plugins = await RepoFileManager.get_file_content(
+        extra_plugins = await RepoFileManager.get_text_content(
             EXTRA_GITHUB_URL, "plugins.json", "index"
         )
         result = (

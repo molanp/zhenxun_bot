@@ -536,15 +536,7 @@ class AliyunFileInfo:
                 ).decode(),
             )
 
-            runtime = util_models.RuntimeOptions()
-            headers = {}
-
-            response = await client.get_file_blobs_with_options_async(
-                repository_id,
-                request,
-                headers,
-                runtime,
-            )
+            response = await client.get_file_blobs_async(repository_id, request)
 
             if response and response.body and response.body.result:
                 if not response.body.success:
