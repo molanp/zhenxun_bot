@@ -337,9 +337,9 @@ class StoreManager:
             source: 源
         """
         repo_type = RepoType.GITHUB if is_external else None
-        if (
-            source != "ali" and source != "git" and plugin_info.ali_url
-        ) or source == "ali":
+        if not is_external:
+            repo_type = RepoType.ALIYUN
+        elif (source is None and plugin_info.ali_url) or source == "ali":
             repo_type = RepoType.ALIYUN
         elif source == "git":
             repo_type = RepoType.GITHUB
@@ -351,7 +351,7 @@ class StoreManager:
         plugin_module = plugin_info.module
         if is_dir:
             files = await RepoFileManager.list_directory_files(
-                github_url, replace_module_path, branch, repo_type=repo_type
+                github_url, replace_module_path, branch, repo_type=RepoType.GITHUB
             )
         else:
             files = [RepoFileInfo(path=f"{replace_module_path}.py", is_dir=False)]
