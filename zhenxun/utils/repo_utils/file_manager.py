@@ -69,7 +69,7 @@ class RepoFileManager:
             ignore_error: 是否忽略错误
 
         返回:
-            list[tuple[str, bytes]]: 文件路径，文件内容
+            list[tuple[str, str]]: 文件路径，文件内容
         """
         results: list[tuple[str, str]] = []
         is_str_input = isinstance(file_path, str)
@@ -210,7 +210,7 @@ class RepoFileManager:
             ignore_error: 是否忽略错误
 
         返回:
-            bytes: 文件内容
+            str: 文件内容
         """
         # 确定仓库类型
         repo_name = (
@@ -251,24 +251,29 @@ class RepoFileManager:
         recursive: bool = True,
     ) -> list[RepoFileInfo]:
         """
-        获取仓库目录下的所有文件路径
+        获取仓库目录下的所有文件路径。
 
         参数:
-            repo_url: 仓库URL
+            repo_url: 仓库URL，可以包含 /tree/<branch>，会自动解析出分支和仓库地址。
             directory_path: 目录路径，默认为仓库根目录
-            branch: 分支名称
+            branch: 分支名称（若 repo_url 中包含 /tree/<branch>，则以 URL 中的为准）
             repo_type: 仓库类型，如果为None则自动判断
             recursive: 是否递归获取子目录文件
 
         返回:
             list[RepoFileInfo]: 文件信息列表
         """
-        repo_name = (
-            repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "").strip()
-        )
+        base_url = repo_url
+        if "/tree/" in repo_url:
+            base_url, tree_part = repo_url.split("/tree/", maxsplit=1)
+            if tree_branch := tree_part.split("/", maxsplit=1)[0].strip():
+                branch = tree_branch
+
+        repo_name = base_url.split("/")[-1].replace(".git", "").strip()
+
         try:
             if repo_type is None:
-                # 尝试GitHub，失败则尝试阿里云
+                # 尝试阿里云，失败则尝试 GitHub
                 try:
                     return await self._list_aliyun_directory_files(
                         repo_name, directory_path, branch, recursive
@@ -278,11 +283,11 @@ class RepoFileManager:
                         "获取阿里云目录文件失败，尝试GitHub", LOG_COMMAND, e=e
                     )
                     return await self._list_github_directory_files(
-                        repo_url, directory_path, branch, recursive
+                        base_url, directory_path, branch, recursive
                     )
             if repo_type == RepoType.GITHUB:
                 return await self._list_github_directory_files(
-                    repo_url, directory_path, branch, recursive
+                    base_url, directory_path, branch, recursive
                 )
             elif repo_type == RepoType.ALIYUN:
                 return await self._list_aliyun_directory_files(
@@ -292,7 +297,7 @@ class RepoFileManager:
             logger.error(f"获取目录文件列表失败: {directory_path}", LOG_COMMAND, e=e)
             if isinstance(e, FileNotFoundError | NetworkError | RepoManagerError):
                 raise
-            raise RepoManagerError(f"获取目录文件列表失败: {e}")
+            raise RepoManagerError(f"获取目录文件列表失败: {e}") from e
 
     async def _list_github_directory_files(
         self,
@@ -524,6 +529,8 @@ class RepoFileManager:
     ) -> FileDownloadResult:
         try:
             clone_url = repo_url.split("/tree/", maxsplit=1)[0].rstrip("/")
+            if not clone_url.endswith(".git"):
+                clone_url += ".git"
             if repo_type == RepoType.ALIYUN:
                 repo_name = clone_url.rsplit("/", maxsplit=1)[-1].removesuffix(".git")
                 group_name = await get_aliyun_group_for_repo(repo_name)

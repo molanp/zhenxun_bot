@@ -4,7 +4,6 @@
 
 import asyncio
 import base64
-from collections.abc import Sequence
 from pathlib import Path
 import re
 import shutil
@@ -49,7 +48,7 @@ async def clean_git(cwd: Path):
 
 
 async def run_git_command(
-    command: str | Sequence[str], cwd: Path | None = None
+    command: str | list[str], cwd: Path | None = None
 ) -> tuple[bool, str, str]:
     """
     运行git命令，实时输出 stderr 进度信息（如 git clone --progress）。
@@ -191,7 +190,7 @@ def filter_files(
 async def sparse_checkout_clone(
     repo_url: str,
     branch: str,
-    sparse_path: str | Sequence[str],
+    sparse_path: str | list[str],
     target_dir: Path,
 ) -> list[str]:
     """
