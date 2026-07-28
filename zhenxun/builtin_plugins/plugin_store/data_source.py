@@ -351,7 +351,7 @@ class StoreManager:
         plugin_module = plugin_info.module
         if is_dir:
             files = await RepoFileManager.list_directory_files(
-                github_url, replace_module_path, branch
+                github_url, replace_module_path, branch, repo_type=repo_type
             )
         else:
             files = [RepoFileInfo(path=f"{replace_module_path}.py", is_dir=False)]
