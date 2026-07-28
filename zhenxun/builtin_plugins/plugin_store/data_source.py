@@ -370,11 +370,17 @@ class StoreManager:
                 dst_path = target_dir / f"{plugin_module}.py"
 
             download_files.append((src_path, dst_path))
+        rand = random.randint(1, 10000)
+        requirement_path_ = TEMP_PATH / f"plugin_store_{rand}_req.txt"
+        requirements_path_ = TEMP_PATH / f"plugin_store_{rand}_reqs.txt"
+        download_files.append(("requirement.txt", requirement_path_))
+        download_files.append(("requirements.txt", requirements_path_))
         result = await RepoFileManager.download_files(
             github_url,
             download_files,
             branch,
             repo_type=repo_type,
+            ignore_error=True,
         )
         if not result.success:
             raise PluginStoreException(result.error_message)
@@ -396,32 +402,18 @@ class StoreManager:
                 await VirtualEnvPackageManager.install_requirement(requirement_file)
 
         if not is_install_req:
-            # 从仓库根目录查找文件
-            rand = random.randint(1, 10000)
-            requirement_path = TEMP_PATH / f"plugin_store_{rand}_req.txt"
-            requirements_path = TEMP_PATH / f"plugin_store_{rand}_reqs.txt"
-            await RepoFileManager.download_files(
-                github_url,
-                [
-                    ("requirement.txt", requirement_path),
-                    ("requirements.txt", requirements_path),
-                ],
-                branch,
-                repo_type=repo_type,
-                ignore_error=True,
-            )
-            if requirement_path.exists():
+            if requirement_path_.exists():
                 logger.info(
-                    f"开始安装插件 {module_path} 依赖文件: {requirement_path}",
+                    f"开始安装插件 {module_path} 依赖文件: {requirement_path_}",
                     LOG_COMMAND,
                 )
-                await VirtualEnvPackageManager.install_requirement(requirement_path)
-            if requirements_path.exists():
+                await VirtualEnvPackageManager.install_requirement(requirement_path_)
+            if requirements_path_.exists():
                 logger.info(
-                    f"开始安装插件 {module_path} 依赖文件: {requirements_path}",
+                    f"开始安装插件 {module_path} 依赖文件: {requirements_path_}",
                     LOG_COMMAND,
                 )
-                await VirtualEnvPackageManager.install_requirement(requirements_path)
+                await VirtualEnvPackageManager.install_requirement(requirements_path_)
 
     @classmethod
     async def remove_plugin(cls, index_or_module: str) -> str:
