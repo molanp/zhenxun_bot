@@ -1,12 +1,12 @@
 import os
 from pathlib import Path
-import random
 import shutil
+import tempfile
+from typing import ClassVar
 
 import ujson as json
 
 from zhenxun.builtin_plugins.plugin_store.models import StorePluginInfo
-from zhenxun.configs.path_config import TEMP_PATH
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.services.cache.bounded_ttl import BoundedTTLCache
 from zhenxun.services.log import logger
@@ -52,6 +52,58 @@ def row_style(column: str, text: str) -> RowStyle:
 
 
 class StoreManager:
+    _SOURCE_NAMES: ClassVar[dict[RepoType, str]] = {
+        RepoType.ALIYUN: "阿里云",
+        RepoType.GITHUB: "GitHub",
+    }
+    _BINARY_EXTENSIONS: ClassVar[frozenset[str]] = frozenset(
+        {
+            ".7z",
+            ".avi",
+            ".bin",
+            ".bmp",
+            ".class",
+            ".dat",
+            ".db",
+            ".dll",
+            ".doc",
+            ".docx",
+            ".dylib",
+            ".eot",
+            ".exe",
+            ".flv",
+            ".gif",
+            ".gz",
+            ".ico",
+            ".jpeg",
+            ".jpg",
+            ".mov",
+            ".mp3",
+            ".mp4",
+            ".otf",
+            ".pdf",
+            ".png",
+            ".ppt",
+            ".pptx",
+            ".pyc",
+            ".rar",
+            ".so",
+            ".svg",
+            ".tar",
+            ".tif",
+            ".tiff",
+            ".ttf",
+            ".webp",
+            ".wmv",
+            ".woff",
+            ".woff2",
+            ".xls",
+            ".xlsx",
+            ".xz",
+            ".zip",
+        }
+    )
+
     @classmethod
     def _resolve_local_plugin_path(
         cls, plugin_info: StorePluginInfo, *, is_external: bool
@@ -333,87 +385,214 @@ class StoreManager:
 
         参数:
             plugin_info: 插件信息
-            is_external: 是否是外部仓库
-            source: 源
+            is_external: 是否是外部仓库（保留用于兼容旧调用）
+            source: 强制使用的源，ali 为阿里云，git 为 GitHub；
+                不指定时优先阿里云，失败后回退 GitHub
         """
-        repo_type = RepoType.GITHUB if is_external else None
-        if not is_external:
-            repo_type = RepoType.ALIYUN
-        elif (source is None and plugin_info.ali_url) or source == "ali":
-            repo_type = RepoType.ALIYUN
-        elif source == "git":
-            repo_type = RepoType.GITHUB
+        source_order = cls._get_source_order(source)
+        errors: list[str] = []
+
+        with tempfile.TemporaryDirectory(prefix="zhenxun_plugin_store_") as temp_dir:
+            staged_result: tuple[list[tuple[Path, Path]], list[Path]] | None = None
+            selected_source: RepoType | None = None
+
+            for repo_type in source_order:
+                source_name = cls._SOURCE_NAMES[repo_type]
+                staging_root = Path(temp_dir) / repo_type.value
+                try:
+                    staged_result = await cls._download_plugin_to_staging(
+                        plugin_info,
+                        repo_type,
+                        branch,
+                        staging_root,
+                    )
+                    selected_source = repo_type
+                    logger.info(
+                        f"插件 {plugin_info.name} 使用{source_name}下载成功",
+                        LOG_COMMAND,
+                    )
+                    break
+                except Exception as e:
+                    errors.append(f"{source_name}: {e}")
+                    if repo_type != source_order[-1]:
+                        logger.warning(
+                            f"插件 {plugin_info.name} 使用{source_name}下载失败，"
+                            "尝试 GitHub",
+                            LOG_COMMAND,
+                            e=e,
+                        )
+
+            if staged_result is None or selected_source is None:
+                raise PluginStoreException(
+                    f"插件 {plugin_info.name} 下载失败（{'；'.join(errors)}）"
+                )
+
+            deploy_files, requirement_files = staged_result
+            for requirement_file in requirement_files:
+                logger.info(
+                    f"开始安装插件 {plugin_info.module_path} "
+                    f"依赖文件: {requirement_file}",
+                    LOG_COMMAND,
+                )
+                await VirtualEnvPackageManager.install_requirement(requirement_file)
+
+            for staged_path, destination_path in deploy_files:
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(staged_path, destination_path)
+
+    @staticmethod
+    def _get_source_order(source: str | None) -> tuple[RepoType, ...]:
+        """解析插件下载源。"""
+        if source is None:
+            return (RepoType.ALIYUN, RepoType.GITHUB)
+        if source == "ali":
+            return (RepoType.ALIYUN,)
+        if source == "git":
+            return (RepoType.GITHUB,)
+        raise PluginStoreException(f"源类型错误: {source}，请使用 ali 或 git")
+
+    @staticmethod
+    def _get_repository_url(plugin_info: StorePluginInfo, repo_type: RepoType) -> str:
+        """获取指定下载源对应的仓库地址。"""
+        if repo_type == RepoType.ALIYUN and plugin_info.ali_url:
+            return plugin_info.ali_url
+        if plugin_info.github_url:
+            return plugin_info.github_url
+        raise PluginStoreException(f"插件 {plugin_info.name} 缺少仓库地址")
+
+    @staticmethod
+    def _get_repository_branch(repo_url: str | None, default_branch: str) -> str:
+        """优先使用仓库 URL 中显式指定的分支、标签或提交。"""
+        if repo_url and "/tree/" in repo_url:
+            _, _, ref = repo_url.partition("/tree/")
+            if ref := ref.strip("/"):
+                return ref
+        return default_branch
+
+    @classmethod
+    def _get_plugin_repository_branch(
+        cls,
+        plugin_info: StorePluginInfo,
+        repo_type: RepoType,
+        default_branch: str,
+    ) -> str:
+        """按下载源独立解析分支，避免把 GitHub 分支套到阿里云镜像。"""
+        branch_source_url = (
+            plugin_info.ali_url
+            if repo_type == RepoType.ALIYUN
+            else plugin_info.github_url
+        )
+        return cls._get_repository_branch(branch_source_url, default_branch)
+
+    @classmethod
+    async def _download_plugin_to_staging(
+        cls,
+        plugin_info: StorePluginInfo,
+        repo_type: RepoType,
+        default_branch: str,
+        staging_root: Path,
+    ) -> tuple[list[tuple[Path, Path]], list[Path]]:
+        """从单一仓库源完整下载插件到临时目录。"""
+        repo_url = cls._get_repository_url(plugin_info, repo_type)
+        branch = cls._get_plugin_repository_branch(
+            plugin_info,
+            repo_type,
+            default_branch,
+        )
         module_path = plugin_info.module_path
-        is_dir = plugin_info.is_dir
-        github_url = plugin_info.github_url
-        assert github_url
-        replace_module_path = module_path.replace(".", "/").lstrip("/")
-        plugin_module = plugin_info.module
-        if is_dir:
+        repository_plugin_path = module_path.replace(".", "/").strip("/")
+
+        if plugin_info.is_dir:
             files = await RepoFileManager.list_directory_files(
-                github_url, replace_module_path, branch, repo_type=repo_type
+                repo_url,
+                repository_plugin_path,
+                branch,
+                repo_type=repo_type,
             )
         else:
-            files = [RepoFileInfo(path=f"{replace_module_path}.py", is_dir=False)]
-        if is_dir:
-            target_dir = BASE_PATH / "plugins" / plugin_module
-        else:
-            target_dir = BASE_PATH / "plugins"
+            if not repository_plugin_path:
+                raise PluginStoreException(
+                    f"插件 {plugin_info.name} 的模块路径不能为空"
+                )
+            files = [RepoFileInfo(path=f"{repository_plugin_path}.py", is_dir=False)]
+
         files = [file for file in files if not file.is_dir]
+        if not files:
+            raise PluginStoreException(
+                f"仓库中未找到插件目录: {plugin_info.module_path}"
+            )
+
+        target_root = (
+            BASE_PATH / "plugins" / plugin_info.module
+            if plugin_info.is_dir
+            else BASE_PATH / "plugins"
+        )
         download_files: list[tuple[str, Path]] = []
+        deploy_files: list[tuple[Path, Path]] = []
 
         for file in files:
-            src_path = file.path
-            if is_dir:
-                dst_path = target_dir / Path(src_path).relative_to(replace_module_path)
-            else:
-                dst_path = target_dir / f"{plugin_module}.py"
+            source_path = Path(file.path)
+            if source_path.is_absolute() or ".." in source_path.parts:
+                raise PluginStoreException(f"仓库包含不安全的文件路径: {file.path}")
 
-            download_files.append((src_path, dst_path))
-        rand = random.randint(1, 10000)
-        requirement_path_ = TEMP_PATH / f"plugin_store_{rand}_req.txt"
-        requirements_path_ = TEMP_PATH / f"plugin_store_{rand}_reqs.txt"
-        download_files.append(("requirement.txt", requirement_path_))
-        download_files.append(("requirements.txt", requirements_path_))
+            staged_path = staging_root / source_path
+            if plugin_info.is_dir:
+                plugin_root = (
+                    Path(repository_plugin_path) if repository_plugin_path else Path()
+                )
+                try:
+                    relative_path = source_path.relative_to(plugin_root)
+                except ValueError as e:
+                    raise PluginStoreException(
+                        f"插件文件不在模块目录内: {file.path}"
+                    ) from e
+                destination_path = target_root / relative_path
+            else:
+                destination_path = target_root / f"{plugin_info.module}.py"
+
+            download_files.append((file.path, staged_path))
+            deploy_files.append((staged_path, destination_path))
+
+        required_download_files = download_files.copy()
+        requirement_files = [
+            staging_root / Path(file.path)
+            for file in files
+            if Path(file.path).name in {"requirement.txt", "requirements.txt"}
+        ]
+        root_requirements: list[tuple[str, Path]] = []
+        if not requirement_files:
+            root_requirements = [
+                ("requirement.txt", staging_root / "requirement.txt"),
+                ("requirements.txt", staging_root / "requirements.txt"),
+            ]
+            download_files.extend(root_requirements)
+
         result = await RepoFileManager.download_files(
-            github_url,
+            repo_url,
             download_files,
             branch,
             repo_type=repo_type,
-            ignore_error=True,
+            ignore_error=bool(root_requirements),
         )
         if not result.success:
-            raise PluginStoreException(result.error_message)
+            raise PluginStoreException(result.error_message or "未知下载错误")
 
-        requirement_paths = [
-            file
-            for file in files
-            if file.path.endswith("requirement.txt")
-            or file.path.endswith("requirements.txt")
-        ]
+        for source_path, staged_path in required_download_files:
+            if not staged_path.is_file():
+                raise PluginStoreException(f"插件文件下载不完整: {source_path}")
+            if (
+                Path(source_path).suffix.lower() in cls._BINARY_EXTENSIONS
+                and staged_path.stat().st_size == 0
+            ):
+                raise PluginStoreException(f"二进制文件下载为空: {source_path}")
 
-        is_install_req = False
-        for requirement_path in requirement_paths:
-            requirement_file = target_dir / Path(requirement_path.path).relative_to(
-                replace_module_path
-            )
-            if requirement_file.exists():
-                is_install_req = True
-                await VirtualEnvPackageManager.install_requirement(requirement_file)
+        requirement_files = [path for path in requirement_files if path.is_file()]
+        if root_requirements:
+            requirement_files = [
+                path for _, path in root_requirements if path.is_file()
+            ]
 
-        if not is_install_req:
-            if requirement_path_.exists():
-                logger.info(
-                    f"开始安装插件 {module_path} 依赖文件: {requirement_path_}",
-                    LOG_COMMAND,
-                )
-                await VirtualEnvPackageManager.install_requirement(requirement_path_)
-            if requirements_path_.exists():
-                logger.info(
-                    f"开始安装插件 {module_path} 依赖文件: {requirements_path_}",
-                    LOG_COMMAND,
-                )
-                await VirtualEnvPackageManager.install_requirement(requirements_path_)
+        return deploy_files, requirement_files
 
     @classmethod
     async def remove_plugin(cls, index_or_module: str) -> str:

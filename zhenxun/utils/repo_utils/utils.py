@@ -4,10 +4,13 @@
 
 import asyncio
 import base64
+import contextlib
 from pathlib import Path
 import re
 import shutil
 import tempfile
+
+import psutil
 
 from zhenxun.services.log import logger
 
@@ -48,7 +51,9 @@ async def clean_git(cwd: Path):
 
 
 async def run_git_command(
-    command: str | list[str], cwd: Path | None = None
+    command: str | list[str],
+    cwd: Path | None = None,
+    timeout_seconds: float | None = None,
 ) -> tuple[bool, str, str]:
     """
     运行git命令，实时输出 stderr 进度信息（如 git clone --progress）。
@@ -56,6 +61,7 @@ async def run_git_command(
     参数:
         command: 命令字符串或参数列表
         cwd: 工作目录
+        timeout_seconds: 硬超时时间，None 表示不限制
 
     返回:
         tuple[bool, str, str]: (是否成功, 标准输出, 标准错误)
@@ -104,7 +110,18 @@ async def run_git_command(
                         stderr_lines.append(text)
                         logger.debug(text, LOG_COMMAND)
 
-        stdout_bytes, _ = await asyncio.gather(_collect_stdout(process), _read_stderr())
+        output_tasks = asyncio.gather(_collect_stdout(process), _read_stderr())
+        try:
+            if timeout_seconds is None:
+                stdout_bytes, _ = await output_tasks
+            else:
+                stdout_bytes, _ = await asyncio.wait_for(
+                    output_tasks,
+                    timeout=timeout_seconds,
+                )
+        except TimeoutError:
+            await _kill_process_tree(process)
+            return False, "", f"命令执行超时（{timeout_seconds:g} 秒）"
 
         await process.wait()
         stdout = (stdout_bytes or b"").decode("utf-8").strip()
@@ -114,6 +131,24 @@ async def run_git_command(
     except Exception as e:
         logger.error(f"运行git命令失败: {command}, 错误: {e}")
         return False, "", str(e)
+
+
+async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """终止超时的 Git 进程及其派生的认证、网络辅助进程。"""
+    with contextlib.suppress(psutil.Error):
+        parent = psutil.Process(process.pid)
+        children = parent.children(recursive=True)
+        for child in reversed(children):
+            with contextlib.suppress(psutil.Error):
+                child.kill()
+        with contextlib.suppress(psutil.Error):
+            parent.kill()
+
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(process.wait(), timeout=5)
 
 
 async def _collect_stdout(process: asyncio.subprocess.Process) -> bytes:
@@ -238,12 +273,40 @@ async def sparse_checkout_clone(
         if not success:
             raise RuntimeError(f"配置稀疏路径失败: {err or out}")
 
-        # 强制拉取并同步到远端
-        success, out, err = await run_git_command(
-            ["fetch", "--force", "--depth", "1", "origin", branch], temp_path
-        )
-        if not success:
-            raise RuntimeError(f"fetch 失败: {err or out}")
+        # 强制拉取并同步到远端。弱网或远端连接卡住时有限重试，
+        # 防止一次下载永久占住插件商店任务。
+        fetch_error = ""
+        for attempt in range(3):
+            success, out, err = await run_git_command(
+                [
+                    "-c",
+                    "http.lowSpeedLimit=1024",
+                    "-c",
+                    "http.lowSpeedTime=30",
+                    "fetch",
+                    "--force",
+                    "--depth",
+                    "1",
+                    "origin",
+                    branch,
+                ],
+                temp_path,
+                timeout_seconds=60,
+            )
+            if success:
+                break
+            fetch_error = err or out
+            if attempt < 2:
+                for lock_name in ("shallow.lock", "index.lock"):
+                    with contextlib.suppress(FileNotFoundError, PermissionError):
+                        (temp_path / ".git" / lock_name).unlink()
+                logger.warning(
+                    f"git fetch 失败，将重试（{attempt + 1}/3）: {fetch_error}",
+                    LOG_COMMAND,
+                )
+                await asyncio.sleep(2)
+        else:
+            raise RuntimeError(f"fetch 失败: {fetch_error}")
 
         # 使用远端强制更新本地分支并覆盖工作区
         success, out, err = await run_git_command(
