@@ -39,7 +39,7 @@ class UpdateManager:
         bot_cur_version = cls.__get_version()
 
         release_task = ZhenxunRepoManager.zhenxun_get_latest_releases_data()
-        dev_version_task = RepoFileManager.get_file_content(
+        dev_version_task = RepoFileManager.get_text_content(
             ZhenxunRepoConfig.ZHENXUN_BOT_GITHUB_URL, "__version__"
         )
         bot_commit_date_task = cls._get_latest_commit_date(
@@ -108,7 +108,7 @@ class UpdateManager:
 
         res_latest_version = "获取失败"
         try:
-            res_latest_version_text = await RepoFileManager.get_file_content(
+            res_latest_version_text = await RepoFileManager.get_text_content(
                 ZhenxunRepoConfig.RESOURCE_GITHUB_URL, "__version__"
             )
             res_latest_version = res_latest_version_text.split(":")[-1].strip()
@@ -264,7 +264,7 @@ class UpdateManager:
         resource_warning = ""
         if version_type == "main":
             try:
-                spec_content = await RepoFileManager.get_file_content(
+                spec_content = await RepoFileManager.get_text_content(
                     ZhenxunRepoConfig.ZHENXUN_BOT_GITHUB_URL, "resources.spec"
                 )
                 required_spec_str = None

@@ -48,20 +48,20 @@ async def clean_git(cwd: Path):
 
 
 async def run_git_command(
-    command: str, cwd: Path | None = None
+    command: str | list[str], cwd: Path | None = None
 ) -> tuple[bool, str, str]:
     """
     运行git命令，实时输出 stderr 进度信息（如 git clone --progress）。
 
     参数:
-        command: 命令
+        command: 命令字符串或参数列表
         cwd: 工作目录
 
     返回:
         tuple[bool, str, str]: (是否成功, 标准输出, 标准错误)
     """
     try:
-        args = command.split()
+        args = command.split() if isinstance(command, str) else list(command)
         process = await asyncio.create_subprocess_exec(
             "git",
             *args,
@@ -190,17 +190,21 @@ def filter_files(
 async def sparse_checkout_clone(
     repo_url: str,
     branch: str,
-    sparse_path: str,
+    sparse_path: str | list[str],
     target_dir: Path,
-) -> None:
+) -> list[str]:
     """
     使用 git 稀疏检出克隆指定路径到目标目录（在临时目录中操作）。
 
     关键保障:
     - 在临时目录中执行所有 git 操作，避免影响 target_dir 中的现有内容
     - 只操作 target_dir/sparse_path 路径，不影响 target_dir 其他内容
+
+    返回:
+        list[str]: 成功检出的路径
     """
     target_dir.mkdir(parents=True, exist_ok=True)
+    sparse_paths = [sparse_path] if isinstance(sparse_path, str) else list(sparse_path)
 
     if not await check_git():
         raise GitUnavailableError()
@@ -214,7 +218,7 @@ async def sparse_checkout_clone(
         if not success:
             raise RuntimeError(f"git init 失败: {err or out}")
         success, out, err = await run_git_command(
-            f"remote add origin {repo_url}", temp_path
+            ["remote", "add", "origin", repo_url], temp_path
         )
         if not success:
             raise RuntimeError(f"添加远程失败: {err or out}")
@@ -224,55 +228,59 @@ async def sparse_checkout_clone(
         await run_git_command("sparse-checkout init --no-cone", temp_path)
 
         # 设置需要检出的路径（每次都覆盖配置）
-        if not sparse_path:
+        if not sparse_paths or any(not path for path in sparse_paths):
             raise RuntimeError("sparse-checkout 路径不能为空")
 
         # 使用 --no-cone 模式，直接指定要检出的具体路径
         success, out, err = await run_git_command(
-            f"sparse-checkout set {sparse_path}/", temp_path
+            ["sparse-checkout", "set", "--", *sparse_paths], temp_path
         )
         if not success:
             raise RuntimeError(f"配置稀疏路径失败: {err or out}")
 
         # 强制拉取并同步到远端
         success, out, err = await run_git_command(
-            f"fetch --force --depth 1 origin {branch}", temp_path
+            ["fetch", "--force", "--depth", "1", "origin", branch], temp_path
         )
         if not success:
             raise RuntimeError(f"fetch 失败: {err or out}")
 
         # 使用远端强制更新本地分支并覆盖工作区
         success, out, err = await run_git_command(
-            f"checkout -B {branch} origin/{branch}", temp_path
+            ["checkout", "-B", branch, f"origin/{branch}"], temp_path
         )
         if not success:
             # 回退方案
             success2, out2, err2 = await run_git_command(
-                f"checkout {branch}", temp_path
+                ["checkout", branch], temp_path
             )
             if not success2:
                 raise RuntimeError(f"checkout 失败: {(err or out) or (err2 or out2)}")
 
         # 强制对齐工作区
-        await run_git_command(f"reset --hard origin/{branch}", temp_path)
+        await run_git_command(["reset", "--hard", f"origin/{branch}"], temp_path)
         await run_git_command("clean -xdf", temp_path)
 
-        # 将检出的文件移动到目标位置
-        source_path = temp_path / sparse_path
-        if source_path.exists():
-            # 确保目标路径存在
-            target_path = target_dir / sparse_path
-            target_path.parent.mkdir(parents=True, exist_ok=True)
+        # 将成功检出的文件复制到 staging，缺失路径由调用方决定是否忽略
+        downloaded_paths = []
+        for path in sparse_paths:
+            source_path = temp_path / path
+            if not source_path.exists():
+                continue
 
-            # 如果目标路径已存在，先清理
+            target_path = target_dir / path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
             if target_path.exists():
                 if target_path.is_dir():
                     shutil.rmtree(target_path)
                 else:
                     target_path.unlink()
-
-            # 移动整个目录结构到目标位置
-            shutil.move(str(source_path), str(target_path))
+            if source_path.is_dir():
+                shutil.copytree(source_path, target_path)
+            else:
+                shutil.copy2(source_path, target_path)
+            downloaded_paths.append(path)
+        return downloaded_paths
 
 
 def prepare_aliyun_url(repo_url: str, group_name: str | None = None) -> str:

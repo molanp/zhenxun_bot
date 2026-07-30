@@ -4,16 +4,16 @@
 
 import contextlib
 from pathlib import Path
-from typing import cast, overload
+import shutil
+import tempfile
+from typing import overload
 
-import aiofiles
 from httpx import Response
 
 from zhenxun.services.log import logger
 from zhenxun.utils.github_utils import GithubUtils
 from zhenxun.utils.github_utils.models import AliyunTreeType, GitHubStrategy, TreeType
 from zhenxun.utils.http_utils import AsyncHttpx
-from zhenxun.utils.utils import is_binary_file
 
 from .config import LOG_COMMAND, RepoConfig
 from .exceptions import (
@@ -40,12 +40,12 @@ class RepoFileManager:
         self.config.ensure_dirs()
 
     @overload
-    async def get_github_file_content(
+    async def get_github_text_content(
         self, url: str, file_path: str, branch: str = "main", ignore_error: bool = False
     ) -> str: ...
 
     @overload
-    async def get_github_file_content(
+    async def get_github_text_content(
         self,
         url: str,
         file_path: list[str],
@@ -53,7 +53,7 @@ class RepoFileManager:
         ignore_error: bool = False,
     ) -> list[tuple[str, str]]: ...
 
-    async def get_github_file_content(
+    async def get_github_text_content(
         self,
         url: str,
         file_path: str | list[str],
@@ -61,7 +61,7 @@ class RepoFileManager:
         ignore_error: bool = False,
     ) -> str | list[tuple[str, str]]:
         """
-        获取GitHub仓库文件内容
+        获取GitHub仓库文本文件内容
 
         参数:
             url: 仓库URL
@@ -71,7 +71,7 @@ class RepoFileManager:
         返回:
             list[tuple[str, str]]: 文件路径，文件内容
         """
-        results = []
+        results: list[tuple[str, str]] = []
         is_str_input = isinstance(file_path, str)
         try:
             if is_str_input:
@@ -91,20 +91,9 @@ class RepoFileManager:
                         )
                         if response.status_code == 200:
                             logger.info(f"获取github文件内容成功: {f}", LOG_COMMAND)
-                            text_content = response.content
-                            # 确保使用UTF-8编码解析响应内容
-                            if not is_binary_file(f):
-                                try:
-                                    text_content = response.content.decode("utf-8")
-                                except UnicodeDecodeError:
-                                    # 如果UTF-8解码失败，尝试其他编码
-                                    text_content = response.content.decode(
-                                        "utf-8", errors="ignore"
-                                    )
-                                    logger.warning(
-                                        f"解码文件内容时出现错误，使用忽略错误模式:{f}",
-                                        LOG_COMMAND,
-                                    )
+                            text_content = response.content.decode(
+                                "utf-8", errors="ignore"
+                            )
                             results.append((f, text_content))
                             break
                         else:
@@ -124,7 +113,7 @@ class RepoFileManager:
         return results[0][1] if is_str_input and results else results
 
     @overload
-    async def get_aliyun_file_content(
+    async def get_aliyun_text_content(
         self,
         repo_name: str,
         file_path: str,
@@ -133,7 +122,7 @@ class RepoFileManager:
     ) -> str: ...
 
     @overload
-    async def get_aliyun_file_content(
+    async def get_aliyun_text_content(
         self,
         repo_name: str,
         file_path: list[str],
@@ -141,7 +130,7 @@ class RepoFileManager:
         ignore_error: bool = False,
     ) -> list[tuple[str, str]]: ...
 
-    async def get_aliyun_file_content(
+    async def get_aliyun_text_content(
         self,
         repo_name: str,
         file_path: str | list[str],
@@ -149,7 +138,7 @@ class RepoFileManager:
         ignore_error: bool = False,
     ) -> str | list[tuple[str, str]]:
         """
-        获取阿里云CodeUp仓库文件内容
+        获取阿里云CodeUp仓库文本文件内容
 
         参数:
             repo: 仓库名称
@@ -183,7 +172,7 @@ class RepoFileManager:
         return results[0][1] if is_str_input and results else results
 
     @overload
-    async def get_file_content(
+    async def get_text_content(
         self,
         repo_url: str,
         file_path: str,
@@ -193,7 +182,7 @@ class RepoFileManager:
     ) -> str: ...
 
     @overload
-    async def get_file_content(
+    async def get_text_content(
         self,
         repo_url: str,
         file_path: list[str],
@@ -202,7 +191,7 @@ class RepoFileManager:
         ignore_error: bool = False,
     ) -> list[tuple[str, str]]: ...
 
-    async def get_file_content(
+    async def get_text_content(
         self,
         repo_url: str,
         file_path: str | list[str],
@@ -211,7 +200,7 @@ class RepoFileManager:
         ignore_error: bool = False,
     ) -> str | list[tuple[str, str]]:
         """
-        获取仓库文件内容
+        获取仓库文本文件内容
 
         参数:
             repo_url: 仓库URL
@@ -229,22 +218,22 @@ class RepoFileManager:
         )
         if repo_type is None:
             try:
-                return await self.get_aliyun_file_content(
+                return await self.get_aliyun_text_content(
                     repo_name, file_path, branch, ignore_error
                 )
             except Exception:
-                return await self.get_github_file_content(
+                return await self.get_github_text_content(
                     repo_url, file_path, branch, ignore_error
                 )
 
         try:
             if repo_type == RepoType.GITHUB:
-                return await self.get_github_file_content(
+                return await self.get_github_text_content(
                     repo_url, file_path, branch, ignore_error
                 )
 
             elif repo_type == RepoType.ALIYUN:
-                return await self.get_aliyun_file_content(
+                return await self.get_aliyun_text_content(
                     repo_name, file_path, branch, ignore_error
                 )
 
@@ -262,24 +251,29 @@ class RepoFileManager:
         recursive: bool = True,
     ) -> list[RepoFileInfo]:
         """
-        获取仓库目录下的所有文件路径
+        获取仓库目录下的所有文件路径。
 
         参数:
-            repo_url: 仓库URL
+            repo_url: 仓库URL，可以包含 /tree/<branch>，会自动解析出分支和仓库地址。
             directory_path: 目录路径，默认为仓库根目录
-            branch: 分支名称
+            branch: 分支名称（若 repo_url 中包含 /tree/<branch>，则以 URL 中的为准）
             repo_type: 仓库类型，如果为None则自动判断
             recursive: 是否递归获取子目录文件
 
         返回:
             list[RepoFileInfo]: 文件信息列表
         """
-        repo_name = (
-            repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "").strip()
-        )
+        base_url = repo_url
+        if "/tree/" in repo_url:
+            base_url, tree_part = repo_url.split("/tree/", maxsplit=1)
+            if tree_branch := tree_part.split("/", maxsplit=1)[0].strip():
+                branch = tree_branch
+
+        repo_name = base_url.split("/")[-1].replace(".git", "").strip()
+
         try:
             if repo_type is None:
-                # 尝试GitHub，失败则尝试阿里云
+                # 尝试阿里云，失败则尝试 GitHub
                 try:
                     return await self._list_aliyun_directory_files(
                         repo_name, directory_path, branch, recursive
@@ -289,11 +283,11 @@ class RepoFileManager:
                         "获取阿里云目录文件失败，尝试GitHub", LOG_COMMAND, e=e
                     )
                     return await self._list_github_directory_files(
-                        repo_url, directory_path, branch, recursive
+                        base_url, directory_path, branch, recursive
                     )
             if repo_type == RepoType.GITHUB:
                 return await self._list_github_directory_files(
-                    repo_url, directory_path, branch, recursive
+                    base_url, directory_path, branch, recursive
                 )
             elif repo_type == RepoType.ALIYUN:
                 return await self._list_aliyun_directory_files(
@@ -303,7 +297,7 @@ class RepoFileManager:
             logger.error(f"获取目录文件列表失败: {directory_path}", LOG_COMMAND, e=e)
             if isinstance(e, FileNotFoundError | NetworkError | RepoManagerError):
                 raise
-            raise RepoManagerError(f"获取目录文件列表失败: {e}")
+            raise RepoManagerError(f"获取目录文件列表失败: {e}") from e
 
     async def _list_github_directory_files(
         self,
@@ -479,35 +473,6 @@ class RepoFileManager:
             if all(f.path != file.path for f in file_list if f != file)
         ]
 
-    def _clean_requirements_content(self, content: str) -> str:
-        """
-        清理 requirements.txt 内容，移除包含非ASCII字符的注释行
-
-        这是为了防止 Windows 上 pip 使用 GBK 编码读取 UTF-8 文件时出错
-
-        参数:
-            content: requirements.txt 文件内容
-
-        返回:
-            str: 清理后的内容
-        """
-        lines = content.splitlines()
-        cleaned_lines = []
-        for line in lines:
-            stripped = line.strip()
-            # 跳过空行
-            if not stripped:
-                continue
-            # 如果是注释行且包含非ASCII字符，跳过
-            if stripped.startswith("#"):
-                try:
-                    stripped.encode("ascii")
-                except UnicodeEncodeError:
-                    # 包含非ASCII字符的注释行，跳过
-                    continue
-            cleaned_lines.append(line)
-        return "\n".join(cleaned_lines) + "\n" if cleaned_lines else ""
-
     async def download_files(
         self,
         repo_url: str,
@@ -515,168 +480,108 @@ class RepoFileManager:
         branch: str = "main",
         repo_type: RepoType | None = None,
         ignore_error: bool = False,
-        sparse_path: str | None = None,
-        target_dir: Path | None = None,
     ) -> FileDownloadResult:
         """
-        下载多个文件
+        使用 Git 稀疏检出下载仓库中的文件或目录
 
         参数:
             repo_url: 仓库URL
-            file_path: 文件在仓库中的路径，本地存储路径
+            file_path: 仓库路径与本地目标路径的映射
             branch: 分支名称
-            repo_type: 仓库类型，如果为None则自动判断
-            ignore_error: 是否忽略错误
-            sparse_path: 稀疏检出路径
-            target_dir: 稀疏目标目录
+            repo_type: 仓库类型，阿里云类型会自动转换 CodeUp 地址
+            ignore_error: 是否忽略不存在的仓库路径
 
         返回:
             FileDownloadResult: 下载结果
         """
+        file_paths = [file_path] if isinstance(file_path, tuple) else file_path
+        if not file_paths:
+            raise RepoManagerError("参数错误: file_path 不能为空")
+        if any(not sparse_path.strip() for sparse_path, _ in file_paths):
+            raise RepoManagerError("参数错误: 仓库路径不能为空")
 
-        # 参数一致性校验：sparse_path 与 target_dir 必须同时有值或同时为 None
-        if (sparse_path is None) ^ (target_dir is None):
-            raise RepoManagerError(
-                "参数错误: sparse_path 与 target_dir 必须同时提供或同时为 None"
-            )
-
-        # 确定仓库类型和所有者
         repo_name = (
             repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "").strip()
         )
-
-        if isinstance(file_path, tuple):
-            file_path = [file_path]
-
-        file_path_mapping = {f[0]: f[1] for f in file_path}
-
-        # 创建结果对象
         result = FileDownloadResult(
             repo_type=repo_type,
             repo_name=repo_name,
-            file_path=file_path,
+            file_path=file_paths,
             version=branch,
         )
-        if (
-            any(is_binary_file(file_name) for file_name in file_path_mapping)
-            and repo_type != RepoType.GITHUB
-            and sparse_path
-            and target_dir
-        ):
-            return await self._handle_binary_with_sparse_checkout(
-                repo_url=repo_url,
-                branch=branch,
-                sparse_path=sparse_path,
-                target_dir=target_dir,
-                result=result,
-            )
-        else:
-            # 不包含二进制时
-            return await self._download_and_write_files(
-                repo_url=repo_url,
-                file_paths=[f[0] for f in file_path],
-                file_path_mapping=file_path_mapping,
-                branch=branch,
-                repo_type=repo_type,
-                ignore_error=ignore_error,
-                result=result,
-            )
+        return await self._handle_with_sparse_checkout(
+            repo_url=repo_url,
+            branch=branch,
+            file_paths=file_paths,
+            repo_type=repo_type,
+            ignore_error=ignore_error,
+            result=result,
+        )
 
-    async def _download_and_write_files(
+    async def _handle_with_sparse_checkout(
         self,
         repo_url: str,
-        file_paths: list[str],
-        file_path_mapping: dict[str, Path],
         branch: str,
+        file_paths: list[tuple[str, Path]],
         repo_type: RepoType | None,
         ignore_error: bool,
         result: FileDownloadResult,
     ) -> FileDownloadResult:
         try:
-            if len(file_paths) == 1:
-                file_contents_result = await self.get_file_content(
-                    repo_url, file_paths[0], branch, repo_type, ignore_error
+            clone_url = repo_url.split("/tree/", maxsplit=1)[0].rstrip("/")
+            if not clone_url.endswith(".git"):
+                clone_url += ".git"
+            if repo_type == RepoType.ALIYUN:
+                repo_name = clone_url.rsplit("/", maxsplit=1)[-1].removesuffix(".git")
+                group_name = await get_aliyun_group_for_repo(repo_name)
+                clone_url = prepare_aliyun_url(clone_url, group_name)
+
+            file_path_mapping = dict(file_paths)
+            with tempfile.TemporaryDirectory(
+                prefix="repo_sparse_", dir=self.config.cache_dir
+            ) as temp_dir:
+                staging_dir = Path(temp_dir)
+                downloaded_paths = await sparse_checkout_clone(
+                    repo_url=clone_url,
+                    branch=branch,
+                    sparse_path=list(file_path_mapping),
+                    target_dir=staging_dir,
                 )
-                if isinstance(file_contents_result, tuple):
-                    file_contents = [file_contents_result]
-                elif isinstance(file_contents_result, str):
-                    file_contents = [(file_paths[0], file_contents_result)]
-                else:
-                    file_contents = cast(list[tuple[str, str]], file_contents_result)
-            else:
-                file_contents = cast(
-                    list[tuple[str, str]],
-                    await self.get_file_content(
-                        repo_url, file_paths, branch, repo_type, ignore_error
-                    ),
-                )
+                missing_paths = set(file_path_mapping) - set(downloaded_paths)
+                if missing_paths and not ignore_error:
+                    missing = ", ".join(sorted(missing_paths))
+                    raise RuntimeError(f"稀疏检出路径不存在: {missing}")
 
-            for repo_file_path, content in file_contents:
-                local_path = file_path_mapping[repo_file_path]
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                if isinstance(content, str):
-                    # 对 requirements 文件特殊处理：移除包含非ASCII字符的注释行
-                    # 防止 Windows GBK 编码问题
-                    if repo_file_path.endswith(("requirements.txt", "requirement.txt")):
-                        content = self._clean_requirements_content(content)
-                    content_bytes = content.encode("utf-8")
-                else:
-                    content_bytes = content
-                logger.debug(f"写入文件: {local_path}")
-                async with aiofiles.open(local_path, "wb") as f:
-                    await f.write(content_bytes)
-            result.success = True
-            result.file_size = sum(
-                len(content.encode("utf-8") if isinstance(content, str) else content)
-                for _, content in file_contents
-            )
-            logger.info(f"下载文件成功: {[f[0] for f in file_contents]}")
-            return result
-        except Exception as e:
-            logger.error(f"下载文件失败: {e}")
-            result.success = False
-            result.error_message = str(e)
-            return result
+                for sparse_path in downloaded_paths:
+                    source_path = staging_dir / sparse_path
+                    target_path = file_path_mapping[sparse_path]
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    if target_path.exists():
+                        if target_path.is_dir():
+                            shutil.rmtree(target_path)
+                        else:
+                            target_path.unlink()
+                    shutil.move(str(source_path), str(target_path))
 
-    async def _handle_binary_with_sparse_checkout(
-        self,
-        repo_url: str,
-        branch: str,
-        sparse_path: str,
-        target_dir: Path,
-        result: FileDownloadResult,
-    ) -> FileDownloadResult:
-        try:
-            # 获取仓库所属的分组名（外部插件仓库可能在不同分组下）
-            repo_name = (
-                repo_url.split("/tree/")[0].split("/")[-1].replace(".git", "").strip()
-            )
-            group_name = await get_aliyun_group_for_repo(repo_name)
-
-            aliyun_repo_url = prepare_aliyun_url(repo_url, group_name)
-
-            await sparse_checkout_clone(
-                repo_url=aliyun_repo_url,
-                branch=branch,
-                sparse_path=sparse_path,
-                target_dir=target_dir,
-            )
             total_size = 0
-            if target_dir.exists():
-                for f in target_dir.rglob("*"):
-                    if f.is_file():
-                        with contextlib.suppress(Exception):
-                            total_size += f.stat().st_size
+            for sparse_path in downloaded_paths:
+                downloaded_path = file_path_mapping[sparse_path]
+                if downloaded_path.is_file():
+                    total_size += downloaded_path.stat().st_size
+                elif downloaded_path.is_dir():
+                    for file in downloaded_path.rglob("*"):
+                        if file.is_file():
+                            with contextlib.suppress(Exception):
+                                total_size += file.stat().st_size
             result.success = True
             result.file_size = total_size
-            logger.info(f"sparse-checkout 克隆成功: {target_dir}:{aliyun_repo_url}")
+            logger.info(f"sparse-checkout 下载成功: {downloaded_paths}")
             return result
         except GitUnavailableError as e:
             logger.error(f"Git不可用: {e}")
             result.success = False
             result.error_message = (
-                "当前插件包含二进制文件，因ali限制需要使用git，"
-                "当前Git不可用，请尝试添加参数 -s git 或 安装 git"
+                "下载仓库文件需要使用 Git，当前 Git 不可用，请安装 Git 后重试"
             )
             return result
         except Exception as e:

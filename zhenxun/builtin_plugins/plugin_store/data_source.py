@@ -76,10 +76,10 @@ class StoreManager:
         if cached_data := await _PLUGIN_STORE_DATA_CACHE.get(cache_key):
             return cached_data
 
-        plugins = await RepoFileManager.get_file_content(
+        plugins = await RepoFileManager.get_text_content(
             DEFAULT_GITHUB_URL, "plugins.json"
         )
-        extra_plugins = await RepoFileManager.get_file_content(
+        extra_plugins = await RepoFileManager.get_text_content(
             EXTRA_GITHUB_URL, "plugins.json", "index"
         )
         result = (
@@ -337,9 +337,9 @@ class StoreManager:
             source: 源
         """
         repo_type = RepoType.GITHUB if is_external else None
-        if (
-            source != "ali" and source != "git" and plugin_info.ali_url
-        ) or source == "ali":
+        if not is_external:
+            repo_type = RepoType.ALIYUN
+        elif (source is None and plugin_info.ali_url) or source == "ali":
             repo_type = RepoType.ALIYUN
         elif source == "git":
             repo_type = RepoType.GITHUB
@@ -370,11 +370,17 @@ class StoreManager:
                 dst_path = target_dir / f"{plugin_module}.py"
 
             download_files.append((src_path, dst_path))
+        rand = random.randint(1, 10000)
+        requirement_path_ = TEMP_PATH / f"plugin_store_{rand}_req.txt"
+        requirements_path_ = TEMP_PATH / f"plugin_store_{rand}_reqs.txt"
+        download_files.append(("requirement.txt", requirement_path_))
+        download_files.append(("requirements.txt", requirements_path_))
         result = await RepoFileManager.download_files(
             github_url,
             download_files,
             branch,
             repo_type=repo_type,
+            ignore_error=True,
         )
         if not result.success:
             raise PluginStoreException(result.error_message)
@@ -396,32 +402,18 @@ class StoreManager:
                 await VirtualEnvPackageManager.install_requirement(requirement_file)
 
         if not is_install_req:
-            # 从仓库根目录查找文件
-            rand = random.randint(1, 10000)
-            requirement_path = TEMP_PATH / f"plugin_store_{rand}_req.txt"
-            requirements_path = TEMP_PATH / f"plugin_store_{rand}_reqs.txt"
-            await RepoFileManager.download_files(
-                github_url,
-                [
-                    ("requirement.txt", requirement_path),
-                    ("requirements.txt", requirements_path),
-                ],
-                branch,
-                repo_type=repo_type,
-                ignore_error=True,
-            )
-            if requirement_path.exists():
+            if requirement_path_.exists():
                 logger.info(
-                    f"开始安装插件 {module_path} 依赖文件: {requirement_path}",
+                    f"开始安装插件 {module_path} 依赖文件: {requirement_path_}",
                     LOG_COMMAND,
                 )
-                await VirtualEnvPackageManager.install_requirement(requirement_path)
-            if requirements_path.exists():
+                await VirtualEnvPackageManager.install_requirement(requirement_path_)
+            if requirements_path_.exists():
                 logger.info(
-                    f"开始安装插件 {module_path} 依赖文件: {requirements_path}",
+                    f"开始安装插件 {module_path} 依赖文件: {requirements_path_}",
                     LOG_COMMAND,
                 )
-                await VirtualEnvPackageManager.install_requirement(requirements_path)
+                await VirtualEnvPackageManager.install_requirement(requirements_path_)
 
     @classmethod
     async def remove_plugin(cls, index_or_module: str) -> str:
