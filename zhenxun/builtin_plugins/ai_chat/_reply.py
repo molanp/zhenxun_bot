@@ -712,6 +712,7 @@ def clean_output(text: str) -> str:
             output.append(block)
             continue
         parts = _INLINE_CODE.split(block)
+        cleaned = []
         for index, part in enumerate(parts):
             if hidden:
                 close = _CLOSE_THINK.search(part) if not index % 2 else None
@@ -719,7 +720,7 @@ def clean_output(text: str) -> str:
                     continue
                 part, hidden = part[close.end() :], False
             if index % 2:
-                output.append(part)
+                cleaned.append(part)
                 continue
             part = _THINK.sub("", part)
             if match := _OPEN_THINK.search(part):
@@ -727,8 +728,10 @@ def clean_output(text: str) -> str:
             if close := _CLOSE_THINK.search(part):
                 part = part[close.end() :]
             label = _echo_label(BotConfig.self_nickname or "真寻")
-            output.append(label.sub("", _TOOL_MARKUP.sub("", part)))
-    return "".join(output).strip()
+            cleaned.append(label.sub("", _TOOL_MARKUP.sub("", part)))
+        if content := "".join(cleaned):
+            output.append(content)
+    return "\n".join(output).strip()
 
 
 def parse_silent(text: str) -> str | None:

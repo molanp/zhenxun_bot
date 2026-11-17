@@ -183,6 +183,22 @@ class PlatformUtils:
         return level >= _ADMIN_ROLE_LEVEL
 
     @classmethod
+    def qq_client_bots(cls) -> list[Bot]:
+        """在线的 OneBot 协议端 Bot，按账号排序
+
+        返回:
+            list[Bot]: Bot 列表
+        """
+        return sorted(
+            (
+                bot
+                for bot in nonebot.get_bots().values()
+                if cls.get_platform_scope(bot) == "qq_client"
+            ),
+            key=lambda bot: str(bot.self_id),
+        )
+
+    @classmethod
     def _resolve_unique_qq_client_bot(cls, log_cmd: str | None = None) -> Bot | None:
         bots = list(nonebot.get_bots().values())
         if not bots:
@@ -953,9 +969,10 @@ class BroadcastEngine:
                 except KeyError:
                     logger.warning(f"Bot:{i} 对象未连接或不存在", log_cmd)
         if not self.bot_list:
-            bot = PlatformUtils._resolve_unique_qq_client_bot(log_cmd)
-            if bot is not None:
-                self.bot_list.append(bot)
+            # 未指定时由全部 OneBot 协议端发送，同一群只发送一次
+            self.bot_list = PlatformUtils.qq_client_bots()
+            if not self.bot_list:
+                logger.warning("未找到 OneBot 协议端 Bot，已跳过。", log_cmd)
 
     async def call_check(self, bot: Bot, group_id: str) -> bool:
         """运行发送检测函数

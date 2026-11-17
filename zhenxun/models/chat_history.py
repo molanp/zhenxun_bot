@@ -13,6 +13,7 @@ from zhenxun.services.db_context import Model
 from zhenxun.services.db_context.schema_ops import (
     AlterColumnType,
     RenameColumn,
+    SchemaOpRisk,
     SetColumnNullable,
 )
 
@@ -141,7 +142,7 @@ class ChatHistory(Model):
     """bot记录id"""
     platform = fields.CharField(255, null=True)
     """平台"""
-    message_id = fields.CharField(64, null=True)
+    message_id = fields.CharField(255, null=True)
     """消息id"""
     segments = fields.JSONField(null=True)
     """结构化消息段，媒体只存地址"""
@@ -386,6 +387,13 @@ class ChatHistory(Model):
     @classmethod
     async def _run_script(cls):
         return [
+            AlterColumnType(
+                "chat_history",
+                "message_id",
+                {"postgres": "character varying(255)", "mysql": "VARCHAR(255)"},
+                nullable=True,
+                risk=SchemaOpRisk.SAFE,
+            ),
             # 允许 group_id 为空
             SetColumnNullable("chat_history", "group_id", {"mysql": "VARCHAR(255)"}),
             # 允许 text 为空

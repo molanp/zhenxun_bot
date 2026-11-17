@@ -610,10 +610,10 @@ CONFIGS = [
         "local",
         str,
         "回复执行器",
-        "DeepSeek Harness 使用已登录的桌面版；普通聊天无宿主工具，"
+        "DeepSeek Harness 可选择已登录的桌面版或独立 SDK；普通聊天无宿主工具，"
         "不桥接长期记忆、知识库及本地 Agent 工具；"
-        "主动插话仍在本地执行；"
-        "可按群设置",
+        "账号场景设置优先于按群和全局设置；"
+        "可用 /ai runner dsh 切换当前场景，/ai status 查看实际执行器",
         options=_options(local="本地 Agent", dsh="DeepSeek Harness"),
     ),
     _config(

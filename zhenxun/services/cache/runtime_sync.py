@@ -545,20 +545,20 @@ class RuntimeCacheMutation:
     @classmethod
     async def ensure_loaded(cls, cache_cls: type[RuntimeMemoryCache]) -> None:
         label = cache_cls.label
+        if getattr(cache_cls, "_loaded", False):
+            return
         if is_db_unhealthy():
             cls.mark_error(cache_cls, RuntimeError("database unhealthy"))
-            return
-        if getattr(cache_cls, "_loaded", False):
             return
         now = time.monotonic()
         if cls._retry_after.get(label, 0.0) > now:
             return
         lock = cls._load_locks.setdefault(label, asyncio.Lock())
         async with lock:
+            if getattr(cache_cls, "_loaded", False):
+                return
             if is_db_unhealthy():
                 cls.mark_error(cache_cls, RuntimeError("database unhealthy"))
-                return
-            if getattr(cache_cls, "_loaded", False):
                 return
             now = time.monotonic()
             if cls._retry_after.get(label, 0.0) > now:
@@ -581,9 +581,13 @@ class RuntimeCacheMutation:
     @staticmethod
     async def read_db(cache_cls: type, coro, *, operation: str):
         if is_db_unhealthy():
-            RuntimeCacheMutation.mark_error(
-                cache_cls, RuntimeError("database unhealthy")
-            )
+            # 数据库降级时跳过本次刷新，已加载的数据没有过期证据，继续使用
+            if getattr(cache_cls, "_loaded", False):
+                setattr(cache_cls, "_last_error", "RuntimeError: database unhealthy")
+            else:
+                RuntimeCacheMutation.mark_error(
+                    cache_cls, RuntimeError("database unhealthy")
+                )
             if inspect.iscoroutine(coro):
                 coro.close()
             return None

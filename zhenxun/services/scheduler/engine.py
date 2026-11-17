@@ -640,6 +640,48 @@ async def _catch_up_when_ready(
     await _execute_persistent_job(schedule_id)
 
 
+async def _plan_bots(
+    schedule: ScheduledJob, resolver: Callable
+) -> list[tuple[Bot, list[str | None]]]:
+    """为任务分配执行的 Bot：未指定 Bot 且有多个 OneBot 协议端在线时，群组目标
+    交给所在的 Bot 执行且每个群只执行一次，全局与用户目标由账号最小的 Bot 执行
+
+    参数:
+        schedule: 定时任务
+        resolver: 目标解析器
+
+    返回:
+        list[tuple[Bot, list[str | None]]]: Bot 与其执行目标，没有可用 Bot 时为空
+    """
+    log_cmd = f"任务 {schedule.id}"
+    clients = PlatformUtils.qq_client_bots()
+    if schedule.bot_id or len(clients) < 2:
+        bot = PlatformUtils.resolve_bot(bot_id=schedule.bot_id, log_cmd=log_cmd)
+        if bot is None:
+            return []
+        return [(bot, await resolver(schedule.target_identifier, bot))]
+    if schedule.target_type in {TargetType.GLOBAL.value, TargetType.USER.value}:
+        return [(clients[0], await resolver(schedule.target_identifier, clients[0]))]
+    plan: list[tuple[Bot, list[str | None]]] = []
+    seen: set[str | None] = set()
+    for bot in clients:
+        try:
+            groups, _ = await PlatformUtils.get_group_list(bot, only_group=True)
+        except Exception as e:
+            logger.warning(f"Bot {bot.self_id} 群列表获取失败，已跳过", log_cmd, e=e)
+            continue
+        joined = {group.group_id for group in groups}
+        targets = [
+            target
+            for target in await resolver(schedule.target_identifier, bot)
+            if target in joined and target not in seen
+        ]
+        seen.update(targets)
+        if targets:
+            plan.append((bot, targets))
+    return plan or [(clients[0], [])]
+
+
 async def _execute_persistent_job(schedule_id: int, force: bool = False):
     """
     执行数据库中持久化的定时任务 (Persistent Job)
@@ -672,16 +714,6 @@ async def _execute_persistent_job(schedule_id: int, force: bool = False):
                 return
             await ScheduleRepository.update_run_status(schedule, status="RUNNING")
 
-        bot = PlatformUtils.resolve_bot(
-            bot_id=schedule.bot_id, log_cmd=f"任务 {schedule_id}"
-        )
-        if bot is None:
-            if policy.get("retain_finished"):
-                await ScheduleRepository.update_run_status(
-                    schedule, status="SKIPPED", disable=schedule.is_one_off
-                )
-            return
-
         resolver = scheduler_registry.target_resolvers.get(schedule.target_type)
         if not resolver:
             logger.error(
@@ -691,15 +723,23 @@ async def _execute_persistent_job(schedule_id: int, force: bool = False):
             raise ValueError(f"未知的目标类型: {schedule.target_type}")
 
         try:
-            resolved_targets = await resolver(schedule.target_identifier, bot)
+            plan = await _plan_bots(schedule, resolver)
         except Exception as e:
             logger.error(f"为任务 {schedule.id} 解析目标失败", e=e)
             raise
+        if not plan:
+            if policy.get("retain_finished"):
+                await ScheduleRepository.update_run_status(
+                    schedule, status="SKIPPED", disable=schedule.is_one_off
+                )
+            return
+        resolved_targets = [target for _, targets in plan for target in targets]
 
         logger.info(
             f"任务 {schedule.id} ({schedule.name or schedule.plugin_name}) 开始执行, "
             f"目标类型: {schedule.target_type}, "
             f"解析出 {len(resolved_targets)} 个目标"
+            + (f"，分配给 {len(plan)} 个 Bot" if len(plan) > 1 else "")
         )
 
         retain = bool(
@@ -707,8 +747,14 @@ async def _execute_persistent_job(schedule_id: int, force: bool = False):
                 "retain_finished"
             )
         )
-        outcome = await ExecutionDispatcher.dispatch(schedule, bot, resolved_targets)
-        outcome = outcome if isinstance(outcome, TaskOutcome) else TaskOutcome()
+        outcomes = [
+            await ExecutionDispatcher.dispatch(schedule, bot, targets)
+            for bot, targets in plan
+        ]
+        outcomes = [
+            o if isinstance(o, TaskOutcome) else TaskOutcome() for o in outcomes
+        ]
+        outcome = outcomes[0] if len(outcomes) == 1 else TaskOutcome.collect(outcomes)
         await ScheduleRepository.update_run_status(
             schedule,
             status=outcome.status,

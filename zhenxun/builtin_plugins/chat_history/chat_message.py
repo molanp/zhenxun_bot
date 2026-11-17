@@ -7,6 +7,7 @@ from nonebot.typing import T_State
 from nonebot_plugin_alconna import UniMsg, get_message_id
 from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_uninfo import Uninfo
+from tortoise.transactions import in_transaction
 
 from zhenxun.configs.config import Config
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
@@ -98,14 +99,20 @@ def _sanitize_chat_history(record: ChatHistory) -> int:
 
 
 async def _write_chat_history_batch(batch: list[ChatHistory], reason: str) -> None:
+    """在同一超时范围内写入并结算聊天记录批次事务。"""
     sanitized = sum(_sanitize_chat_history(record) for record in batch)
     if sanitized:
         logger.warning(
             f"聊天历史写库前清理了 {sanitized} 个含 NUL 的字符串字段",
             "chat_history",
         )
+
+    async def write():
+        async with in_transaction() as connection:
+            await ChatHistory.bulk_create(batch, _FLUSH_BATCH_SIZE, using_db=connection)
+
     await with_db_timeout(
-        ChatHistory.bulk_create(batch, _FLUSH_BATCH_SIZE),
+        write(),
         timeout=_FLUSH_DB_TIMEOUT,
         operation=f"ChatHistory.bulk_create[{len(batch)}]",
         source=f"chat_history:{reason}",

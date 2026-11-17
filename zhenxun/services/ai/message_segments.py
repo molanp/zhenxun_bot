@@ -63,14 +63,14 @@ _OTHER_NAMES = {
 }
 
 
-def _forward_nodes(data: Any) -> list[dict]:
+def _forward_nodes(data: Any) -> list[Any]:
     """从 get_forward_msg 的返回值中取出消息节点
 
     参数:
         data: 协议端返回值
 
     返回:
-        list[dict]: 消息节点列表
+        list[Any]: 待校验的消息节点列表
     """
     if isinstance(data, dict):
         if isinstance(data.get("messages"), list):
@@ -109,6 +109,7 @@ async def expand_forward(forward_id: str) -> list[LLMContentPart]:
     """通过协议端展开合并转发，转为“发送者: 内容”的逐条记录
 
     超过嵌套层数、调用次数上限或协议端不支持时只返回占位文字。
+    格式异常的节点保留占位文字，不影响其他节点的解析。
 
     参数:
         forward_id: 合并转发 ID
@@ -143,20 +144,36 @@ async def expand_forward(forward_id: str) -> list[LLMContentPart]:
 
         parts: list[LLMContentPart] = [TextPart(text="[合并转发]\n")]
         for node in nodes[:FORWARD_MAX_NODES]:
-            sender = node.get("sender") or {}
+            if not isinstance(node, dict):
+                parts.append(TextPart(text="[无法解析的消息]\n"))
+                continue
+            sender = node.get("sender")
+            if not isinstance(sender, dict):
+                sender = {}
             name = (
                 sender.get("card")
                 or sender.get("nickname")
                 or str(sender.get("user_id") or "未知")
             )
             raw = node.get("message") or node.get("content") or ""
-            if isinstance(raw, list):
-                raw = [
-                    MessageSegment(str(s.get("type")), s.get("data") or {})
-                    for s in raw
-                    if isinstance(s, dict)
-                ]
-            uni_msg = UniMessage.of(Message(raw)).exclude(Reply)
+            try:
+                if isinstance(raw, list):
+                    raw = [
+                        MessageSegment(s["type"], s["data"])
+                        if (
+                            isinstance(s, dict)
+                            and isinstance(s.get("type"), str)
+                            and isinstance(s.get("data"), dict)
+                        )
+                        else MessageSegment.text("[无法解析的消息片段]")
+                        for s in raw
+                    ]
+                elif not isinstance(raw, str):
+                    raw = "[无法解析的消息]"
+                uni_msg = UniMessage.of(Message(raw)).exclude(Reply)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                parts.append(TextPart(text=f"{name}: [无法解析的消息]\n"))
+                continue
             node_parts = await MessageBuilder.unimsg_to_llm_parts(uni_msg)
             parts.append(TextPart(text=f"{name}: "))
             parts.extend(node_parts or [TextPart(text="[空消息]")])

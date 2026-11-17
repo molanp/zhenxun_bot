@@ -255,7 +255,10 @@ def validate_cards(cards: dict) -> dict:
             raise ValueError("启用状态必须是布尔值。")
         for field, limit in (("title", 200), ("body", 8000), ("quote", 2000)):
             text_value(card.get(field, ""), field, limit, required=False)
-        https_url(card.get("image_url", ""), optional=True)
+        image_url = card.get("image_url", "")
+        if isinstance(image_url, str):
+            image_url = image_url.strip()
+        card["image_url"] = https_url(image_url, optional=True)
         if card["enabled"] and not (card.get("title") or card.get("body")):
             raise ValueError("启用的卡片至少需要标题或正文。")
         ids = set()
@@ -293,8 +296,8 @@ def read_cards(app_id: str) -> dict:
     if not isinstance(record, dict):
         raise ValueError("图文配置记录结构不可确认。")
     cards = record.get(app_id, {kind: empty_card() for kind in CARD_KINDS})
-    validate_cards(cards)
-    return {"revision": digest(cards), "cards": deepcopy(cards)}
+    validated = validate_cards(cards)
+    return {"revision": digest(cards), "cards": validated}
 
 
 def save_cards(app_id: str, revision: str, cards: dict) -> dict:

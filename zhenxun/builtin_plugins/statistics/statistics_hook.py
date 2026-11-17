@@ -8,6 +8,7 @@ from nonebot.matcher import Matcher
 from nonebot.message import run_postprocessor
 from nonebot.plugin import PluginMetadata
 from nonebot_plugin_uninfo import Uninfo
+from tortoise.transactions import in_transaction
 
 from zhenxun.configs.utils import PluginExtraData
 from zhenxun.models.statistics import Statistics
@@ -41,8 +42,14 @@ driver = get_driver()
 
 
 async def _write_statistics_batch(batch: list[Statistics], reason: str) -> None:
+    """在同一超时范围内写入并结算调用统计批次事务。"""
+
+    async def write():
+        async with in_transaction() as connection:
+            await Statistics.bulk_create(batch, using_db=connection)
+
     await with_db_timeout(
-        Statistics.bulk_create(batch),
+        write(),
         timeout=5.0,
         operation=f"Statistics.bulk_create[{len(batch)}]",
         source=f"statistics:{reason}",

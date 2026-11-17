@@ -1,6 +1,7 @@
 from nonebot import on_notice
 from nonebot.adapters import Bot, Event
 from nonebot.adapters.qq.event import FriendAddEvent, GroupAddRobotEvent
+from nonebot.matcher import Matcher
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import to_me
 from nonebot_plugin_alconna import (
@@ -81,7 +82,18 @@ _matcher = on_alconna(
         Args["name?", str],
         Option("-d|--detail", action=store_true, help_text="详细帮助"),
     ),
-    aliases={"help", "帮助", "菜单"},
+    aliases={"help", "帮助"},
+    rule=to_me(),
+    priority=1,
+    block=True,
+)
+
+_menu_matcher = on_alconna(
+    Alconna(
+        "菜单",
+        Args["name?", str],
+        Option("-d|--detail", action=store_true, help_text="详细帮助"),
+    ),
     rule=to_me(),
     priority=1,
     block=True,
@@ -97,14 +109,20 @@ _matcher.shortcut(
 
 
 @_matcher.handle()
+@_menu_matcher.handle()
 async def _(
     bot: Bot,
     event: Event,
     name: Match[str],
     session: Uninfo,
+    matcher: Matcher,
     is_detail: Query[bool] = AlconnaQuery("detail.value", False),
 ):
-    if not name.available and not is_detail.result:
+    if (
+        isinstance(matcher, _menu_matcher)
+        and not name.available
+        and not is_detail.result
+    ):
         if await send_configured_card(bot, event, "help"):
             return
     _is_superuser = PlatformUtils.is_superuser(bot, session.user.id)
