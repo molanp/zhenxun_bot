@@ -592,8 +592,8 @@ class Memory:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     @classmethod
-    async def reset(cls, session_id: str) -> None:
-        """取消整理并使持久化游标修订失效，保留已有长期记忆。"""
+    async def cancel_session(cls, session_id: str) -> None:
+        """等待指定对话的整理退出，保留已提交的游标和长期记忆。"""
         current = asyncio.current_task()
         tasks = {
             t
@@ -607,6 +607,11 @@ class Memory:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    @classmethod
+    async def reset(cls, session_id: str) -> None:
+        """取消整理并使持久化游标修订失效，保留已有长期记忆。"""
+        await cls.cancel_session(session_id)
         async with cls._locks.setdefault(session_id, asyncio.Lock()):
             cursor, _ = await AIMemoryCursor.get_or_create(session_id=session_id)
             await AIMemoryCursor.filter(id=cursor.id).update(

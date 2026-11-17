@@ -583,7 +583,9 @@ async def _deliver_unlocked(
         voice = (
             None
             if chunks is not None
-            else await voice_segment(clean_markdown(text), voice_input, voice_mode, bot)
+            else await voice_segment(
+                clean_markdown(text), voice_input, voice_mode, bot, context=context
+            )
         )
         long = None if voice or chunks is not None else await long_message(bot, text)
         chunks = (
@@ -751,8 +753,10 @@ async def voice_segment(
     voice_input: bool,
     mode: str | None = None,
     bot: Bot | None = None,
+    *,
+    context=None,
 ) -> Voice | None:
-    """按语音回复配置用 tts 默认模型把回复合成为语音，QQ 官方编码为 silk
+    """按语音回复方式和场景 TTS 选择合成回复，QQ 官方编码为 silk
 
     参数:
         text: 回复文本
@@ -769,20 +773,20 @@ async def voice_segment(
     text = text.strip()
     from zhenxun.services.ai.config import get_llm_config
 
-    deepseek_tts = (
-        not get_default_model("tts") and get_llm_config().deepseek_tools.tts_enabled
-    )
-    if (
-        len(text) > VOICE_MAX_CHARS
-        or "```" in text
-        or not (get_default_model("tts") or deepseek_tts)
-    ):
+    model = (
+        context.state.get("_scene_configuration", {}).get("effective", {}).get("tts")
+        if context
+        else None
+    ) or get_default_model("tts")
+    deepseek_tts = not model and get_llm_config().deepseek_tools.tts_enabled
+    if len(text) > VOICE_MAX_CHARS or "```" in text or not (model or deepseek_tts):
         return None
     bot = bot or current_bot.get()
     qq_api = PlatformUtils.get_platform_scope(bot) == "qq_api"
     try:
         speech = await create_speech(
             text,
+            model=model,
             config=TTSConfig(
                 response_format="wav" if qq_api or deepseek_tts else "mp3"
             ),

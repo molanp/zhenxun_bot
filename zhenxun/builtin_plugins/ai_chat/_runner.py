@@ -68,7 +68,7 @@ async def select_dsh_session(context: RunContext, persona: AIPersona | None) -> 
     """在排队前绑定所有者与模式，回复位置仍由本轮上下文持有。"""
     mode = await dsh_mode(context, persona)
     key = f"{persona.id}:{persona.updated_at.isoformat()}" if persona else ""
-    return DshSessions.route(context, mode, key)
+    return DshSessions.for_settings(dsh_settings()).route(context, mode, key)
 
 
 async def scene_session(bot, event) -> str:
@@ -76,18 +76,26 @@ async def scene_session(bot, event) -> str:
     from zhenxun.services.ai.run.context import NoneBotDeps
 
     from ._agent import bind_source
+    from ._sessions import Conversations
 
     context = RunContext(deps=NoneBotDeps(bot=bot, event=event))
+    scene = AIChatManager.session_id(bot, event)
+    snapshot = await Conversations.snapshot(scene, create=False)
+    preferences = snapshot["settings"]
+    context.state["_conversation"] = snapshot
     group = context.get_group_id()
     setting = await AIChatGroup.get_setting(group) if group else None
-    if agent_runner(setting) == "dsh":
+    if (preferences.get("runner") or agent_runner(setting)) == "dsh":
         bind_source(context, "qq")
-        persona = await AIPersona.get_for_scene(group, context.get_user_id())
-        owner = DshSessions.owner(context, await dsh_mode(context, persona))
-        item = DshSessions._read()["owners"].get(owner)
+        persona = await Conversations.persona(
+            context.state["_conversation"], group, context.get_user_id()
+        )
+        records = DshSessions.for_settings(dsh_settings())
+        owner = records.owner(context, await dsh_mode(context, persona))
+        item = records._read()["owners"].get(owner)
         if item:
             return item["local_id"]
-    return AIChatManager.session_id(bot, event)
+    return snapshot["session_id"] or scene
 
 
 async def stop_dsh_runs(context: RunContext, manage: bool) -> tuple[int, int]:
@@ -197,7 +205,7 @@ async def _run_dsh(
             if binding is None:
                 raise LLMException("DSH 会话没有在准入时绑定。")
             try:
-                DshSessions.refresh(binding)
+                DshSessions.for_binding(binding).refresh(binding)
                 prepared, selected = parts, persona
                 if prepare_run:
                     prepared, selected = await prepare_run()
@@ -232,12 +240,20 @@ async def _run_dsh(
                     current_setting = (
                         await AIChatGroup.get_setting(group) if group else None
                     )
-                    if agent_runner(current_setting) != "dsh":
+                    snapshot = context.state.get("_conversation")
+                    if snapshot:
+                        from ._sessions import Conversations
+
+                        await Conversations.check(snapshot)
+                    if (
+                        (snapshot or {}).get("settings", {}).get("runner")
+                        or agent_runner(current_setting)
+                    ) != "dsh":
                         return "denied"
                     return await dsh_mode(context, current)
 
                 context.state["_dsh_authorization_check"] = authorization_check
-                DshSessions.update(binding, persona=persona_key)
+                DshSessions.for_binding(binding).update(binding, persona=persona_key)
                 context.run.budget["deadline"] = deadline
                 backend = chat_backend(AIChatManager.get_agent(selected).memory_config)
                 history = await backend.get_messages(session_id) if backend else []
@@ -350,7 +366,7 @@ async def _run_dsh(
                     and not delivery.get("uncertain")
                     and text == raw
                 )
-                DshSessions.update(
+                DshSessions.for_binding(binding).update(
                     binding,
                     inflight=None,
                     quarantined=None
@@ -360,7 +376,7 @@ async def _run_dsh(
                 )
                 return result
             except BaseException:
-                DshSessions.update(
+                DshSessions.for_binding(binding).update(
                     binding, inflight=None, quarantined="settlement_unconfirmed"
                 )
                 raise

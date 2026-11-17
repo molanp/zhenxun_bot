@@ -126,7 +126,9 @@ class ChatTurn:
             [entry["text"] for entry in entries] if entries else self.delivery.parts
         )
         report["uncertain"] |= any(record["uncertain"] for record in records)
-        final_sent = self.delivery.status == "sent" and bool(self.delivery.parts)
+        final_sent = (
+            not entries and self.delivery.status == "sent" and bool(self.delivery.parts)
+        )
         failed = (
             (bool(error) and not final_sent)
             or any(record["failed"] for record in records)

@@ -154,7 +154,7 @@ class Proactive:
         logger.info("主动插话开关已改为插话模式", MODULE)
 
     @classmethod
-    async def settings(cls, group_id: str) -> Settings | None:
+    async def settings(cls, group_id: str, bot: Bot | None = None) -> Settings | None:
         """合并群设置与全局配置，主动插话关闭或群停用 AI 聊天时为空
 
         参数:
@@ -164,7 +164,23 @@ class Proactive:
             Settings | None: 生效的设置
         """
         setting, group = await group_config(group_id)
-        if setting and setting.disabled:
+        from zhenxun.services.platform_identity import scoped_group_id
+        from zhenxun.utils.platform import PlatformUtils
+
+        from ._sessions import Conversations
+
+        scene = (
+            f"{MODULE}:{bot.self_id}:"
+            f"{scoped_group_id(group_id, PlatformUtils.get_platform_scope(bot))}"
+            if bot
+            else None
+        )
+        disabled = (
+            (await Conversations.preferences(scene)).get("disabled")
+            if scene
+            else bool(setting and setting.disabled)
+        )
+        if disabled:
             return None
         mode = group.mode or _cfg("PROACTIVE_MODE", "probability")
         if mode not in ("probability", "listen"):
@@ -349,7 +365,7 @@ class Proactive:
         返回:
             str | None: 插话时给 AI 的提示（概率触发时为空字符串），不插话时为空
         """
-        cfg = await cls.settings(group_id)
+        cfg = await cls.settings(group_id, bot)
         if cfg is None:
             return None
         st = cls.state(bot.self_id, group_id)

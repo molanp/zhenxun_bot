@@ -13,12 +13,9 @@ from pydantic import BaseModel
 
 from zhenxun.configs.config import Config
 from zhenxun.models.ai_chat_group import AIChatGroup
-from zhenxun.models.ai_persona import AIPersona
 from zhenxun.models.scheduled_job import ScheduledJob
-from zhenxun.services.ai.context.memory.engine import chat_backend
 from zhenxun.services.ai.core.exceptions import LLMException
-from zhenxun.services.ai.core.messages import LLMMessage
-from zhenxun.services.ai.run.context import RunContext, ScheduledDeps
+from zhenxun.services.ai.run.context import CallerIdentity, RunContext, ScheduledDeps
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
 from zhenxun.services.ai.tools.models import ToolOptions, ToolResult
@@ -36,7 +33,6 @@ from zhenxun.utils.time_utils import TimeUtils
 
 from ._buffer import ChatBuffer
 from ._data_source import (
-    BACKGROUND_KEY,
     MODULE,
     PLUGIN_MODULE,
     SILENT,
@@ -436,10 +432,13 @@ class AITasks:
             name: 任务名称
             params: 任务参数
         """
-        from zhenxun.services.platform_identity import scoped_user_id
+        from zhenxun.services.ai.core.messages import LLMMessage, TextPart
+        from zhenxun.services.platform_identity import scoped_group_id, scoped_user_id
         from zhenxun.services.scheduler.engine import _plugin_blocked
 
         from ._agent import USER_KEY, bind_source
+        from ._runner import run_dsh, select_dsh_session
+        from ._sessions import Conversations
         from ._stickers import send_marked, split_sticker
         from ._turn import ChatTurn
 
@@ -461,11 +460,20 @@ class AITasks:
                 )
         quota_scope = "webui" if management_check else platform
         quota_id = scoped_user_id(params.creator, quota_scope)
-        if (setting and setting.disabled) or await _plugin_blocked(
+        scene = (
+            f"{MODULE}:{bot.self_id}:{scoped_group_id(group_id, platform)}"
+            if group_id
+            else f"{MODULE}:{bot.self_id}:private:{scoped_user_id(user_id, platform)}"
+        )
+        snapshot = await Conversations.snapshot(scene, create=False)
+        resolved = await Conversations.resolve(scene, snapshot)
+        if resolved["effective"]["disabled"] or await _plugin_blocked(
             PLUGIN_MODULE, bot, target
         ):
             return TaskOutcome(status="SKIPPED")
-        persona = await AIPersona.get_for_scene(group_id, user_id)
+        snapshot = await Conversations.snapshot(scene)
+        resolved = await Conversations.resolve(scene, snapshot)
+        persona = await Conversations.persona(snapshot, group_id, user_id)
         agent = AIChatManager.get_agent(persona)
         prompt = (
             f"任务 #{task_id}「{name}」：{params.prompt}。"
@@ -479,9 +487,17 @@ class AITasks:
                 schedule_id=task_id,
                 platform=platform,
             ),
-            session_id=f"{MODULE}:{bot.self_id}:task:{task_id}",
+            session_id=snapshot["session_id"],
         )
         bind_source(context, "task", management_check=management_check)
+        context.state["_conversation"] = snapshot
+        context.state["_scene_configuration"] = resolved
+        context.state["_dsh_chat_target"] = CallerIdentity(
+            "task", platform, str(bot.self_id), user_id or params.creator, group_id
+        )
+        accepted_runner = resolved["effective"]["runner"]
+        if accepted_runner == "dsh":
+            await select_dsh_session(context, persona)
         context.state[USER_KEY] = params.creator
         AIChatManager.prepare_input(context, params.prompt)
         turn = ChatTurn(
@@ -493,25 +509,35 @@ class AITasks:
             quota_id,
             usage_id=quota_id,
         )
+        context.run.history_metadata.update(schedule_id=task_id, creator=quota_id)
         delivery = turn.delivery
 
         async def prepare_run():
             nonlocal setting, persona, agent
+            await Conversations.check(snapshot)
             setting = await AIChatGroup.get_setting(group_id) if group_id else None
-            if setting and setting.disabled:
+            state = await Conversations.resolve(scene, snapshot)
+            context.state["_scene_configuration"] = state
+            if state["effective"]["disabled"]:
                 raise asyncio.CancelledError("目标会话已停用")
-            persona = await AIPersona.get_for_scene(group_id, user_id)
+            if state["effective"]["runner"] != accepted_runner:
+                raise asyncio.CancelledError("目标场景执行器已变化")
+            persona = await Conversations.persona(snapshot, group_id, user_id)
             agent = AIChatManager.get_agent(persona)
             turn.select_agent(agent, persona)
-            AIChatManager.configuration(context, setting, persona)
+            AIChatManager.configuration(context, setting, persona, accepted_runner)
             context.run.current_model = context.state["_configuration"]["model"]
-            if group_id:
-                context.state[BACKGROUND_KEY] = ChatBuffer.background(
-                    bot.self_id, group_id, None, 20
+            message = LLMMessage.user([TextPart(text=prompt)])
+            message.metadata = {"source": "task", "schedule_id": task_id}
+            if group_id and not context.state.get("_dsh_binding", {}).get("native"):
+                message.metadata["chat_input_anchor"] = (
+                    ChatBuffer.anchor(bot.self_id, group_id, None) + 1
                 )
-            return agent, prompt
+                message = await AIChatManager.prepare_background(context, message)
+            return agent, message
 
         async def before_run():
+            await Conversations.check(snapshot)
             notice = await AIChatManager._check_quota(
                 params.creator,
                 PlatformUtils.get_platform(bot),
@@ -551,21 +577,35 @@ class AITasks:
                     "skipped",
                 }:
                     await send_marked(context, sticker_id)
-                if delivery.parts and not group_id and user_id:
-                    await cls.remember(bot, user_id, name, "\n".join(delivery.parts))
             except BaseException as exc:
                 await turn.settle(exc)
                 raise
             await turn.settle(error)
 
         try:
-            await agent.run(
-                prompt,
-                context=context,
-                finalize=finalize,
-                before_run=before_run,
-                prepare_run=prepare_run,
-            )
+            if accepted_runner == "dsh":
+
+                async def prepare_dsh():
+                    _, message = await prepare_run()
+                    context.state["_dsh_input_metadata"] = message.metadata or {}
+                    return message.content, persona
+
+                await run_dsh(
+                    context,
+                    [TextPart(text=prompt)],
+                    persona,
+                    finalize=finalize,
+                    before_run=before_run,
+                    prepare_run=prepare_dsh,
+                )
+            else:
+                await agent.run(
+                    prompt,
+                    context=context,
+                    finalize=finalize,
+                    before_run=before_run,
+                    prepare_run=prepare_run,
+                )
             report = turn.report()
             if report.get("uncertain") or report.get("operation_uncertain"):
                 return TaskOutcome(status="UNKNOWN")
@@ -594,31 +634,6 @@ class AITasks:
             await turn.settle(error)
             return TaskOutcome(status="FAILURE")
 
-    @classmethod
-    async def remember(cls, bot: Bot, user_id: str, name: str, reply: str) -> None:
-        """把私聊任务的结果写入该用户的私聊对话记忆，之后的对话可以接着聊
-
-        参数:
-            bot: Bot
-            user_id: 私聊对象
-            name: 任务名称
-            reply: 已发送的结果
-        """
-        from zhenxun.services.platform_identity import scoped_user_id
-
-        agent = AIChatManager.get_agent(None)
-        scoped = scoped_user_id(user_id, PlatformUtils.get_platform_scope(bot))
-        if backend := chat_backend(agent.memory_config):
-            await backend.add_messages(
-                f"{MODULE}:{bot.self_id}:private:{scoped}",
-                [
-                    LLMMessage.user(
-                        f"（系统提示：主动任务「{name}」按时运行，结果如下）"
-                    ),
-                    LLMMessage.assistant_text_response(reply),
-                ],
-            )
-
 
 async def _run_task(bot: Bot, context: ScheduleContext, params: TaskParams):
     job = await AITasks.get(context.schedule_id)
@@ -646,7 +661,8 @@ class TaskToolkit(BaseToolkit):
         name="schedule_task",
         description=(
             "创建一个主动任务，按时运行 prompt 并把结果发到当前会话。prompt 要自包含"
-            "（写清楚要做什么、发什么），运行时不会看到这次对话。kind：cron（value 为"
+            "（写清楚要做什么、发什么），执行时使用目标场景当前对话。"
+            "kind：cron（value 为"
             "“分 时 日 月 周”，如 0 8 * * *）、interval（value 为间隔分钟，至少 10）、"
             "date（value 为 YYYY-MM-DD HH:MM，执行一次）。"
         ),

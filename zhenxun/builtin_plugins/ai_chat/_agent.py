@@ -275,7 +275,10 @@ class AgentCapability(AbstractCapability):
         返回:
             bool: 已开启 Agent 且对话者是超级用户时为 True
         """
-        if not agent_enabled():
+        enabled = (
+            context.state.get("_conversation", {}).get("settings", {}).get("agent")
+        )
+        if not (agent_enabled() if enabled is None else enabled):
             return False
         if context.state.get(AGENT_ACTIVE_KEY) is False:
             return False

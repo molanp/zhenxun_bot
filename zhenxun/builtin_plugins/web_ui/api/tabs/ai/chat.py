@@ -386,14 +386,49 @@ async def list_chat_groups() -> Result:
             "group_id", "group_name"
         )
     )
+    import nonebot
+
+    from zhenxun.builtin_plugins.ai_chat._data_source import parse_session
+    from zhenxun.models.ai_chat_scene import AIChatScene
+    from zhenxun.services.platform_identity import native_id, scope_owns
+    from zhenxun.utils.platform import PlatformUtils
+
+    targets: dict[str, dict[str, dict]] = {}
+    for row in await AIChatScene.all():
+        bot_id, group_id, _ = parse_session(row.scene_id)
+        if group_id and bot_id != "dsh":
+            targets.setdefault(group_id, {})[row.scene_id] = {
+                "scene_id": row.scene_id,
+                "label": f"Bot {bot_id}",
+                "overrides": sorted(
+                    key for key in (row.settings or {}) if not key.startswith("_")
+                ),
+            }
+    for bot in nonebot.get_bots().values():
+        scope = PlatformUtils.get_platform_scope(bot)
+        for group_id in set(groups) | set(settings):
+            if scope == "qq_api" and not group_id.startswith(
+                f"qq_api:{bot.self_id}:group:"
+            ):
+                continue
+            if not scope_owns(group_id, scope=scope) or not native_id(
+                group_id, scope, group=True, bot_id=str(bot.self_id)
+            ):
+                continue
+            scene = f"ai_chat:{bot.self_id}:{group_id}"
+            target = targets.setdefault(group_id, {}).setdefault(
+                scene, {"scene_id": scene, "overrides": []}
+            )
+            target["label"] = f"{scope} · Bot {bot.self_id}"
     items = []
-    for group_id in sorted(set(groups) | set(settings)):
+    for group_id in sorted(set(groups) | set(settings) | set(targets)):
         setting = settings.get(group_id)
         persona = personas.get(group_id)
         items.append(
             {
                 "group_id": group_id,
                 "group_name": groups.get(group_id, ""),
+                "scene_targets": list(targets.get(group_id, {}).values()),
                 "active_probability": setting.active_probability if setting else None,
                 "wake_words": setting.wake_words if setting else None,
                 "model": setting.model if setting else None,
@@ -445,4 +480,6 @@ async def update_chat_group(group_id: str, payload: GroupSettingPayload) -> Resu
                 [*groups, group_id] if persona.id == payload.persona_id else groups
             )
             await persona.save(update_fields=["group_ids", "updated_at"])
-    return Result.ok(info="群设置已保存。")
+    return Result.ok(
+        info="群基础设置已保存；账号场景的显式覆盖仍优先，可在场景设置恢复继承。"
+    )

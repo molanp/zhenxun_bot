@@ -107,8 +107,10 @@ async def init():
         )
         import zhenxun.models.ai_agent_call
         import zhenxun.models.ai_agent_run
+        import zhenxun.models.ai_chat_conversation
         import zhenxun.models.ai_chat_group
         import zhenxun.models.ai_chat_message
+        import zhenxun.models.ai_chat_scene
         import zhenxun.models.ai_knowledge_base
         import zhenxun.models.ai_knowledge_chunk
         import zhenxun.models.ai_knowledge_doc

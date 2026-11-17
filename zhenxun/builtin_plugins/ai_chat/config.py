@@ -714,10 +714,15 @@ CONFIGS = [
         model_dump(DshSettings()),
         dict,
         "DeepSeek Harness 设置",
+        "transport：desktop 或 sdk，不自动互相回退。"
         "desktop_url：桌面回环 HTTP 地址，留空自动识别；home：DSH home，"
         "留空使用当前用户 .dsh；timeout：每轮超时；allow_tools：允许符合"
         "当前授权的超管通过 QQ 操作 DSH 原生 Agent，不另加工具白名单。"
-        "无需 API Key；新建使用 standard，继承保留原会话模型、思考等级和模式。"
+        "桌面无需 API Key；sdk_bin 指向已安装 SDK，sdk_home 为独立宿主目录，"
+        "sdk_provider 引用已配置的官方 DeepSeek 提供商，"
+        "sdk_model、sdk_thinking 为新会话默认选择。"
+        "SDK 原生 Agent 在 Bot 退出后继续运行；只停止转发，不补发旧消息。"
+        "两种后端分别继承会话，不迁移或共用桌面运行目录。"
         "超管 Agent 跨群和私聊共享历史，完整回复发到本轮触发位置，"
         "群内回复可能包含此前私聊或工具读取的信息。",
         advanced=True,

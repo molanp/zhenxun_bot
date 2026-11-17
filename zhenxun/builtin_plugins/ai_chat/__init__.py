@@ -9,7 +9,6 @@ from nonebot.typing import T_State
 from nonebot_plugin_alconna import Alconna, Reply, UniMessage, UniMsg, on_alconna
 from nonebot_plugin_alconna.uniseg import SerializeFailed
 from nonebot_plugin_apscheduler import scheduler
-from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.config import Config
 from zhenxun.configs.utils import Command, PluginExtraData
@@ -24,7 +23,6 @@ from zhenxun.services.ai.utils.runtime import ContextUtils
 from zhenxun.services.log import logger
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.message import MessageUtils
-from zhenxun.utils.platform import PlatformUtils
 
 from ._buffer import AtWaiter, ChatBuffer, ChatLine, sender_name, summarize
 from ._data_source import MODULE, AIChatManager
@@ -43,13 +41,14 @@ __plugin_meta__ = PluginMetadata(
     description="和 Bot 用自然语言聊天",
     usage="""
     @Bot、回复 Bot 的消息、私聊、以 / 或唤醒词开头即可聊天
-    群聊中全群共用一段对话记忆，Bot 能看到上次发言之后群里的新消息
+    群聊中全群共用当前选中的对话，Bot 能看到上次发言之后群里的新消息
     只 @ Bot 不说话时，Bot 会等你 15 秒内的下一条消息一起回复
     群聊中可按概率或由监听模型判断后主动插话，也能自动收集群里的表情包
     开启长期记忆后会把聊天整理成记忆，之后聊到相关内容时想起来
     指令:
         停止对话 / /停止对话: 中止自己发起的对话
         重置对话 / /重置对话: 清空当前群或私聊的对话记忆（群聊限群管理员）
+        /ai help: 查看会话、模型、人设、记忆、计划和 DSH 控制命令
     """.strip(),
     extra=PluginExtraData(
         author="Copaan",
@@ -83,6 +82,16 @@ async def _with_reply(bot: Bot, event: Event, message: UniMessage) -> UniMessage
 async def _rule(bot: Bot, event: Event, message: UniMsg, state: T_State) -> bool:
     if not message:
         return False
+    from ._commands import command_text
+
+    if command_text(message.extract_plain_text()) is not None:
+        return False
+    from ._sessions import Conversations
+
+    if (await Conversations.preferences(AIChatManager.session_id(bot, event))).get(
+        "disabled"
+    ):
+        return False
     message = state[MESSAGE_KEY] = await _with_reply(bot, event, message)
     deps = NoneBotDeps(bot=bot, event=event)
     group_id = ContextUtils.extract_group_id(deps)
@@ -105,7 +114,7 @@ async def _rule(bot: Bot, event: Event, message: UniMsg, state: T_State) -> bool
         await Steal.observe(bot, group_id, user_id, message)
         if AtWaiter.feed(bot.self_id, group_id, user_id, message, line.message_id):
             return False
-    if await AIChatManager.should_reply(event, message, group_id):
+    if await AIChatManager.should_reply(event, message, group_id, bot):
         if group_id:
             Proactive.answered(bot.self_id, group_id)
         return True
@@ -119,6 +128,41 @@ async def _rule(bot: Bot, event: Event, message: UniMsg, state: T_State) -> bool
 
 
 _chat_matcher = on_message(rule=_rule, priority=999, block=False)
+
+
+async def _control_rule(message: UniMsg, state: T_State) -> bool:
+    from ._commands import command_text
+
+    value = command_text(message.extract_plain_text())
+    if value is None:
+        return False
+    state["ai_control_command"] = value
+    return True
+
+
+_control_matcher = on_message(rule=_control_rule, priority=98, block=True)
+
+
+@_control_matcher.handle()
+async def _control(bot: Bot, event: Event, state: T_State):
+    from ._commands import execute
+
+    try:
+        result = await execute(bot, event, state["ai_control_command"])
+    except ValueError as error:
+        result = str(error)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.warning(f"AI 控制命令未完成: {type(error).__name__}", "ai_chat")
+        result = "操作未完成；没有发送给模型。请刷新状态后重试，详细原因见管理日志。"
+    await MessageUtils.build_message(UniMessage.text(result)).finish(
+        reply_to=quote_reply(
+            ContextUtils.extract_group_id(NoneBotDeps(bot=bot, event=event))
+        )
+    )
+
+
 _stop_matcher = on_alconna(
     Alconna("停止对话"), aliases={"/停止对话"}, priority=5, block=True
 )
@@ -156,56 +200,13 @@ async def _(bot: Bot, event: Event, message: UniMsg, state: T_State):
 
 
 @_stop_matcher.handle()
-async def _(bot: Bot, event: Event, session: Uninfo):
-    from zhenxun.services.ai.run.context import RunContext
-
-    from ._agent import bind_source
-    from ._runner import stop_dsh_runs
-
-    deps = NoneBotDeps(bot=bot, event=event)
-    user_id = ContextUtils.extract_user_id(deps)
-    manage = PlatformUtils.is_superuser(bot, user_id) or (
-        bool(ContextUtils.extract_group_id(deps))
-        and await PlatformUtils.is_group_admin(bot, session)
-    )
-    count = await AIChatManager.stop(
-        AIChatManager.session_id(bot, event), None if manage else user_id
-    )
-    context = RunContext(deps=deps)
-    bind_source(context, "qq")
-    stopped, uncertain = await stop_dsh_runs(context, manage)
-    await MessageUtils.build_message(
-        "已请求停止，部分桌面任务的停止结果仍待核验。"
-        if uncertain
-        else "已停止对应的会话任务。"
-        if count or stopped
-        else "没有对应的进行中任务。"
-    ).finish(reply_to=quote_reply(ContextUtils.extract_group_id(deps)))
+async def _(bot: Bot, event: Event):
+    await _control(bot, event, {"ai_control_command": "stop"})
 
 
 @_reset_matcher.handle()
-async def _(bot: Bot, event: Event, session: Uninfo):
-    from ._runner import scene_session
-
-    group_id = ContextUtils.extract_group_id(NoneBotDeps(bot=bot, event=event))
-    quote = quote_reply(group_id)
-    if (
-        group_id
-        and not PlatformUtils.is_superuser(bot, session.user.id)
-        and not await PlatformUtils.is_group_admin(bot, session)
-    ):
-        await MessageUtils.build_message(
-            "群聊的对话记忆是全群共用的，只有群管理员可以重置。"
-        ).finish(reply_to=quote)
-    target = await scene_session(bot, event)
-    await AIChatManager.reset(target)
-    await MessageUtils.build_message(
-        "已重置真寻短期对话并解除 DSH 映射；桌面旧历史仍保留。"
-        if target.startswith("ai_chat:dsh:")
-        else "已清空本群的对话记忆。"
-        if group_id
-        else "已清空你的对话记忆。"
-    ).finish(reply_to=quote)
+async def _(bot: Bot, event: Event):
+    await _control(bot, event, {"ai_control_command": "reset"})
 
 
 register_task_job()

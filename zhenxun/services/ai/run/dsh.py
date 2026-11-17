@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import secrets
 import time
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 import uuid
@@ -47,10 +47,16 @@ Asker = Callable[[str], Awaitable[str]]
 
 
 class DshSettings(BaseModel):
-    """已登录桌面的连接设置；不接受 SDK 可执行文件或模型密钥。"""
+    """显式选择桌面或 SDK；两种后端不自动互相回退。"""
 
+    transport: Literal["desktop", "sdk"] = "desktop"
     desktop_url: str = ""
     home: str = ""
+    sdk_bin: str = "dsh"
+    sdk_home: str = ""
+    sdk_provider: str = ""
+    sdk_model: str = ""
+    sdk_thinking: str = ""
     timeout: int = Field(default=300, ge=10, le=1800)
     allow_tools: bool = False
     migration_required: bool = Field(default=False, exclude=True)
@@ -60,9 +66,22 @@ class DshSettings(BaseModel):
     def legacy(cls, value):
         if isinstance(value, dict):
             value = dict(value)
-            value["migration_required"] = not value.get("desktop_url") and any(
-                value.get(key)
-                for key in ("bin", "api_provider", "base_url", "provider", "model")
+            if value.get("transport") == "sdk":
+                for old, new in (
+                    ("bin", "sdk_bin"),
+                    ("api_provider", "sdk_provider"),
+                    ("model", "sdk_model"),
+                    ("reasoning_effort", "sdk_thinking"),
+                ):
+                    if old in value and new not in value:
+                        value[new] = value[old]
+            value["migration_required"] = (
+                value.get("transport", "desktop") == "desktop"
+                and not value.get("desktop_url")
+                and any(
+                    value.get(key)
+                    for key in ("bin", "api_provider", "base_url", "provider", "model")
+                )
             )
         return value
 
@@ -71,6 +90,15 @@ class DshSessions:
     """按可信所有者保存桌面会话，旧 SDK 文件不参与读取。"""
 
     FILE = DSH_PATH / "desktop-sessions.json"
+    TRANSPORT = "desktop"
+
+    @staticmethod
+    def for_settings(settings):
+        return SdkSessions if settings.transport == "sdk" else DshSessions
+
+    @staticmethod
+    def for_binding(binding):
+        return SdkSessions if binding.get("transport") == "sdk" else DshSessions
 
     @classmethod
     def _read(cls):
@@ -116,7 +144,15 @@ class DshSessions:
 
     @classmethod
     def owner(cls, context, mode: str) -> str:
-        return cls.owner_key(context.run.caller, mode)
+        return cls.owner_key(cls.mapping_caller(context, mode), mode)
+
+    @staticmethod
+    def mapping_caller(context, mode: str):
+        """普通定时聊天按目标归属历史，授权与用量仍取真实创建者。"""
+        caller = context.run.caller
+        if mode == "chat" and caller and caller.source == "task":
+            return context.state.get("_dsh_chat_target", caller)
+        return caller
 
     @staticmethod
     def owner_key(caller, mode: str) -> str:
@@ -147,7 +183,8 @@ class DshSessions:
 
     @classmethod
     def route(cls, context, mode: str, persona_key: str) -> dict:
-        owner = cls.owner(context, mode)
+        caller = cls.mapping_caller(context, mode)
+        owner = cls.owner_key(caller, mode)
 
         def edit(data):
             item = data["owners"].get(owner)
@@ -160,6 +197,7 @@ class DshSessions:
             if item is None:
                 remote = "zx-" + uuid.uuid4().hex
                 item = {
+                    "transport": cls.TRANSPORT,
                     "owner": owner,
                     "mode": mode,
                     "persona": persona_key,
@@ -169,18 +207,18 @@ class DshSessions:
                     "created": False,
                     "inflight": None,
                     "quarantined": None,
-                    "preset": "standard" if mode == "agent" else PRESETS[mode],
+                    "preset": ("sdk-native" if cls.TRANSPORT == "sdk" else "standard")
+                    if mode == "agent"
+                    else PRESETS[mode],
                     "native": mode == "agent",
                     "identity": {
-                        "source": context.run.caller.source,
-                        "platform": context.run.caller.platform,
-                        "bot_id": context.run.caller.bot_id,
-                        "user_id": context.run.caller.user_id
-                        if mode == "agent" or not context.run.caller.group_id
+                        "source": caller.source,
+                        "platform": caller.platform,
+                        "bot_id": caller.bot_id,
+                        "user_id": caller.user_id
+                        if mode == "agent" or not caller.group_id
                         else None,
-                        "group_id": context.run.caller.group_id
-                        if mode == "chat"
-                        else None,
+                        "group_id": caller.group_id if mode == "chat" else None,
                     },
                 }
                 data["owners"][owner] = item
@@ -193,9 +231,13 @@ class DshSessions:
         return item
 
     @classmethod
-    def switch(cls, caller, selected: dict | None, expected_revision: int) -> dict:
-        """原子切换指定超管的桌面映射，保留旧会话记录且不更改桌面历史。"""
-        owner = cls.owner_key(caller, "agent")
+    def switch(
+        cls, caller, selected: dict | None, expected_revision: int, mode: str = "agent"
+    ) -> dict:
+        """按可信所有者和模式切换映射，普通聊天只复用自身记录。"""
+        if mode not in PRESETS:
+            raise DshUnavailable("未知的 DSH 模式。")
+        owner = cls.owner_key(caller, mode)
         remote_id = selected["remote_id"] if selected else "zx-" + uuid.uuid4().hex
 
         def edit(data):
@@ -205,6 +247,27 @@ class DshSessions:
             for item in [*data["archives"], *data["owners"].values()]:
                 if item["remote_id"] == remote_id and item["owner"] != owner:
                     raise DshUnavailable("该会话已分配给其他用户。")
+            owned = next(
+                (
+                    item
+                    for item in [*data["archives"], *data["owners"].values()]
+                    if item["remote_id"] == remote_id
+                    and item["owner"] == owner
+                    and item["mode"] == mode
+                ),
+                None,
+            )
+            if (
+                mode == "chat"
+                and selected
+                and (
+                    not owned
+                    or owned.get("native")
+                    or owned.get("quarantined")
+                    or owned.get("inflight")
+                )
+            ):
+                raise DshUnavailable("不能接入无可信归属或结果待核验的普通聊天。")
             if current and current.get("inflight"):
                 raise DshUnavailable("会话仍在执行，不能切换。")
             if current:
@@ -212,17 +275,28 @@ class DshSessions:
                     {**current, "archive_reason": "selection_changed"}
                 )
             item = {
+                "transport": cls.TRANSPORT,
                 "owner": owner,
-                "mode": "agent",
-                "persona": "",
+                "mode": mode,
+                "persona": owned.get("persona", "") if owned and mode == "chat" else "",
                 "remote_id": remote_id,
-                "local_id": f"ai_chat:dsh:{owner}:{uuid.uuid4().hex}",
+                "local_id": owned["local_id"]
+                if owned and mode == "chat"
+                else f"ai_chat:dsh:{owner}:{uuid.uuid4().hex}",
                 "revision": expected_revision + 1,
-                "created": bool(selected),
+                "created": selected.get("created", True) if selected else False,
                 "inflight": None,
                 "quarantined": None,
-                "preset": selected["preset"] if selected else "standard",
-                "native": selected["native"] if selected else True,
+                "preset": selected["preset"]
+                if selected
+                else PRESETS["chat"]
+                if mode == "chat"
+                else ("sdk-native" if cls.TRANSPORT == "sdk" else "standard"),
+                "native": False
+                if mode == "chat"
+                else selected["native"]
+                if selected
+                else True,
                 "inherited": bool(selected),
                 "cwd": selected["cwd"] if selected else None,
                 "model": selected["model"] if selected else None,
@@ -232,10 +306,16 @@ class DshSessions:
                     "source": caller.source,
                     "platform": caller.platform,
                     "bot_id": caller.bot_id,
-                    "user_id": caller.user_id,
-                    "group_id": None,
+                    "user_id": caller.user_id
+                    if mode == "agent" or not caller.group_id
+                    else None,
+                    "group_id": caller.group_id if mode == "chat" else None,
                 },
             }
+            if owned and mode == "chat":
+                for key in ("preset_revision", "sdk_home"):
+                    if key in owned:
+                        item[key] = owned[key]
             data["owners"][owner] = item
             return dict(item)
 
@@ -305,6 +385,11 @@ class DshSessions:
                     del data["owners"][owner]
 
         cls._mutate(edit)
+
+
+class SdkSessions(DshSessions):
+    FILE = DSH_PATH / "sdk-sessions.json"
+    TRANSPORT = "sdk"
 
 
 @dataclass
@@ -392,7 +477,12 @@ class DshRuntime:
 
     @classmethod
     async def status(cls, settings: DshSettings) -> dict:
+        if settings.transport == "sdk":
+            from .dsh_sdk import SdkClient
+
+            return await SdkClient.status(settings)
         result = {
+            "transport": "desktop",
             "connected": False,
             "logged_in": None,
             "guard_ready": None,
@@ -521,11 +611,17 @@ class DshRuntime:
             }
         )
         if payload.get("model"):
-            context.run.current_model = "dsh:" + str(payload["model"].get("model", ""))
+            cls.record_selection(turn, payload["model"])
         return {"allowed": True}
 
     @classmethod
     async def start(cls, context, binding, settings, approve, ask) -> _Turn:
+        if settings.transport != binding.get("transport", "desktop"):
+            raise DshUnavailable("执行器传输已变化，请重新选择会话。")
+        if settings.transport == "sdk":
+            from .dsh_sdk import SdkClient
+
+            return await SdkClient.start_turn(context, binding, settings, approve, ask)
         if settings.migration_required:
             raise DshUnavailable(
                 "旧 SDK 配置不能连接桌面，请更新 desktop_url 与 home。"
@@ -751,12 +847,12 @@ class DshRuntime:
             "stop": "not_requested",
             "background_stop_guarantee": False,
         }
-        context.run.current_model = "dsh:" + str(
-            (info["model"] or {}).get("model", "desktop")
-        )
+        cls.record_selection(turn, info["model"])
 
     @classmethod
     async def prompt(cls, turn: _Turn, content: list[dict], timeout: float):
+        if turn.binding.get("transport") == "sdk":
+            return await turn.client.prompt(turn, content, timeout)
         from websockets.exceptions import WebSocketException
 
         if not (turn and turn.binding.get("native")) and any(
@@ -884,6 +980,23 @@ class DshRuntime:
             await asyncio.gather(incoming, return_exceptions=True)
 
     @staticmethod
+    def record_selection(turn: _Turn, model: dict | None) -> None:
+        """记录执行端确认的模型选择，不修改远端默认值或原生参数。"""
+        if not model or not model.get("model"):
+            return
+        selected = {
+            key: model[key]
+            for key in ("provider", "model", "reasoningEffort")
+            if key in model
+        }
+        turn.context.run.current_model = "dsh:" + str(selected["model"])
+        configuration = turn.context.state.setdefault("_configuration", {})
+        configuration.update(model=turn.context.run.current_model, native=selected)
+        turn.context.run.operations.setdefault("dsh", {})["model"] = selected
+        if turn.binding.get("model") != selected:
+            DshSessions.for_binding(turn.binding).update(turn.binding, model=selected)
+
+    @staticmethod
     def consume(turn: _Turn, event: dict) -> str | None:
         seq = event.get("seq")
         if not isinstance(seq, int) or seq in turn.seen:
@@ -899,6 +1012,14 @@ class DshRuntime:
             turn.remote_turn = data.get("turn")
         if not turn.admitted or data.get("turn") not in {None, turn.remote_turn}:
             return None
+        if kind == "request/header":
+            header = data.get("header") or {}
+            selection = dict(header.get("config") or {})
+            if (header.get("adapterDefaults") or {}).get("reasoningEffort") is True:
+                selection.pop("reasoningEffort", None)
+            DshRuntime.record_selection(turn, selection)
+        elif kind == "model/selection":
+            DshRuntime.record_selection(turn, data)
         tools = turn.context.run.operations.setdefault("dsh_tools", {})
         callback = turn.context.state.get("_dsh_event")
         if kind in {"llm/retry", "llm/retry-started"}:
@@ -1043,7 +1164,9 @@ class DshRuntime:
                     max(0.001, remaining),
                 )
                 turn.stop_confirmation = (
-                    "foreground_idle"
+                    "unknown"
+                    if not state.get("loaded", turn.binding.get("transport") != "sdk")
+                    else "foreground_idle"
                     if not state.get("running")
                     and not state.get("queue")
                     and not state.get("pendingInput")
@@ -1062,12 +1185,17 @@ class DshRuntime:
             turn.stop_confirmation
         )
         try:
-            DshSessions.update(
+            DshSessions.for_binding(turn.binding).update(
                 turn.binding,
                 quarantined="interrupted",
                 inflight=None
                 if turn.stop_confirmation
-                in {"confirmed", "foreground_confirmed", "foreground_idle"}
+                in {
+                    "confirmed",
+                    "foreground_confirmed",
+                    "foreground_idle",
+                    "target_removed",
+                }
                 else {
                     "boot": BOOT_ID,
                     "run_id": turn.context.run.run_id,
@@ -1086,6 +1214,9 @@ class DshRuntime:
         if turn.pending:
             await asyncio.gather(*turn.pending, return_exceptions=True)
         cls._turns.pop(turn.context.run.run_id, None)
+        if turn.binding.get("transport") == "sdk":
+            await turn.client.close()
+            return
         try:
             (DSH_PATH / "leases" / (turn.binding["remote_id"] + ".json")).unlink(
                 missing_ok=True

@@ -86,7 +86,9 @@ def parse_session(session_id: str) -> tuple[str, str | None, str | None]:
     返回:
         tuple[str, str | None, str | None]: Bot id、群号（私聊和任务为空）、用户id
     """
-    _, bot_id, rest = [*session_id.split(":", 2), "", ""][:3]
+    from ._sessions import scene_key
+
+    _, bot_id, rest = [*scene_key(session_id).split(":", 2), "", ""][:3]
     if rest.startswith("private:"):
         return bot_id, None, rest[len("private:") :] or None
     if rest.startswith("task:"):
@@ -119,16 +121,19 @@ class AIChatManager:
         返回:
             bool: 是否拦截
         """
-        from zhenxun.builtin_plugins.hooks.auth.auth_ban import is_ban
         from zhenxun.services.platform_identity import (
             scoped_group_id,
             scoped_user_id,
         )
+
+        from ._sessions import Conversations
+
+        scope = PlatformUtils.get_platform_scope(bot)
+        scene = f"{MODULE}:{bot.self_id}:{scoped_group_id(group_id, scope)}"
+        if (await Conversations.preferences(scene)).get("disabled"):
+            return True
         from zhenxun.services.scheduler.engine import _plugin_blocked
 
-        setting = await AIChatGroup.get_setting(group_id)
-        if setting and setting.disabled:
-            return True
         context = SimpleNamespace(group_id=group_id, user_id=None)
         if await _plugin_blocked(PLUGIN_MODULE, bot, context):
             return True
@@ -136,6 +141,8 @@ class AIChatManager:
         if scope == "qq_api" or (user_id and user_id in bot.config.superusers):
             return False
         try:
+            from zhenxun.builtin_plugins.hooks.auth.auth_ban import is_ban
+
             return bool(
                 await is_ban(
                     scoped_user_id(user_id, scope) if user_id else None,
@@ -148,7 +155,11 @@ class AIChatManager:
 
     @classmethod
     async def should_reply(
-        cls, event: Event, message: UniMessage, group_id: str | None
+        cls,
+        event: Event,
+        message: UniMessage,
+        group_id: str | None,
+        bot: Bot | None = None,
     ) -> bool:
         """判断消息是否唤醒 AI 聊天：@、回复 Bot、私聊、以 / 开头（SLASH_WAKE）
         或唤醒词，群设置了唤醒词时覆盖全局值；群停用 AI 聊天时不回复。
@@ -163,7 +174,16 @@ class AIChatManager:
             bool: 是否回复
         """
         setting = await AIChatGroup.get_setting(group_id) if group_id else None
-        if setting and setting.disabled:
+        from ._sessions import Conversations
+
+        disabled = (
+            (await Conversations.preferences(cls.session_id(bot, event))).get(
+                "disabled"
+            )
+            if bot
+            else bool(setting and setting.disabled)
+        )
+        if disabled:
             return False
         if event.is_tome():
             return True
@@ -487,13 +507,20 @@ class AIChatManager:
         def version(value):
             return str(getattr(value, "updated_at", ""))
 
+        native_model = context.state.get("_dsh_binding", {}).get("model")
+        if isinstance(native_model, dict):
+            native_model = native_model.get("model")
+
         selected = {
             "persona_id": persona.id if persona else None,
             "persona_revision": version(persona),
             "group_revision": version(setting),
-            "model": "dsh:桌面默认"
+            "model": native_model or "DSH 原生选择（待查询）"
             if runner == "dsh"
-            else (setting.model if setting else None)
+            else context.state.get("_scene_configuration", {})
+            .get("effective", {})
+            .get("model")
+            or (setting.model if setting else None)
             or (persona.model if persona else None)
             or get_default_model("chat"),
             "executor": runner,
@@ -639,10 +666,19 @@ class AIChatManager:
         from zhenxun.services.ai.core.exceptions import RunInterrupted
         from zhenxun.services.ai.run.context import set_run_context
 
+        from ._sessions import Conversations
+
+        snapshot = await Conversations.snapshot(cls.session_id(bot, event))
+        effective = await Conversations.resolve(snapshot["scene_id"], snapshot)
+        if effective["effective"]["disabled"]:
+            return
+
         context = RunContext(
             deps=NoneBotDeps(bot=bot, event=event),
-            session_id=cls.session_id(bot, event),
+            session_id=snapshot["session_id"],
         )
+        context.state["_conversation"] = snapshot
+        context.state["_scene_configuration"] = effective
         if group_id := context.get_group_id():
             message_id = getattr(event, "message_id", None)
             context.state["_input_anchor"] = ChatBuffer.anchor(
@@ -693,6 +729,7 @@ class AIChatManager:
         from ._reply import quote_reply, send_reply
         from ._runner import agent_runner, run_dsh, select_dsh_session
         from ._safety import INPUT_NOTICE, Safety
+        from ._sessions import Conversations
         from ._turn import FAILED_NOTICE, ChatTurn
 
         deps = NoneBotDeps(bot=bot, event=event)
@@ -700,7 +737,9 @@ class AIChatManager:
         if not user_id:
             return
         group_id = ContextUtils.extract_group_id(deps)
-        session_id = cls.session_id(bot, event)
+        snapshot = context.state["_conversation"]
+        await Conversations.check(snapshot)
+        session_id = snapshot["session_id"]
         revision = session_manager.revision(session_id)
         admitted = await cls._admit(bot, event, message, proactive)
         if admitted is None or revision != session_manager.revision(session_id):
@@ -723,7 +762,7 @@ class AIChatManager:
                 )
             return
         setting = await AIChatGroup.get_setting(group_id) if group_id else None
-        persona = await AIPersona.get_for_scene(group_id, user_id)
+        persona = await Conversations.persona(snapshot, group_id, user_id)
         context = cls._context(
             bot, event, setting, proactive, text, message_id, context
         )
@@ -734,7 +773,7 @@ class AIChatManager:
         prompt = LLMMessage.user(parts)
         prompt.metadata = {"chat_input_anchor": context.state.get("_input_anchor")}
         agent = cls.get_agent(persona)
-        accepted_runner = agent_runner(setting) if proactive is None else "local"
+        accepted_runner = snapshot["settings"].get("runner") or agent_runner(setting)
         if accepted_runner == "dsh":
             await select_dsh_session(context, persona)
             session_id = context.session_id or ""
@@ -758,12 +797,16 @@ class AIChatManager:
 
         async def prepare_run():
             nonlocal setting, persona, agent
+            await Conversations.check(snapshot)
             setting = await AIChatGroup.get_setting(group_id) if group_id else None
-            runner = agent_runner(setting) if proactive is None else "local"
+            context.state["_scene_configuration"] = await Conversations.resolve(
+                snapshot["scene_id"], snapshot
+            )
+            runner = context.state["_scene_configuration"]["effective"]["runner"]
             if runner != accepted_runner:
                 context.run.user_notice = "排队期间执行器已切换，请重新发送问题。"
                 raise LLMException(context.run.user_notice)
-            persona = await AIPersona.get_for_scene(group_id, user_id)
+            persona = await Conversations.persona(snapshot, group_id, user_id)
             agent = cls.get_agent(persona)
             turn.select_agent(agent, persona)
             cls.configuration(context, setting, persona, runner)
@@ -781,6 +824,7 @@ class AIChatManager:
             return prepared.content, persona
 
         async def before_run():
+            await Conversations.check(snapshot)
             if not turn.current:
                 raise asyncio.CancelledError("会话已重置")
             if group_id and await cls.blocked(bot, group_id, user_id):
@@ -872,9 +916,13 @@ class AIChatManager:
         返回:
             bool: 是否有
         """
+        from ._sessions import scene_key
+
         return any(
             origin == "qq" and task in cls._admitted and not task.done()
-            for task, (_, origin) in cls._requests.get(session_id, {}).items()
+            for task, (_, origin) in cls._requests.get(
+                scene_key(session_id), {}
+            ).items()
         )
 
     @classmethod
@@ -918,7 +966,14 @@ class AIChatManager:
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(tasks, timeout=10)
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
+            if pending:
+                for task in tasks:
+                    task.add_done_callback(cls._stopped.discard)
+                raise LLMException("停止清理尚未完成，结果待核验。")
         cls._stopped.difference_update(tasks)
         return requests or others
 
@@ -930,13 +985,14 @@ class AIChatManager:
         参数:
             session_id: 会话id
         """
-        from zhenxun.services.ai.run.dsh import DshSessions
+        from zhenxun.services.ai.run.dsh import DshSessions, SdkSessions
 
         from ._memory import Memory
 
         session_manager.invalidate(session_id)
         await cls.stop(session_id)
         DshSessions.reset(session_id)
+        SdkSessions.reset(session_id)
         await Memory.reset(session_id)
         bot_id, group_id, _ = parse_session(session_id)
         if group_id and not session_id.startswith("ai_chat:dsh:"):

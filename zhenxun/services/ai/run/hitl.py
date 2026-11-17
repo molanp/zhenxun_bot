@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from typing import ClassVar
+import uuid
 
-from nonebot.adapters import Event
+from nonebot.adapters import Bot, Event
 from nonebot_plugin_waiter import waiter
 
 from zhenxun.services.ai.core.exceptions import AbortException, ToolFatalError
@@ -19,6 +21,8 @@ class HITLController:
     人机协同控制器 (Human-in-the-Loop Controller)。
     封装底层的物理环境隔离等待逻辑，供上层工具和中间件发起提问或审批。
     """
+
+    pending: ClassVar[dict[str, tuple[RunContext, asyncio.Future, str]]] = {}
 
     def __init__(self, context: RunContext):
         self.context = context
@@ -49,15 +53,19 @@ class HITLController:
         orig_group_id = self.context.get_group_id()
 
         @waiter(waits=["message"], keep_session=False)
-        async def event_waiter(e: Event):
-            raw_curr_group = getattr(e, "group_id", getattr(e, "channel_id", None))
+        async def event_waiter(event_bot: Bot, e: Event):
+            from .context import NoneBotDeps
 
-            curr_group_id = str(raw_curr_group) if raw_curr_group else None
-            tgt_group_id = str(orig_group_id) if orig_group_id else None
-            if curr_group_id != tgt_group_id:
+            if (
+                str(event_bot.self_id) != str(bot.self_id)
+                or event_bot.adapter.get_name() != bot.adapter.get_name()
+            ):
+                return None
+            current = RunContext(deps=NoneBotDeps(bot=event_bot, event=e))
+            if current.get_group_id() != orig_group_id:
                 return None
 
-            if strict_user and str(e.get_user_id()) != orig_user_id:
+            if strict_user and current.get_user_id() != orig_user_id:
                 return None
 
             if custom_checker and not custom_checker(e):
@@ -70,20 +78,91 @@ class HITLController:
         if cancellation_token:
             cancellation_token.link_future(task)
 
-        return await task
+        try:
+            return await task
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def ask_text(self, prompt_msg: str, timeout: float = 60.0) -> str:
         """
         高阶交互：发起文本提问，内置超时与取消词检测。
         如用户取消或超时，自动抛出异常切断 Agent 思考循环。
         """
-        event = await self.wait_event(prompt_msg, timeout=timeout, strict_user=True)
-        if event is None:
-            logger.warning("🛡️ [HITL] 文本参数收集超时，任务已被系统强杀。")
-            raise ToolFatalError("参数收集超时，用户已离开，任务已中止。")
-
-        user_input = event.get_plaintext().strip()
+        question_id = uuid.uuid4().hex[:12]
+        answer = asyncio.get_running_loop().create_future()
+        self.pending[question_id] = (self.context, answer, prompt_msg)
+        task = asyncio.create_task(
+            self.wait_event(
+                f"{prompt_msg}\n问题 {question_id}，"
+                f"也可使用 /ai answer {question_id} <回答>",
+                timeout=timeout,
+                strict_user=True,
+                custom_checker=lambda event: not event.get_plaintext()
+                .strip()
+                .startswith("/ai "),
+            )
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {task, answer}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+            if answer in done:
+                user_input = answer.result().strip()
+            elif task in done and (event := task.result()) is not None:
+                user_input = event.get_plaintext().strip()
+            else:
+                raise ToolFatalError("参数收集超时，任务已中止。")
+        finally:
+            self.pending.pop(question_id, None)
+            answer.cancel()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         if user_input.lower() in CANCEL_WORDS:
             raise AbortException(reason="用户主动取消了操作")
 
         return user_input
+
+    @classmethod
+    async def command(cls, context: RunContext, action: str, argument: str) -> str:
+        """按可信调用者和运行归属查询或回答问题，迟到回答不重新放行。"""
+        from zhenxun.services.ai.utils.runtime import PermissionUtils
+
+        caller = context.run.caller
+        entries = {}
+        for ident, (owner, future, prompt) in list(cls.pending.items()):
+            other = owner.run.caller
+            if (
+                caller
+                and other
+                and not future.done()
+                and (
+                    caller.source,
+                    caller.platform,
+                    caller.bot_id,
+                    caller.user_id,
+                    caller.group_id,
+                )
+                == (
+                    other.source,
+                    other.platform,
+                    other.bot_id,
+                    other.user_id,
+                    other.group_id,
+                )
+            ):
+                entries[ident] = (owner, future, prompt)
+        if action == "approval":
+            return (
+                "\n".join(
+                    f"{ident}: {entry[2][:300]}" for ident, entry in entries.items()
+                )
+                or "当前没有等待你处理的问题。"
+            )
+        ident, _, answer = argument.partition(" ")
+        if not answer.strip() or ident not in entries:
+            raise ValueError("问题已失效、不属于你，或回答为空。")
+        owner, future, _ = entries[ident]
+        PermissionUtils.ensure_current(owner)
+        future.set_result(answer.strip())
+        return "已提交本次回答。"

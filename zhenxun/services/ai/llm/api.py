@@ -182,7 +182,12 @@ def _converter(
         "audio": (AudioPart, "stt", "语音转写"),
         "video": (VideoPart, "vision", "视频描述"),
     }[modality]
-    if not (model := get_default_model(task)):
+    from zhenxun.services.ai.run.context import get_current_run_context
+
+    context = get_current_run_context()
+    scene = context.state.get("_scene_configuration", {}) if context else {}
+    model = scene.get("effective", {}).get("stt") if task == "stt" else None
+    if not (model := model or get_default_model(task)):
         settings = get_llm_config().deepseek_tools
         if modality == "audio" and settings.asr_enabled:
             return part_type, None, label
@@ -193,6 +198,8 @@ def _converter(
     try:
         candidates = resolve_routes(model, route_task)
     except LLMException as e:
+        if task == "stt" and scene.get("overrides", {}).get("stt"):
+            raise
         logger.warning(f"{label}模型 {model} 不可用: {e}")
         return None
     if task == "vision" and all(unmet_needs(route, {"image"}) for route in candidates):

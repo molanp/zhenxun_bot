@@ -522,30 +522,65 @@ async def console_run(payload: ConsoleRequest, request: Request) -> StreamingRes
 
 @router.post("/console/stop", dependencies=[authentication()], response_model=Result)
 async def console_stop(payload: ConsoleStopRequest, request: Request) -> Result:
-    from zhenxun.builtin_plugins.ai_chat._data_source import AIChatManager
+    from zhenxun.builtin_plugins.ai_chat._commands import stop_message
+    from zhenxun.builtin_plugins.ai_chat._runner import dsh_settings
+    from zhenxun.services.ai.run.dsh import DshSessions
+    from zhenxun.services.ai.run.dsh_control import DshControl
     from zhenxun.services.ai.run.session import session_manager
 
     subject = management_subject(request)
     session = console_session(payload.persona_id)
-    if payload.run_id:
-        entry = session_manager.runs.get(payload.run_id)
-        if entry and (
-            entry[0].run.caller is None
-            or entry[0].run.caller.source != "webui"
-            or entry[0].run.caller.user_id != f"webui:{subject}"
+    captured = []
+    for run_id, (context, task) in list(session_manager.runs.items()):
+        if payload.run_id and run_id != payload.run_id:
+            continue
+        caller = context.run.caller
+        owned = (
+            caller is not None
+            and caller.source == "webui"
+            and caller.user_id == f"webui:{subject}"
+        )
+        if payload.run_id and not owned:
+            raise HTTPException(409, detail={"message": "运行不属于当前账号"})
+        if owned and (
+            payload.run_id
+            or context.session_id == session
+            or context.state.get("_dsh_binding")
         ):
-            raise HTTPException(409, detail={"message": "运行不属于当前会话"})
-        stopped = await session_manager.stop(payload.run_id)
-        confirmed = (
-            not entry or entry[0].run.operations.get("dsh", {}).get("stop") != "unknown"
-        )
-        return Result.ok(
-            info="已停止。" if stopped and confirmed else "正在停止，结果待核验。"
-        )
-    task = _tasks.get(session + ":" + hashlib.sha256(subject.encode()).hexdigest())
-    count = await AIChatManager.stop(session)
-    if task and not task.done():
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        count += 1
-    return Result.ok(info="已停止。" if count else "当前没有进行中的对话。")
+            captured.append((run_id, context))
+    completed = [await session_manager.stop(run_id) for run_id, _ in captured]
+    states = [
+        context.run.operations.get("dsh", {}).get("stop", "unknown")
+        for _, context in captured
+        if context.state.get("_dsh_binding")
+    ]
+    if not payload.run_id:
+        task = _tasks.get(session + ":" + hashlib.sha256(subject.encode()).hexdigest())
+        if task and not task.done():
+            task.cancel()
+            _, pending = await asyncio.wait({task}, timeout=10)
+            completed.append(not pending)
+    settings = dsh_settings()
+    records = DshSessions.for_settings(settings)
+    captured_ids = {run_id for run_id, _ in captured}
+    for item in records._read()["owners"].values():
+        identity = item.get("identity") or {}
+        flight = item.get("inflight") or {}
+        run_id = flight.get("run_id")
+        if (
+            identity.get("source") != "webui"
+            or identity.get("user_id") != f"webui:{subject}"
+            or not run_id
+            or run_id in captured_ids
+            or (payload.run_id and run_id != payload.run_id)
+        ):
+            continue
+        result = await DshControl.stop_owned(settings, dict(item), run_id)
+        states.append(result["state"])
+    local_done = all(completed)
+    info = (
+        stop_message(states, local_done)
+        if completed or states
+        else "没有本账号的登记运行；未对无归属的原生活动执行停止。"
+    )
+    return Result.ok({"local_done": local_done, "remote_states": states}, info=info)

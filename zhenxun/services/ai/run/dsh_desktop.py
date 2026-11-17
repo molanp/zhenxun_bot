@@ -267,7 +267,7 @@ class DesktopClient:
             raise RunInterrupted("DSH 桌面进程已变化")
 
     async def stop(self, session_id: str, request_id: str) -> str:
-        """移除本轮待执行输入并取消，直到被动状态确认空闲或窗口耗尽。"""
+        """移除精确待执行输入；缺少当前执行的原子归属条件时不取消整会话。"""
 
         async def drain():
             snapshot = await self.rpc("session/state", {"sessionId": session_id})
@@ -281,7 +281,9 @@ class DesktopClient:
                             "action": {"kind": "remove"},
                         },
                     )
-            await self.rpc("session/cancel", {"sessionId": session_id})
+            # 桌面 cancel 只有会话级参数，不能用旧请求取消后来接入的原生活动。
+            if snapshot.get("running") or snapshot.get("pendingInput"):
+                return "unknown"
             while True:
                 state = await self.rpc("session/state", {"sessionId": session_id})
                 if (
