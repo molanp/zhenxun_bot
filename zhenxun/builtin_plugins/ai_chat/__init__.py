@@ -86,12 +86,6 @@ async def _rule(bot: Bot, event: Event, message: UniMsg, state: T_State) -> bool
 
     if command_text(message.extract_plain_text()) is not None:
         return False
-    from ._sessions import Conversations
-
-    if (await Conversations.preferences(AIChatManager.session_id(bot, event))).get(
-        "disabled"
-    ):
-        return False
     message = state[MESSAGE_KEY] = await _with_reply(bot, event, message)
     deps = NoneBotDeps(bot=bot, event=event)
     group_id = ContextUtils.extract_group_id(deps)
@@ -137,6 +131,7 @@ async def _control_rule(message: UniMsg, state: T_State) -> bool:
     if value is None:
         return False
     state["ai_control_command"] = value
+    state["ai_control_quiet"] = True
     return True
 
 
@@ -145,10 +140,15 @@ _control_matcher = on_message(rule=_control_rule, priority=98, block=True)
 
 @_control_matcher.handle()
 async def _control(bot: Bot, event: Event, state: T_State):
-    from ._commands import execute
+    from ._commands import CommandDenied, execute
 
+    group_id = ContextUtils.extract_group_id(NoneBotDeps(bot=bot, event=event))
     try:
         result = await execute(bot, event, state["ai_control_command"])
+    except CommandDenied as error:
+        if state.get("ai_control_quiet") and group_id and not event.is_tome():
+            await _control_matcher.finish()
+        result = str(error)
     except ValueError as error:
         result = str(error)
     except asyncio.CancelledError:
@@ -157,9 +157,7 @@ async def _control(bot: Bot, event: Event, state: T_State):
         logger.warning(f"AI 控制命令未完成: {type(error).__name__}", "ai_chat")
         result = "操作未完成；没有发送给模型。请刷新状态后重试，详细原因见管理日志。"
     await MessageUtils.build_message(UniMessage.text(result)).finish(
-        reply_to=quote_reply(
-            ContextUtils.extract_group_id(NoneBotDeps(bot=bot, event=event))
-        )
+        reply_to=quote_reply(group_id)
     )
 
 

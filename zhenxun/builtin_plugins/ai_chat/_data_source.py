@@ -130,7 +130,7 @@ class AIChatManager:
 
         scope = PlatformUtils.get_platform_scope(bot)
         scene = f"{MODULE}:{bot.self_id}:{scoped_group_id(group_id, scope)}"
-        if (await Conversations.preferences(scene)).get("disabled"):
+        if await Conversations.disabled(scene):
             return True
         from zhenxun.services.scheduler.engine import _plugin_blocked
 
@@ -174,17 +174,16 @@ class AIChatManager:
             bool: 是否回复
         """
         setting = await AIChatGroup.get_setting(group_id) if group_id else None
+        if not cls._wakes(event, message, setting):
+            return False
+        if bot is None:
+            return not (setting and setting.disabled)
         from ._sessions import Conversations
 
-        disabled = (
-            (await Conversations.preferences(cls.session_id(bot, event))).get(
-                "disabled"
-            )
-            if bot
-            else bool(setting and setting.disabled)
-        )
-        if disabled:
-            return False
+        return not await Conversations.disabled(cls.session_id(bot, event), setting)
+
+    @staticmethod
+    def _wakes(event: Event, message: UniMessage, setting) -> bool:
         if event.is_tome():
             return True
         words = [

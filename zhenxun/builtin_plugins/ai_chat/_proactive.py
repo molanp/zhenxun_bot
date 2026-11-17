@@ -176,7 +176,7 @@ class Proactive:
             else None
         )
         disabled = (
-            (await Conversations.preferences(scene)).get("disabled")
+            await Conversations.disabled(scene, setting)
             if scene
             else bool(setting and setting.disabled)
         )

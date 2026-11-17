@@ -98,40 +98,6 @@ async def scene_session(bot, event) -> str:
     return snapshot["session_id"] or scene
 
 
-async def stop_dsh_runs(context: RunContext, manage: bool) -> tuple[int, int]:
-    """按本轮可信来源停止桌面运行，不依赖后来切换的执行器或模式。"""
-    caller = context.run.caller
-    if caller is None:
-        return 0, 0
-    targets = []
-    for run_id, (active, task) in list(session_manager.runs.items()):
-        other = active.run.caller
-        binding = active.state.get("_dsh_binding")
-        if (
-            not binding
-            or not other
-            or not task
-            or task.done()
-            or other.source == "webui"
-            or (other.platform, other.bot_id) != (caller.platform, caller.bot_id)
-        ):
-            continue
-        own_agent = binding["mode"] == "agent" and other.user_id == caller.user_id
-        same_scene = other.group_id == caller.group_id and (
-            bool(caller.group_id) or other.user_id == caller.user_id
-        )
-        if own_agent or (same_scene and (manage or other.user_id == caller.user_id)):
-            targets.append((run_id, active))
-    results = await asyncio.gather(
-        *(session_manager.stop(run_id) for run_id, _ in targets)
-    )
-    confirmed = sum(
-        stopped and active.run.operations.get("dsh", {}).get("stop") != "unknown"
-        for (_, active), stopped in zip(targets, results)
-    )
-    return confirmed, len(targets) - confirmed
-
-
 async def _run_dsh(
     context: RunContext,
     parts: list[Any],
@@ -415,3 +381,85 @@ async def run_dsh(
             )
         finally:
             await session_manager.finish(context)
+
+
+async def dsh_command(context, argument: str, *, current_mode: bool = False) -> str:
+    """执行 DSH 原生会话控制命令
+
+    参数:
+        context: 运行上下文
+        argument: 子命令与参数
+        current_mode: 按当前场景的 DSH 模式执行，否则为 Agent 模式
+
+    返回:
+        str: 执行结果
+    """
+    from zhenxun.services.ai.run.dsh_control import DshControl
+
+    from ._commands import AGENT_PRIVATE, require_admin
+    from ._sessions import Conversations
+
+    action, _, value = argument.strip().partition(" ")
+    settings = dsh_settings()
+    records = DshSessions.for_settings(settings)
+    persona = await Conversations.persona(
+        context.state["_conversation"], context.get_group_id(), context.get_user_id()
+    )
+    mode = await dsh_mode(context, persona) if current_mode else "agent"
+    if context.get_group_id() and mode == "agent":
+        # 群内重置针对本群共用的聊天会话；跨场景共用的 Agent 会话只在私聊管理
+        if current_mode and action == "reset":
+            mode = "chat"
+        elif action in {"ls", "new", "switch", "archive"}:
+            raise ValueError(AGENT_PRIVATE)
+    if mode == "agent":
+        await require_admin(context)
+    owner = records.owner(context, mode)
+    current = records._read()["owners"].get(owner)
+    if action in {"", "status"}:
+        state = await DshRuntime.status(settings)
+        return "\n".join(
+            f"{key}: {state.get(key)}"
+            for key in ("transport", "connected", "version", "reason", "native_ready")
+        )
+    if action in {"new", "ls", "reset", "archive"} and value:
+        raise ValueError(
+            "此 DSH 操作不接受名称、分页或额外目标；请使用完整会话 ID 切换。"
+        )
+    if action == "ls":
+        rows = await DshControl.list(settings, owner, mode=mode)
+        return (
+            "\n".join(
+                f"{r['remote_id']} · {r['title']} · {r.get('model') or '继承'}"
+                for r in rows[:30]
+            )
+            or "没有可接入的会话。"
+        )
+    if action in {"new", "switch"}:
+        if action == "switch" and not value:
+            raise ValueError("请提供 /ai dsh ls 中的完整会话 ID。")
+        selected = await DshControl.choose(
+            context.run.caller,
+            settings,
+            value if action == "switch" else None,
+            current["revision"] if current else 0,
+            mode=mode,
+        )
+        if action == "new" and context.get_group_id():
+            from ._buffer import ChatBuffer
+
+            ChatBuffer.reset(context.get_bot().self_id, context.get_group_id())
+        return (
+            f"已选择 {selected['remote_id']}；"
+            "回复到每次触发位置，原会话历史和设置保留。"
+        )
+    if not current:
+        raise ValueError("请先新建或选择 DSH 会话。")
+    if action in {"reset", "archive"}:
+        await DshControl.release(settings, current, archive=action == "archive")
+        if action == "reset":
+            await AIChatManager.reset(current["local_id"])
+        return "已解除关联；远端历史未删除。"
+    if action in {"model", "thinking", "mode"}:
+        return await DshControl.parameter(settings, current, action, value)
+    raise ValueError("不支持的 DSH 命令；未作为聊天内容发送。")

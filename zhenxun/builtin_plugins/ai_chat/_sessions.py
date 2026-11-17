@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import re
 from typing import ClassVar
 import uuid
+import weakref
 
 from tortoise.transactions import in_transaction
 
@@ -23,13 +24,34 @@ class ConversationConflict(ValueError):
 
 
 class Conversations:
-    _locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    _locks: ClassVar[weakref.WeakValueDictionary[str, asyncio.Lock]] = (
+        weakref.WeakValueDictionary()
+    )
     _changing: ClassVar[set[str]] = set()
 
-    @classmethod
-    async def preferences(cls, scene: str) -> dict:
-        """读取场景有效开关，继承值和显式覆盖使用同一解析路径。"""
-        return (await cls.resolve(scene))["effective"]
+    @staticmethod
+    async def disabled(scene: str, setting=None) -> bool:
+        """场景是否停用 AI，不加锁；场景未覆盖时继承群设置
+
+        参数:
+            scene: 场景标识
+            setting: 群设置，为空时按场景读取
+
+        返回:
+            bool: 是否停用
+        """
+        row = await AIChatScene.get_or_none(scene_id=scene)
+        value = (row.settings or {}).get("disabled") if row else None
+        if value is not None:
+            return bool(value)
+        if setting is None:
+            from zhenxun.models.ai_chat_group import AIChatGroup
+
+            from ._data_source import parse_session
+
+            _, group, _ = parse_session(scene)
+            setting = await AIChatGroup.get_setting(group) if group else None
+        return bool(setting and setting.disabled)
 
     @staticmethod
     async def base(scene: str) -> tuple[dict, dict]:
@@ -252,17 +274,15 @@ class Conversations:
             else None
         )
         if row.current_id and item is None:
-            raise ConversationConflict("当前对话记录不完整，请在会话页处理。")
+            # 当前对话已删除或归档时视为没有活跃对话
+            changed = await AIChatScene.filter(id=row.id, revision=row.revision).update(
+                current_id=None, revision=row.revision + 1
+            )
+            if not changed:
+                raise ConversationConflict("当前对话已变化，请重试。")
+            row.current_id, row.revision = None, row.revision + 1
         if (row.settings or {}).get("_scope_version") != 1:
-            _, legacy = await cls.base(scene)
-            old = {
-                key: value
-                for key, value in ((item.options or {}) if item else {}).items()
-                if key in {"model", "persona_id"} and value is not None
-            }
             settings = {
-                **old,
-                **legacy,
                 **(row.settings or {}),
                 "_scope_version": 1,
                 "_execution_revision": row.revision,

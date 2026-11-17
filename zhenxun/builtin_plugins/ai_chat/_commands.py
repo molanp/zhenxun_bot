@@ -27,7 +27,7 @@ COMMANDS = (
     ("switch", "/switch <编号或ID>", "history", True),
     ("archive", "/archive", "history", True),
     ("rename", "/rename <名称>", "local_history", True),
-    ("unarchive", "/unarchive <ID>", "local_history", True),
+    ("unarchive", "/unarchive <编号或ID>", "local_history", True),
     ("del", "/del", "local_history", True),
     ("history", "/history [页码] · /stats", "all", True),
     ("stats", "", "all", True),
@@ -64,6 +64,12 @@ COMMANDS = (
     ("approval", "/ai approval · /ai answer <问题ID> <回答>", "all", False),
 )
 ALIASES = {name for name, _, _, alias in COMMANDS if alias}
+SUBCOMMANDS = {name for name, *_ in COMMANDS} | {"help", "status", "answer"}
+AGENT_PRIVATE = "Agent 会话在私聊和各群之间共用，请私聊管理，避免在群内暴露桌面内容。"
+
+
+class CommandDenied(ValueError):
+    """权限不足；群聊中未 @ Bot 的控制命令被拒绝时不回复"""
 
 
 async def command_help(context: RunContext, runner: str) -> str:
@@ -109,7 +115,8 @@ def command_text(text: str) -> str | None:
         return None
     head, rest = parts[0], parts[1] if len(parts) > 1 else ""
     if head == "/ai":
-        return rest.strip() or "help"
+        sub = rest.split(maxsplit=1)[0] if rest.strip() else "help"
+        return (rest.strip() or "help") if sub in SUBCOMMANDS else None
     if not head.startswith("/") or head[1:] not in ALIASES:
         return None
     from arclet.alconna import command_manager
@@ -152,15 +159,41 @@ def select_number(key: tuple, items: list[tuple[str, str]], value: str | None):
         ):
             raise ValueError("列表已变化或编号失效，请先重新读取列表。")
         return cached[2][int(value) - 1]
-    matches = [ident for ident, label in items if value in {ident, label}]
+    matches = [
+        ident
+        for ident, label in items
+        if value in {ident, label, label.removesuffix("（当前）")}
+    ]
     if len(matches) != 1:
         raise ValueError("没有唯一匹配项，请先读取列表并使用完整 ID。")
     return matches[0]
 
 
+async def conversation_pairs(
+    scene: str, current: str | None, archived: bool
+) -> list[tuple[str, str]]:
+    """场景内的本地对话列表
+
+    参数:
+        scene: 场景标识
+        current: 当前对话 ID
+        archived: 是否列出已归档对话
+
+    返回:
+        list[tuple[str, str]]: 对话 ID 与名称，当前对话带标记
+    """
+    items = await AIChatConversation.filter(scene_id=scene, archived=archived).order_by(
+        "id"
+    )
+    return [
+        (i.session_id, i.name + ("（当前）" if i.session_id == current else ""))
+        for i in items
+    ]
+
+
 async def require_admin(context: RunContext) -> None:
     if not await PermissionUtils.check_superuser(context):
-        raise ValueError("此管理操作仅限真寻超级用户。")
+        raise CommandDenied("此管理操作仅限真寻超级用户。")
 
 
 async def require_scene(context: RunContext, *, reset: bool = False) -> None:
@@ -168,7 +201,7 @@ async def require_scene(context: RunContext, *, reset: bool = False) -> None:
         await PermissionUtils.check_superuser(context)
         or (reset and await PermissionUtils.check_admin_level(context, 1))
     ):
-        raise ValueError(
+        raise CommandDenied(
             "群对话由全群共享，此操作需要" + ("群管理员或超管。" if reset else "超管。")
         )
 
@@ -345,10 +378,14 @@ async def execute(bot, event, text: str) -> str:
         return await HITLController.command(context, command, argument)
     if command == "dsh":
         await require_admin(context)
+        from ._runner import dsh_command
+
         return await dsh_command(context, argument)
     if runner == "dsh" and command in {"new", "ls", "switch", "archive", "reset"}:
         if command != "ls":
             await require_scene(context, reset=command == "reset")
+        from ._runner import dsh_command
+
         return await dsh_command(
             context, command + (" " + argument if argument else ""), current_mode=True
         )
@@ -366,35 +403,18 @@ async def execute(bot, event, text: str) -> str:
         page = argument.replace("--archived", "").strip() or "1"
         if not page.isdigit() or not 1 <= int(page) <= 10000:
             raise ValueError("页码须为正整数。")
-        items = await AIChatConversation.filter(
-            scene_id=scene, archived=archived
-        ).order_by("id")
-        pairs = [
-            (
-                i.session_id,
-                i.name + ("（当前）" if i.session_id == snapshot["session_id"] else ""),
-            )
-            for i in items
-        ]
-        listing = select_number((*key, "sessions"), pairs, None).splitlines()
+        pairs = await conversation_pairs(scene, snapshot["session_id"], archived)
+        listing = select_number((*key, "sessions", archived), pairs, None)
+        listing = listing.splitlines()
         start = (int(page) - 1) * 10
         return "\n".join(listing[start : start + 10]) or "本页没有对话。"
     if command in {"new", "switch", "rename", "archive", "unarchive", "del", "reset"}:
         await require_scene(context, reset=command == "reset")
         target = None
         if command in {"switch", "unarchive"}:
-            items = await AIChatConversation.filter(
-                scene_id=scene, archived=command == "unarchive"
-            ).order_by("id")
-            pairs = [
-                (
-                    i.session_id,
-                    i.name
-                    + ("（当前）" if i.session_id == snapshot["session_id"] else ""),
-                )
-                for i in items
-            ]
-            target = select_number((*key, "sessions"), pairs, argument)
+            archived = command == "unarchive"
+            pairs = await conversation_pairs(scene, snapshot["session_id"], archived)
+            target = select_number((*key, "sessions", archived), pairs, argument)
         result = await Conversations.change(
             scene,
             {"del": "delete"}.get(command, command),
@@ -407,6 +427,12 @@ async def execute(bot, event, text: str) -> str:
     if command == "history":
         if runner == "local" and snapshot["session_id"] is None:
             return "当前没有活跃对话；请用 /ls 查看并选择已有对话。"
+        if runner == "dsh" and group:
+            from ._runner import dsh_mode
+
+            persona = await Conversations.persona(snapshot, group, user)
+            if await dsh_mode(context, persona) == "agent":
+                raise ValueError(AGENT_PRIVATE)
         from zhenxun.models.ai_chat_message import AIChatMessage
 
         if argument and (not argument.isdigit() or int(argument) < 1):
@@ -489,7 +515,7 @@ async def configure(context, snapshot, command, argument, key) -> str:
     """修改场景显式覆盖；模型选择按聊天、合成及识别能力隔离。"""
 
     settings = {}
-    resolved = await Conversations.resolve(snapshot["scene_id"], snapshot)
+    resolved = context.state["_scene_configuration"]
     if command in {"llm", "runner", "agent"}:
         name = {"llm": "disabled", "runner": "runner", "agent": "agent"}[command]
         if argument in {"", "status"}:
@@ -686,69 +712,3 @@ async def task_command(context, argument: str) -> str:
         raise ValueError("不支持的计划操作。")
     _, message = await handler(job.id)
     return message
-
-
-async def dsh_command(context, argument: str, *, current_mode: bool = False) -> str:
-    from zhenxun.services.ai.run.dsh import DshRuntime, DshSessions
-    from zhenxun.services.ai.run.dsh_control import DshControl
-
-    from ._runner import dsh_mode, dsh_settings
-
-    action, _, value = argument.strip().partition(" ")
-    settings = dsh_settings()
-    records = DshSessions.for_settings(settings)
-    persona = await Conversations.persona(
-        context.state["_conversation"], context.get_group_id(), context.get_user_id()
-    )
-    mode = await dsh_mode(context, persona) if current_mode else "agent"
-    if mode == "agent":
-        await require_admin(context)
-    owner = records.owner(context, mode)
-    current = records._read()["owners"].get(owner)
-    if action in {"", "status"}:
-        state = await DshRuntime.status(settings)
-        return "\n".join(
-            f"{key}: {state.get(key)}"
-            for key in ("transport", "connected", "version", "reason", "native_ready")
-        )
-    if action in {"new", "ls", "reset", "archive"} and value:
-        raise ValueError(
-            "此 DSH 操作不接受名称、分页或额外目标；请使用完整会话 ID 切换。"
-        )
-    if action == "ls":
-        rows = await DshControl.list(settings, owner, mode=mode)
-        return (
-            "\n".join(
-                f"{r['remote_id']} · {r['title']} · {r.get('model') or '继承'}"
-                for r in rows[:30]
-            )
-            or "没有可接入的会话。"
-        )
-    if action in {"new", "switch"}:
-        if action == "switch" and not value:
-            raise ValueError("请提供 /ai dsh ls 中的完整会话 ID。")
-        selected = await DshControl.choose(
-            context.run.caller,
-            settings,
-            value if action == "switch" else None,
-            current["revision"] if current else 0,
-            mode=mode,
-        )
-        if action == "new" and context.get_group_id():
-            from ._buffer import ChatBuffer
-
-            ChatBuffer.reset(context.get_bot().self_id, context.get_group_id())
-        return (
-            f"已选择 {selected['remote_id']}；"
-            "回复到每次触发位置，原会话历史和设置保留。"
-        )
-    if not current:
-        raise ValueError("请先新建或选择 DSH 会话。")
-    if action in {"reset", "archive"}:
-        await DshControl.release(settings, current, archive=action == "archive")
-        if action == "reset":
-            await AIChatManager.reset(current["local_id"])
-        return "已解除关联；远端历史未删除。"
-    if action in {"model", "thinking", "mode"}:
-        return await DshControl.parameter(settings, current, action, value)
-    raise ValueError("不支持的 DSH 命令；未作为聊天内容发送。")
