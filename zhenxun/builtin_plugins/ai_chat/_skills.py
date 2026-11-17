@@ -274,11 +274,14 @@ class SkillToolkit(BaseToolkit):
             return ResolvedToolPayload()
         payload = await super().resolve(context)
         lines = [f"- {s.name}：{s.description}" for s in skills]
-        payload.injected_prompts = [
+        instructions = (
             "## 技能\n"
             "下面是可用的技能。任务与某个技能相关时，先用 `read_skill` "
             "读取它的完整说明，再按说明去做；无关时不要读取。\n" + "\n".join(lines)
-        ]
+        )
+        payload.instruction_builders.append(
+            lambda names: [instructions] if "read_skill" in names else []
+        )
         return payload
 
     @tool(name="read_skill", description="读取一个技能的完整说明。")

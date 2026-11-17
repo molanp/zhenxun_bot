@@ -14,7 +14,11 @@ from zhenxun.services.ai.config import get_llm_config
 from zhenxun.services.ai.context.memory.engine import SessionMemoryContext
 from zhenxun.services.ai.context.memory.models import MemoryConfig
 from zhenxun.services.ai.core.engine.token_counter import token_counter
-from zhenxun.services.ai.core.exceptions import ControlFlowExit
+from zhenxun.services.ai.core.exceptions import (
+    ControlFlowExit,
+    InterventionHandledException,
+    RunBudgetExceeded,
+)
 from zhenxun.services.ai.core.messages import (
     LLMMessage,
     PromptInput,
@@ -25,10 +29,10 @@ from zhenxun.services.ai.core.models import CancellationToken
 from zhenxun.services.ai.core.options import GenerationConfig
 from zhenxun.services.ai.core.protocols.tool import ToolResolvable
 from zhenxun.services.ai.core.stream_events import EventBus
-from zhenxun.services.ai.llm.manager import resolve_model_profile
+from zhenxun.services.ai.llm.manager import get_default_model, resolve_model_profile
 from zhenxun.services.ai.llm.protocols import drop_tool_media, has_media
 from zhenxun.services.ai.message_builder import MessageBuilder
-from zhenxun.services.ai.run.context import RunContext
+from zhenxun.services.ai.run.context import RunContext, set_run_context
 from zhenxun.services.ai.run.di import DependencyInjector
 from zhenxun.services.ai.run.models import (
     AgentRunEnd,
@@ -75,6 +79,8 @@ def _prompt_text(prompt: PromptInput | None) -> str:
         return ""
     if isinstance(prompt, str):
         return prompt
+    if isinstance(prompt, LLMMessage):
+        return prompt.extract_text
     if isinstance(prompt, list):
         return " ".join(p.text for p in prompt if isinstance(p, TextPart))
     if extract := getattr(prompt, "extract_plain_text", None):
@@ -170,6 +176,8 @@ class Agent:
         ]
         | None = None,
         before_run: Callable[[], Awaitable[None]] | None = None,
+        prepare_run: Callable[[], Awaitable[tuple["Agent", PromptInput | None]]]
+        | None = None,
     ) -> AgentRunResult[Any]:
         """运行 Agent 并等待结果
 
@@ -186,14 +194,24 @@ class Agent:
         ctx: RunContext = context or RunContext()
         try:
             async with self.run_stream(
-                prompt, context=ctx, finalize=finalize, before_run=before_run
+                prompt,
+                context=ctx,
+                finalize=finalize,
+                before_run=before_run,
+                prepare_run=prepare_run,
             ) as stream:
                 return await stream.get_run_result()
         except ControlFlowExit as e:
             logger.info(f"[{self.name}] 运行中止: {type(e).__name__} - {e}")
             if not ctx.run.source:
                 await show_exit_notice(e, ctx)
-            return AgentRunResult(output="", usage=UsageInfo(), stopped=e)
+            return AgentRunResult(
+                output="",
+                usage=UsageInfo(),
+                stopped=e,
+                outcome=ctx.run.outcome or "skipped",
+                reason=str(e),
+            )
 
     @contextlib.asynccontextmanager
     async def run_stream(
@@ -206,6 +224,8 @@ class Agent:
         ]
         | None = None,
         before_run: Callable[[], Awaitable[None]] | None = None,
+        prepare_run: Callable[[], Awaitable[tuple["Agent", PromptInput | None]]]
+        | None = None,
     ) -> AsyncIterator[StreamedRunResult[Any]]:
         """流式运行 Agent，负责会话并发控制与事件总线挂载
 
@@ -218,6 +238,7 @@ class Agent:
         """
         ctx = context or RunContext()
         bus = EventBus()
+        bus.parent = ctx.state.get("_parent_event_bus")
         if not ctx.state.get("__is_root_run_executed__"):
             ctx.state["__is_root_run_executed__"] = True
             if ctx.get_bot() and ctx.get_event():
@@ -225,10 +246,62 @@ class Agent:
         text = _prompt_text(prompt)
         revision = session_manager.revision(ctx.session_id or "default_session")
 
+        finalized = False
+
+        async def finish_turn(result=None, error=None):
+            nonlocal finalized
+            if finalized:
+                return
+            finalized = True
+            run = ctx.run
+            if run.outcome == "unknown":
+                pass
+            elif run.operations.get("interruption"):
+                run.outcome = "interrupted"
+            elif isinstance(error, asyncio.TimeoutError):
+                run.outcome = "timeout"
+            elif isinstance(error, asyncio.CancelledError):
+                reason = run.cancellation_token.reason if run.cancellation_token else ""
+                run.outcome = "cancelled" if reason == "cancelled" else "interrupted"
+            elif isinstance(error, RunBudgetExceeded):
+                run.outcome = "exhausted"
+            elif error is not None:
+                run.outcome = (
+                    "skipped"
+                    if isinstance(error, InterventionHandledException)
+                    else "failed"
+                )
+            else:
+                run.outcome = getattr(result, "outcome", "completed")
+            await session_manager.phase(ctx, "settling" if error else "delivering")
+            if finalize:
+                await finalize(result, error)
+
         async def execution() -> None:
             cancel_token = ctx.run.cancellation_token or CancellationToken()
             ctx.run.cancellation_token = cancel_token
+            completed = None
+            failure = None
             try:
+                await session_manager.accept(ctx, text)
+                from zhenxun.services.ai.utils.runtime import PermissionUtils
+
+                async def admission_for(agent):
+                    if not ctx.run.follow_up or ctx.run.caller is None:
+                        return None
+                    superuser = await PermissionUtils.check_superuser(ctx)
+                    admin = superuser or await PermissionUtils.check_admin_level(ctx, 1)
+                    return (
+                        ctx.run.caller,
+                        superuser,
+                        admin,
+                        agent.name,
+                        ctx.state.get("_agent_active"),
+                        ctx.run.tool_ceiling,
+                        ctx.state.get("_configuration", {}).get("fingerprint"),
+                    )
+
+                admission = await admission_for(self)
                 async with session_manager.run_scope(
                     ctx.session_id or "default_session",
                     cancel_token,
@@ -238,7 +311,9 @@ class Agent:
                     else None,
                     sender=ctx.get_user_id() if ctx.run.follow_up else None,
                     revision=revision,
+                    admission=admission,
                 ):
+                    await session_manager.phase(ctx, "running")
                     budget = ctx.run.budget
                     if ctx.run.timeout:
                         budget.setdefault(
@@ -248,11 +323,19 @@ class Agent:
 
                     async def turn():
                         try:
+                            effective, prepared = self, prompt
+                            if prepare_run:
+                                effective, prepared = await prepare_run()
+                            cancel_token.raise_if_cancelled()
+                            session_manager.update_admission(
+                                ctx.session_id or "default_session",
+                                await admission_for(effective),
+                            )
                             if before_run:
                                 await before_run()
-                            await bus.emit(AgentRunStart(agent_name=self.name))
-                            result = await self._execute(
-                                prompt, text, ctx, cancel_token
+                            await bus.emit(AgentRunStart(agent_name=effective.name))
+                            result = await effective._execute(
+                                prepared, _prompt_text(prepared), ctx, cancel_token
                             )
                             cancel_token.raise_if_cancelled()
                             if revision != session_manager.revision(
@@ -267,36 +350,71 @@ class Agent:
                                 and not cancel_token.is_cancelled()
                             ):
                                 error = asyncio.TimeoutError("本轮执行超时")
-                            if finalize:
-                                await finalize(None, error)
+                            await finish_turn(None, error)
                             raise
-                        if finalize:
-                            await finalize(result, None)
-                        await bus.emit(AgentRunEnd(result=result))
+                        await finish_turn(result, None)
+                        return result
 
                     if deadline:
                         remaining = max(0.001, deadline - time.monotonic())
-                        await asyncio.wait_for(turn(), remaining)
+                        completed = await asyncio.wait_for(turn(), remaining)
                     else:
-                        await turn()
-            except asyncio.CancelledError:
+                        completed = await turn()
+            except asyncio.CancelledError as error:
+                await finish_turn(None, error)
                 logger.debug(f"[{self.name}] 执行被取消。")
-                await bus.emit(
-                    AgentRunError(error=asyncio.CancelledError("任务已被中止"))
-                )
+                failure = error
             except (ControlFlowExit, Exception) as e:
-                await bus.emit(AgentRunError(error=e))
+                await finish_turn(None, e)
+                failure = e
             finally:
-                await bus.end()
+                ctx.run.phase = "settling"
+                try:
+                    await session_manager.finish(ctx)
+                except Exception as error:
+                    ctx.run.outcome = "unknown"
+                    failure = error
+                finally:
+                    try:
+                        if failure is not None:
+                            await bus.emit(AgentRunError(error=failure))
+                        elif completed is not None:
+                            await bus.emit(AgentRunEnd(result=completed))
+                    finally:
+                        await bus.end()
 
         ctx.run.event_bus = bus
-        task = asyncio.create_task(execution())
+        if ctx.run.cancellation_token is None:
+            ctx.run.cancellation_token = CancellationToken()
+        session_manager.register(ctx)
+        with set_run_context(ctx):
+            task = asyncio.create_task(execution())
+        session_manager.register(ctx, task)
         try:
             yield StreamedRunResult[Any](bus)
         finally:
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            if not task.done() and ctx.run.phase != "settling":
+                ctx.run.cancellation_token.cancel("source_closed")
+            _, pending = await asyncio.wait(
+                {task},
+                timeout=(
+                    session_manager.cleanup_remaining(ctx)
+                    if ctx.run.cancellation_token.is_cancelled()
+                    else 10
+                ),
+            )
+            if pending:
+                ctx.run.outcome = "unknown"
+                if ctx.run.source:
+                    from zhenxun.models.ai_agent_run import AIAgentRun
+
+                    await AIAgentRun.filter(run_id=ctx.run.run_id).update(
+                        status="unknown",
+                        details={
+                            **session_manager.details(ctx),
+                            "cleanup": "unconfirmed",
+                        },
+                    )
 
     def _effective_config(self) -> AgentConfig:
         """未显式设置的循环相关字段取全局 agent_settings
@@ -330,12 +448,32 @@ class Agent:
             if text and text.strip()
         )
         reminders: list[str] = []
+        sources = [
+            {
+                "source": "persona_and_capabilities",
+                "role": "system",
+                "characters": sum(map(len, static)),
+                "count": len(static),
+                "temporary": True,
+            }
+        ]
         for func in self.dynamic_prompts:
+            before = len(reminders)
             res = await _call_with_deps(func, context)
             for item in res if isinstance(res, list) else [res]:
                 text = item.extract_text if isinstance(item, LLMMessage) else item
                 if text and str(text).strip():
                     reminders.append(str(text))
+            sources.append(
+                {
+                    "source": getattr(func, "__name__", "dynamic_prompt"),
+                    "role": "user",
+                    "temporary": True,
+                    "characters": sum(map(len, reminders[before:])),
+                    "count": len(reminders) - before,
+                }
+            )
+        context.state["_prompt_sources"] = sources
         return static, reminders
 
     async def _build_tools(
@@ -354,20 +492,53 @@ class Agent:
         payload = await resolve_tools(
             [*self.tool_definitions, *await capability.get_tools(context)], context
         )
-        defs = [
-            d
-            for t in payload.tools
-            if hasattr(t, "get_definition") and (d := await t.get_definition(context))
-        ]
+        candidates = {}
+        conflicts = set()
+        for tool in payload.tools:
+            if not hasattr(tool, "get_definition"):
+                continue
+            definition = await tool.get_definition(context)
+            if definition is None:
+                continue
+            name = definition.name.lower()
+            identity = tool.identity
+            if (
+                context.run.tool_ceiling is not None
+                and identity not in context.run.tool_ceiling
+            ):
+                continue
+            if name in candidates and candidates[name][0].identity != identity:
+                conflicts.add(name)
+            else:
+                candidates.setdefault(name, (tool, definition))
+        if conflicts:
+            context.state["_tool_conflicts"] = sorted(conflicts)
+            logger.warning(f"同名工具来源冲突，已排除: {', '.join(sorted(conflicts))}")
+        candidates = {k: v for k, v in candidates.items() if k not in conflicts}
+        defs = [definition for _, definition in candidates.values()]
         defs = list(await capability.prepare_tools(context, defs) or [])
         defs_by_name = {d.name.lower(): d for d in defs if d}
         tools = []
-        for t in payload.tools:
-            name = getattr(t, "name", "unknown").lower()
+        for name, (t, _) in candidates.items():
             if name in defs_by_name:
                 tool = copy.copy(t)
                 setattr(tool, "_dynamic_def", defs_by_name.pop(name))
                 tools.append(tool)
+        context.run.available_tools = frozenset(tool.identity for tool in tools)
+        context.run.bound_tools = {tool.identity: tool for tool in tools}
+        context.state["_available_tool_names"] = {tool.name for tool in tools}
+        names = frozenset(tool.name for tool in tools)
+        for build in payload.instruction_builders:
+            payload.injected_prompts.extend(build(names))
+        payload.injection_sources.append(
+            {
+                "source": "filtered_tool_instructions",
+                "role": "system",
+                "characters": sum(map(len, payload.injected_prompts)),
+                "count": len(payload.injected_prompts),
+                "temporary": True,
+            }
+        )
         return ToolCollection(tools), payload
 
     async def _prepare(
@@ -390,6 +561,21 @@ class Agent:
         tools, payload = await self._build_tools(context, resources.capability)
         static.extend(payload.injected_prompts)
         reminders.extend(payload.reminders)
+        context.state["_injections"] = {
+            "system": {
+                "count": len(static),
+                "characters": sum(map(len, static)),
+                "temporary": True,
+            },
+            "reminders": {
+                "count": len(reminders),
+                "characters": sum(map(len, reminders)),
+                "temporary": True,
+            },
+            "tools": sorted(tool.name for tool in tools),
+            "sources": context.state.get("_prompt_sources", [])
+            + payload.injection_sources,
+        }
         model = context.run.current_model or ""
         overhead = sum(token_counter._count_text(p) for p in [*static, *reminders])
         for t in tools:
@@ -418,6 +604,15 @@ class Agent:
                 msgs[-1].metadata = {**(msgs[-1].metadata or {}), **history}
             messages.append(msgs[-1])
             state._input = msgs[-1]
+            context.state["_injections"]["sources"].append(
+                {
+                    "source": "current_input_with_background",
+                    "role": "user",
+                    "characters": len(msgs[-1].extract_text),
+                    "count": 1,
+                    "temporary": memory is None,
+                }
+            )
             if memory:
                 if has_media(msgs[-1]):
                     state._pending_input = msgs[-1]
@@ -453,7 +648,7 @@ class Agent:
         if not context.run.current_model:
             context.run.current_model = (
                 self.model_name() if callable(self.model_name) else self.model_name
-            )
+            ) or get_default_model("chat")
         memory = None
         if not self.stateless:
             memory = SessionMemoryContext(

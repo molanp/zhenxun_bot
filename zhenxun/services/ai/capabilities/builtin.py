@@ -111,6 +111,9 @@ class PermissionCapability(AbstractCapability):
         admin_level = _get_tool_meta(tool, "admin_level", 0)
         if admin_level > 0:
             if not await PermissionUtils.check_admin_level(context, admin_level):
+                context.run.operations["permission_reason"] = context.state.get(
+                    "_permission_reason", "缺少群管理授权"
+                )
                 msg = (
                     "系统警告：用户权限不足（仅限群主或管理员）。"
                     "请温和地向用户解释权限不足，并拒绝执行。"
@@ -140,12 +143,18 @@ class ToolRetryAndReflectionCapability(AbstractCapability):
         try:
             result = await handler(arguments)
         except Exception as error:
+            from zhenxun.services.ai.run.context import interrupt_transport
+
+            interrupt_transport(error, "tool")
             readonly = bool(
                 _get_tool_meta(context.call.current_tool, "read_only", False)
             ) and not isinstance(error, PermissionError)
             result = ToolResult(
                 output=f"工具执行失败（{type(error).__name__}），未确认完成。"
-            ).as_error(readonly)
+            ).as_error(
+                readonly,
+                uncertain=not readonly and not isinstance(error, PermissionError),
+            )
             logger.warning(f"工具 {tool_name} 失败: {type(error).__name__}")
         if not isinstance(result, ToolResult) or not result.is_error:
             context.run.tool_retries.pop(tool_name, None)
@@ -197,6 +206,9 @@ class ReflexionCapability(AbstractCapability):
         try:
             return await handler(arguments)
         except Exception as error:
+            from zhenxun.services.ai.run.context import interrupt_transport
+
+            interrupt_transport(error, "tool")
             from zhenxun.services.ai.tools.models import ToolResult
 
             if isinstance(error, ToolRetryError | ModelRetry):

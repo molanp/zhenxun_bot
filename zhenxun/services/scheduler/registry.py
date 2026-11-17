@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Awaitable, Callable
 
 from arclet.alconna import Alconna, Option
@@ -26,6 +27,19 @@ class SchedulerRegistry:
             str, Callable[[str, Bot], Awaitable[list[str | None]]]
         ] = {}
         self.running_tasks: set[int] = set()
+        self.running_handles: dict[int, set[asyncio.Task]] = {}
+
+    async def stop_running(self, schedule_id: int) -> bool:
+        """取消计划的当前执行并等待清理，不修改未来触发定义。"""
+        tasks = set(self.running_handles.get(schedule_id, ()))
+        if asyncio.current_task() in tasks:
+            return False
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return True
+        _, pending = await asyncio.wait(tasks, timeout=10)
+        return not pending
 
     def register_target_resolver(
         self,

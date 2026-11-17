@@ -2,6 +2,7 @@
 工具系统域类型定义
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,11 +24,18 @@ class ToolResult(BaseModel):
     """是否发生了业务级别的错误"""
     is_retryable: bool = Field(default=True)
     """标记该错误是否允许大模型进行自愈反思重试"""
+    uncertain: bool = False
+    """外部操作可能已经执行，不能按普通失败重放。"""
+    reused: bool = False
+    """返回本轮已经完成的操作结果，没有再次执行。"""
 
-    def as_error(self, is_retryable: bool = True) -> "ToolResult":
+    def as_error(
+        self, is_retryable: bool = True, *, uncertain: bool = False
+    ) -> "ToolResult":
         """链式方法：标记此结果为错误，并引导大模型在下一轮进行重试自愈"""
         self.is_error = True
         self.is_retryable = is_retryable
+        self.uncertain = uncertain
         return self
 
 
@@ -95,12 +103,20 @@ class ResolvedToolPayload:
     """不随运行变化的说明，进入系统提示词"""
     reminders: list[str] = field(default_factory=list)
     """随运行变化的提示（如检索结果），只贴在本轮用户消息末尾"""
+    instruction_builders: list[Callable[[frozenset[str]], list[str]]] = field(
+        default_factory=list
+    )
+    """根据最终可用工具生成操作说明，不持久化回调。"""
+    injection_sources: list[dict[str, Any]] = field(default_factory=list)
+    """来源、长度与生命周期摘要，不包含注入正文。"""
 
     def merge(self, other: "ResolvedToolPayload") -> "ResolvedToolPayload":
         """将另一个解析载荷合并到当前载荷中"""
         self.tools.extend(other.tools)
         self.injected_prompts.extend(other.injected_prompts)
         self.reminders.extend(other.reminders)
+        self.instruction_builders.extend(other.instruction_builders)
+        self.injection_sources.extend(other.injection_sources)
         return self
 
 

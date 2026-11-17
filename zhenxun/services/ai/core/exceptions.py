@@ -64,6 +64,19 @@ class ControlFlowExit(BaseException):
     pass
 
 
+class RunInterrupted(ControlFlowExit):
+    """本轮通信未完成，禁止恢复请求或让模型继续执行。"""
+
+    def __init__(self, stage: str):
+        self.reason = "network"
+        self.stage = stage
+        super().__init__(f"本轮在 {stage} 阶段中断")
+
+
+class RunBudgetExceeded(ControlFlowExit):
+    """根运行及子代理共享的模型请求预算已经用完。"""
+
+
 class ToolFatalError(ControlFlowExit):
     """
     致命工具异常（不可恢复）。

@@ -34,6 +34,7 @@ from zhenxun.services.ai.utils.logger import log_llm as logger
 from . import (
     ChatStream,
     HttpCall,
+    deepseek_server_tool,
     dump_arguments,
     encodable_inputs,
     ensure_content,
@@ -199,12 +200,16 @@ async def build_chat(route, request: ChatRequest) -> HttpCall:
         elif kind == "required":
             body["tool_choice"] = "required"
     for tool in server:
-        payload = _server_tool(tool)
         type_id = getattr(tool, "type_id", "")
+        payload = deepseek_server_tool(route, type_id) or _server_tool(tool)
         if payload and native_tool_allowed(route, type_id):
             tools.append(payload)
             vendor = detect_preset(route.base_url) or route.provider.preset
-            if type_id == "web_search" and vendor in _SOURCE_VENDORS:
+            if (
+                type_id == "web_search"
+                and vendor in _SOURCE_VENDORS
+                and vendor != "deepseek"
+            ):
                 body.setdefault("include", []).append("web_search_call.action.sources")
         else:
             logger.warning(
@@ -299,13 +304,24 @@ def parse_chat(route, request: ChatRequest, payload: dict[str, Any]) -> ChatResp
             ).strip()
             replay = {
                 k: item[k]
-                for k in ("type", "id", "summary", "encrypted_content")
+                for k in (
+                    "type",
+                    "id",
+                    "summary",
+                    "encrypted_content",
+                    "content",
+                    "signature",
+                )
                 if k in item
             }
             parts.append(
                 ThoughtPart(
                     thought_text=text, metadata=replay_metadata(PROTOCOL, replay)
                 )
+            )
+        elif kind == "web_search_call" and deepseek_server_tool(route, "web_search"):
+            parts.append(
+                ThoughtPart(thought_text="", metadata=replay_metadata(PROTOCOL, item))
             )
         elif kind == "message":
             for content in item.get("content") or []:

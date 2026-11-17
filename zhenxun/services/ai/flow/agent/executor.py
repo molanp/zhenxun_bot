@@ -7,7 +7,7 @@ from zhenxun.services.ai.core.engine.token_counter import (
     parse_usage_info,
     token_counter,
 )
-from zhenxun.services.ai.core.exceptions import LLMException, UpstreamServerException
+from zhenxun.services.ai.core.exceptions import LLMException
 from zhenxun.services.ai.core.messages import (
     AssistantMessage,
     ChatRequest,
@@ -60,6 +60,9 @@ class AgentExecutor:
             AgentRunResult[Any]: 运行结果
         """
         cycle = 0
+        resources.run_context.run.budget.setdefault(
+            "model_limit", resources.config.max_cycles
+        )
         while cycle < resources.config.max_cycles:
             state.current_cycle = cycle
             if token := resources.run_context.run.cancellation_token:
@@ -117,8 +120,20 @@ class AgentExecutor:
         for prompt in session_manager.drain_follow_ups(
             context.session_id or "default_session"
         ):
+            if context.run.prepare_follow_up:
+                prompt = await context.run.prepare_follow_up(prompt)
             if msgs := await MessageBuilder.normalize_to_llm_messages(prompt):
                 context.run.messages.append(msgs[-1])
+                if injections := context.state.get("_injections"):
+                    injections["sources"].append(
+                        {
+                            "source": "follow_up_with_background",
+                            "role": "user",
+                            "characters": len(msgs[-1].extract_text),
+                            "count": 1,
+                            "temporary": resources.memory_context is None,
+                        }
+                    )
                 state.should_reset_cycle = True
 
     async def _invoke_and_record(
@@ -143,6 +158,14 @@ class AgentExecutor:
         """
         run_context = resources.run_context
         flattened = await self._fit_request(messages, tools, state, resources)
+        budget = run_context.run.budget
+        if budget.get("model_calls", 0) >= budget.get(
+            "model_limit", resources.config.max_cycles
+        ):
+            from zhenxun.services.ai.core.exceptions import RunBudgetExceeded
+
+            raise RunBudgetExceeded("本轮模型调用预算已用完，未继续请求。")
+        budget["model_calls"] = budget.get("model_calls", 0) + 1
         model_name = run_context.run.current_model
         await run_context.run.emit(
             LLMStartEvent(model_name=model_name or "unknown", messages=flattened)
@@ -326,6 +349,15 @@ class AgentExecutor:
             if text and text.strip()
         ]
         history = list(run_context.run.messages)
+        if injections := run_context.state.get("_injections"):
+            dynamic = list(run_context.run.dynamic_prompts.values())
+            injections["dynamic"] = {
+                "source": "runtime_reminders",
+                "role": "user",
+                "characters": sum(len(text) for text in dynamic),
+                "count": len(dynamic),
+                "temporary": True,
+            }
         texts = [
             text
             for text in [*state.reminders, *run_context.run.dynamic_prompts.values()]
@@ -382,6 +414,8 @@ class AgentExecutor:
                 event_bus,
                 call.tool_name,
                 call.args if isinstance(call.args, dict) else {},
+                resources.run_context,
+                call.id,
             ) as box:
                 box["result"] = ToolResult(output=returns[call.id].output)
         return bool(state.current_tool_calls)
@@ -433,7 +467,9 @@ class AgentExecutor:
         run_context = resources.run_context
         max_cycles = resources.config.max_cycles
         if not resources.config.enable_fallback_summary:
-            raise UpstreamServerException(
+            from zhenxun.services.ai.core.exceptions import RunBudgetExceeded
+
+            raise RunBudgetExceeded(
                 f"超过最大工具调用循环次数 ({max_cycles})。",
             )
         logger.warning(f"达到最大循环次数 ({max_cycles})，触发兜底总结机制。")
@@ -450,4 +486,5 @@ class AgentExecutor:
         )
         self._finish(state, resources, response.text)
         assert state.pending_result is not None
+        state.pending_result.outcome = "exhausted"
         return state.pending_result

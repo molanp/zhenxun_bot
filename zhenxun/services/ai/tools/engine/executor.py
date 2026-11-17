@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
 import inspect
 import json
 from typing import Any
@@ -86,7 +87,7 @@ class ToolExecutor:
         usage = None
 
         if isinstance(res_or_exc, BaseException):
-            if isinstance(res_or_exc, ControlFlowExit):
+            if isinstance(res_or_exc, ControlFlowExit | asyncio.CancelledError):
                 raise res_or_exc
             final_content = json.dumps(
                 {"error": str(res_or_exc), "status": "failed"},
@@ -145,11 +146,18 @@ class ToolExecutor:
         event_bus: EventBus | None,
         tool_name: str,
         arguments: dict[str, Any],
+        context: RunContext | None = None,
+        tool_call_id: str | None = None,
     ):
         """生命周期上下文管理器：接管事件流的发送与异常包装样板代码"""
+        ids = {
+            "run_id": context.run.run_id if context else None,
+            "parent_run_id": context.run.parent_run_id if context else None,
+            "tool_call_id": tool_call_id,
+        }
         if event_bus:
             await event_bus.emit(
-                ToolCallStartEvent(tool_name=tool_name, arguments=arguments)
+                ToolCallStartEvent(tool_name=tool_name, arguments=arguments, **ids)
             )
         result_box: dict[str, Any] = {}
         try:
@@ -159,7 +167,7 @@ class ToolExecutor:
                 res = result_box["result"]
                 await event_bus.emit(
                     ToolCallEndEvent(
-                        tool_name=tool_name, result=res, is_error=res.is_error
+                        tool_name=tool_name, result=res, is_error=res.is_error, **ids
                     )
                 )
 
@@ -283,6 +291,40 @@ class ToolExecutor:
         context: RunContext | None = None,
         event_bus: EventBus | None = None,
     ) -> tuple[ToolCallPart, ToolResult]:
+        """执行当前授权的工具；根运行中的写操作串行且未知结果不得重放。"""
+        from zhenxun.services.ai.utils.runtime import PermissionUtils
+
+        tool = validated.tool
+        if context is None or tool is None or not validated.args_valid:
+            return await self._execute_tool_call_unlocked(validated, context, event_bus)
+        PermissionUtils.ensure_current(context)
+        identity = tool.identity
+        if (
+            context.run.tool_ceiling is not None
+            and identity not in context.run.tool_ceiling
+        ):
+            return validated.call, ToolResult(
+                output="该工具不在父代理允许的范围内，未执行。"
+            ).as_error(False)
+        metadata = getattr(tool, "metadata", None) or {}
+        if metadata.get("read_only") is True or metadata.get("delegates") is True:
+            return await self._execute_tool_call_unlocked(validated, context, event_bus)
+        operations = context.run.operations
+        lock = operations.setdefault("write_lock", asyncio.Lock())
+        async with lock:
+            PermissionUtils.ensure_current(context)
+            if identity in operations.setdefault("uncertain_tools", set()):
+                return validated.call, ToolResult(
+                    output="该工具此前的操作结果未确认，本轮不再执行。"
+                ).as_error(False, uncertain=True)
+            return await self._execute_tool_call_unlocked(validated, context, event_bus)
+
+    async def _execute_tool_call_unlocked(
+        self,
+        validated: ValidatedToolCall,
+        context: RunContext | None = None,
+        event_bus: EventBus | None = None,
+    ) -> tuple[ToolCallPart, ToolResult]:
         """核心执行阶段。只接收已经通过 Validation 阶段的 ValidatedToolCall 载体。"""
         tool_name = validated.call.tool_name
         if not validated.args_valid or validated.tool is None:
@@ -308,20 +350,54 @@ class ToolExecutor:
             context, validated.call.id, tool_name, executable, event_bus
         )
         combined_cap = self._get_combined_capability(executable, safe_context)
+        started = False
+        metadata = getattr(executable, "metadata", None) or {}
+        mutating = not (
+            metadata.get("read_only") is True or metadata.get("delegates") is True
+        )
+        identity = executable.identity
+        operations = safe_context.run.operations
+        signature = (
+            identity
+            + ":"
+            + hashlib.sha256(
+                json.dumps(
+                    arguments, sort_keys=True, ensure_ascii=False, default=str
+                ).encode()
+            ).hexdigest()
+        )
 
         async def inner_handler(args_inner: dict) -> Any:
+            nonlocal started
+            from zhenxun.services.ai.utils.runtime import PermissionUtils
+
+            PermissionUtils.ensure_current(safe_context)
+            completed = operations.setdefault("completed_operations", {})
+            if mutating and signature in completed:
+                operations["reused_operations"] = (
+                    operations.get("reused_operations", 0) + 1
+                )
+                return completed[signature].model_copy(
+                    update={"usage": None, "reused": True}
+                )
+            started = True
             call = executable.execute(context=safe_context, **args_inner)
             if not (timeout := _tool_timeout(executable)):
                 return await call
             try:
                 return await asyncio.wait_for(call, timeout)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as error:
+                from zhenxun.services.ai.run.context import interrupt_network
+
+                interrupt_network("tool_timeout", error)
                 metadata = getattr(executable, "metadata", None) or {}
                 return ToolResult(
                     output=f"工具执行超时（{timeout} 秒），执行结果未确认。"
-                ).as_error(bool(metadata.get("read_only")))
+                ).as_error(metadata.get("read_only") is True, uncertain=mutating)
 
-        async with self._tool_stream_scope(event_bus, tool_name, arguments) as box:
+        async with self._tool_stream_scope(
+            event_bus, tool_name, arguments, safe_context, validated.call.id
+        ) as box:
             with set_run_context(safe_context):
                 try:
                     result = await combined_cap.wrap_tool_execute(
@@ -331,14 +407,27 @@ class ToolExecutor:
                         result = ToolResult(output=result)
                 except BaseException as e:
                     if isinstance(e, ControlFlowExit | asyncio.CancelledError):
+                        if started and mutating:
+                            operations.setdefault("uncertain_tools", set()).add(
+                                identity
+                            )
                         raise e
+                    from zhenxun.services.ai.run.context import interrupt_transport
+
+                    if started and mutating:
+                        operations.setdefault("uncertain_tools", set()).add(identity)
+                    interrupt_transport(e, "tool")
                     safe_context.state.setdefault("_disabled_tools", set()).add(
                         tool_name
                     )
                     logger.error(f"工具执行链未完成: {type(e).__name__}")
                     result = ToolResult(
                         output="工具执行结果无法确认，本轮不要重试，请用已有信息回答。"
-                    ).as_error(False)
+                    ).as_error(False, uncertain=started and mutating)
+            if mutating and result.uncertain:
+                operations.setdefault("uncertain_tools", set()).add(identity)
+            elif mutating and started and not result.is_error:
+                operations.setdefault("completed_operations", {})[signature] = result
             box["result"] = result
 
         return validated.call, box["result"]
@@ -363,16 +452,45 @@ class ToolExecutor:
                 结果，出错的调用对应异常对象；遇到中止或取消后不再执行后续调用
         """
         size = len(validated_calls)
-        chunks = [list(range(size))] if parallel else [[i] for i in range(size)]
+        chunks: list[list[int]] = []
+        reads: list[int] = []
+        for index, validated in enumerate(validated_calls):
+            metadata = getattr(validated.tool, "metadata", None) or {}
+            if parallel and (
+                metadata.get("read_only") is True or metadata.get("delegates") is True
+            ):
+                reads.append(index)
+                continue
+            if reads:
+                chunks.append(reads)
+                reads = []
+            chunks.append([index])
+        if reads:
+            chunks.append(reads)
         results: list[tuple[ToolCallPart, ToolResult] | BaseException] = []
         for chunk in chunks:
-            chunk_results = await asyncio.gather(
-                *[
+            tasks = [
+                asyncio.create_task(
                     self.execute_tool_call(validated_calls[i], context, event_bus)
-                    for i in chunk
-                ],
-                return_exceptions=True,
-            )
+                )
+                for i in chunk
+            ]
+            try:
+                done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_EXCEPTION
+                )
+                if any(
+                    t.cancelled() or isinstance(t.exception(), ControlFlowExit)
+                    for t in done
+                ):
+                    for task in pending:
+                        task.cancel()
+                chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
             results.extend(chunk_results)
             stop = next(
                 (

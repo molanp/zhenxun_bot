@@ -16,7 +16,7 @@ from zhenxun.services.ai.message_builder import MessageBuilder
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
-from zhenxun.services.ai.tools.models import ToolResult
+from zhenxun.services.ai.tools.models import ToolOptions, ToolResult
 from zhenxun.services.ai.utils.utils import MediaFetchError, fetch_media
 from zhenxun.services.hot_query_cache import get_member_names
 from zhenxun.services.log import logger
@@ -541,6 +541,7 @@ class QQToolkit(BaseToolkit):
 
     @tool(
         name="get_group_history",
+        rules=ToolOptions(metadata={"read_only": True}),
         description=(
             "读取当前群的聊天记录（含你自己的发言），按时间正序，每条带消息 id。"
             "count 最多 50；before_id 为空读最新的，填消息 id 时读这条之前的。"
@@ -563,6 +564,7 @@ class QQToolkit(BaseToolkit):
 
     @tool(
         name="get_message_detail",
+        rules=ToolOptions(metadata={"read_only": True}),
         description=(
             "查看当前群一条消息的完整内容，包括图片、表情、合并转发和引用的消息。"
         ),
@@ -590,6 +592,7 @@ class QQToolkit(BaseToolkit):
 
     @tool(
         name="get_active_members",
+        rules=ToolOptions(metadata={"read_only": True}),
         description="统计当前群最近 minutes 分钟（最多 1440）里发言的成员和次数。",
     )
     async def get_active_members(
@@ -618,6 +621,7 @@ class QQToolkit(BaseToolkit):
 
     @tool(
         name="get_group_member_info",
+        rules=ToolOptions(metadata={"read_only": True}),
         description=(
             "查询当前群某位成员的资料：群名片、昵称、身份、头衔、等级、性别、年龄、"
             "地区、入群与最后发言时间、禁言状态等。"
@@ -681,6 +685,7 @@ class QQToolkit(BaseToolkit):
 
     @tool(
         name="wait_for_messages",
+        rules=ToolOptions(metadata={"read_only": True}),
         description=(
             "等待当前群的新消息，收到 count 条（最多 20）或等满 seconds 秒（最多 60）"
             "后返回期间的新消息。适合对方可能还没说完时先等一等。"

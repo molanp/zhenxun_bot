@@ -40,6 +40,7 @@ _SECTIONS = {
     "context": "context_settings",
     "agent": "agent_settings",
     "web_search": "web_search",
+    "deepseek_tools": "deepseek_tools",
     "advanced": None,
 }
 _ADVANCED_KEYS = {"client_settings", "debug_log"}

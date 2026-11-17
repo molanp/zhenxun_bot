@@ -387,6 +387,26 @@ def register_llm_configs():
 
     Config.add_plugin_config(
         "AI",
+        "deepseek_tools",
+        model_dump(llm_config.deepseek_tools),
+        help=(
+            "DeepSeek 独立工具 API，默认关闭收费媒体转换。provider 为已保存的官方"
+            "服务商名称，留空自动选择；ocr_enabled 仅在无视觉模型时识别图片文字，"
+            "asr_enabled/tts_enabled 仅在未指定对应模型时生效；"
+            "voice 为 stella 或 tide；timeout 为请求总超时秒数。"
+            "不使用 DSH 登录凭据，不修改 DSH 原生工具。"
+        ),
+        type=dict,
+        ui={
+            "label": "DeepSeek 工具",
+            "section": "deepseek_tools",
+            "component": "object",
+            "order": 26,
+        },
+    )
+
+    Config.add_plugin_config(
+        "AI",
         "PROVIDERS",
         [],
         help=(
@@ -450,6 +470,7 @@ def get_llm_config() -> LLMConfig:
         "agent_settings": ai_config.get("agent_settings", {}),
         "sandbox": ai_config.get("sandbox", {}),
         "web_search": ai_config.get("web_search", {}),
+        "deepseek_tools": ai_config.get("deepseek_tools", {}),
     }
 
     return parse_as(LLMConfig, config_data)

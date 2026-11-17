@@ -10,7 +10,7 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 from mcp import ClientSession  # type: ignore
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamable_http_client
+from mcp.client.streamable_http import StreamableHTTPTransport
 from mcp.shared.message import SessionMessage
 from mcp.types import PaginatedRequestParams
 from pydantic import ValidationError
@@ -28,6 +28,106 @@ from zhenxun.utils.pydantic_compat import model_dump
 
 _MESSAGE_START_CHARS = {"{", "["}
 _LITERAL_PREFIXES: tuple[str, ...] = ("true", "false", "null")
+
+
+class _RunTransport(StreamableHTTPTransport):
+    """MCP 请求响应按调用上下文决定是否允许断流续接。"""
+
+    def active_contexts(self):
+        return ()
+
+    async def handle_get_stream(self, client, read_stream_writer):
+        """通知流断开时中断受影响 AI 运行，其他调用保留 SDK 的连接恢复规则。"""
+        from mcp.client.streamable_http import (
+            DEFAULT_RECONNECTION_DELAY_MS,
+            MAX_RECONNECTION_ATTEMPTS,
+        )
+        from mcp.shared._httpx_utils import sse_within_origin
+
+        attempt, last_event_id, retry_ms = 0, None, DEFAULT_RECONNECTION_DELAY_MS
+        while attempt < MAX_RECONNECTION_ATTEMPTS:
+            if not self.session_id:
+                return
+            headers = self._prepare_headers()
+            if last_event_id:
+                headers["Last-Event-ID"] = last_event_id
+            try:
+                async with sse_within_origin(
+                    client,
+                    self.url,
+                    headers=headers,
+                    max_event_size=self.max_sse_event_size,
+                ) as source:
+                    if source.response.status_code == 405:
+                        return
+                    source.response.raise_for_status()
+                    async for event in source:
+                        last_event_id = event.id or last_event_id
+                        retry_ms = event.retry if event.retry is not None else retry_ms
+                        await self._handle_sse_event(event, read_stream_writer)
+                attempt = 0
+            except Exception:
+                attempt += 1
+            active = list(self.active_contexts())
+            strict = [ctx for ctx in active if ctx and ctx.run.fail_fast]
+            for ctx in strict:
+                ctx.run.operations["interruption"] = "mcp_notification_stream"
+                token = ctx.run.cancellation_token
+                while token and token.parent:
+                    token = token.parent
+                if token:
+                    token.cancel("network")
+            if strict and len(strict) == len(active):
+                return
+            if attempt < MAX_RECONNECTION_ATTEMPTS:
+                await anyio.sleep(retry_ms / 1000)
+
+    async def _handle_reconnection(
+        self, ctx, last_event_id, retry_interval_ms=None, attempt=0
+    ):
+        from zhenxun.services.ai.run.context import fail_fast_enabled
+
+        if fail_fast_enabled():
+            await self._resolve_abandoned_request(
+                ctx.read_stream_writer,
+                ctx.session_message.message.id,
+                "AI run interrupted: response stream ended",
+            )
+            return
+        await super()._handle_reconnection(
+            ctx, last_event_id, retry_interval_ms, attempt
+        )
+
+
+@asynccontextmanager
+async def _streamable_transport(url: str, http_client, active_contexts):
+    """沿用 SDK 传输与发送者上下文，只覆盖 AI 请求的断流恢复策略。"""
+    from mcp.shared._context_streams import create_context_streams
+
+    transport = _RunTransport(url)
+    transport.active_contexts = active_contexts
+    incoming, reader = create_context_streams[SessionMessage | Exception](0)
+    writer, outgoing = create_context_streams[SessionMessage](0)
+    async with incoming, reader, writer, outgoing, anyio.create_task_group() as group:
+
+        def start_get_stream():
+            group.start_soon(transport.handle_get_stream, http_client, incoming)
+
+        group.start_soon(
+            transport.post_writer,
+            http_client,
+            outgoing,
+            incoming,
+            writer,
+            start_get_stream,
+            group,
+        )
+        try:
+            yield reader, writer
+        finally:
+            if transport.session_id:
+                await transport.terminate_session(http_client)
+            group.cancel_scope.cancel()
 
 
 def _protocol_value(value: Any, name: str, alias: str, default: Any = None) -> Any:
@@ -116,6 +216,11 @@ async def filtered_stdio_client(
 class MCPRemoteTool(BaseTool):
     """远端 MCP 工具在本地的代理对象"""
 
+    @property
+    def identity(self) -> str:
+        """MCP 服务及原始工具名组成的执行身份。"""
+        return f"mcp:{self.toolkit.server_name}:{self.original_tool_name}"
+
     def __init__(
         self,
         name: str,
@@ -178,38 +283,32 @@ class MCPRemoteTool(BaseTool):
         return tool_def
 
     async def execute(self, context: RunContext | None = None, **kwargs) -> ToolResult:
-        max_retries = 3
-        last_error = None
-
-        for attempt in range(max_retries):
-            await self.toolkit.lifespan_manager.touch(
-                self.toolkit.server_name, self.toolkit.effective_ttl
+        await self.toolkit.lifespan_manager.touch(
+            self.toolkit.server_name, self.toolkit.effective_ttl
+        )
+        try:
+            result = await self.toolkit.call_tool(
+                self.original_tool_name, kwargs, context
             )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            from mcp.shared.exceptions import MCPError
 
-            try:
-                result = await self.toolkit.call_tool(
-                    self.original_tool_name, kwargs, context
-                )
-                break
-            except Exception as e:
-                last_error = e
-                logger.warning(
-                    f"MCP 工具 '{self.name}' 执行失败 "
-                    f"(尝试 {attempt + 1}/{max_retries}): {e}。"
-                    "正在尝试自动重连自愈..."
-                )
-                if attempt < max_retries - 1:
-                    await self.toolkit.close()
-                    await asyncio.sleep(2**attempt)
-        else:
-            logger.error(
-                f"MCP 工具 '{self.name}' "
-                f"在重试 {max_retries} 次后仍然执行失败: {last_error}"
-            )
-            return ToolResult(output=f"MCP 错误: {last_error}").as_error()
+            if isinstance(error, MCPError) and error.code in {-32600, -32601, -32602}:
+                return ToolResult(
+                    output=f"远端拒绝了 MCP 请求，请检查工具名或参数（{error.code}）。"
+                ).as_error(False)
+            from zhenxun.services.ai.run.context import interrupt_network
+
+            interrupt_network("mcp_call", error)
+            logger.warning(f"MCP 工具 {self.name} 结果未确认: {type(error).__name__}")
+            return ToolResult(
+                output="MCP 操作结果未确认，未自动重试；请核查外部结果。"
+            ).as_error(False, uncertain=True)
 
         if _protocol_value(result, "is_error", "isError", False):
-            return ToolResult(output=str(result.content)).as_error()
+            return ToolResult(output=str(result.content)).as_error(False)
 
         from zhenxun.services.ai.core.messages import ImagePart, TextPart
 
@@ -405,6 +504,19 @@ class MCPToolkit(BaseToolkit):
     async def call_tool(
         self, name: str, arguments: dict, context: RunContext | None = None
     ) -> Any:
+        """登记当前调用身份，让共享连接失效只中断对应的 AI 运行。"""
+        if not hasattr(self, "_active_calls"):
+            self._active_calls = {}
+        task = asyncio.current_task()
+        self._active_calls[task] = context
+        try:
+            return await self._call_tool(name, arguments, context)
+        finally:
+            self._active_calls.pop(task, None)
+
+    async def _call_tool(
+        self, name: str, arguments: dict, context: RunContext | None = None
+    ) -> Any:
         """调用远端工具，连接中断时立即抛出异常
 
         参数:
@@ -420,15 +532,23 @@ class MCPToolkit(BaseToolkit):
         if not session or not task:
             raise ConnectionError(f"MCP 服务器 '{self.server_name}' 未连接")
         call = asyncio.ensure_future(session.call_tool(name, arguments))
-        await asyncio.wait({call, task}, return_when=asyncio.FIRST_COMPLETED)
-        if call.done():
-            return call.result()
-        call.cancel()
-        raise ConnectionError(f"MCP 服务器 '{self.server_name}' 连接已断开")
+        try:
+            await asyncio.wait({call, task}, return_when=asyncio.FIRST_COMPLETED)
+            if call.done():
+                return call.result()
+            raise ConnectionError(f"MCP 服务器 '{self.server_name}' 连接已断开")
+        finally:
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
 
     async def _spawn_session_task(self, dynamic_headers: dict, dynamic_env: dict):
         """在后台异步拉起 MCP 传输协议通道并进行服务初始化"""
         max_attempts = 2 if (self.transport == "stdio" and self.install_command) else 1
+        from zhenxun.services.ai.run.context import fail_fast_enabled
+
+        if fail_fast_enabled():
+            max_attempts = 1
 
         try:
             for attempt in range(1, max_attempts + 1):
@@ -468,8 +588,12 @@ class MCPToolkit(BaseToolkit):
                                 headers=dynamic_headers, timeout=self.timeout
                             )
                             await stack.enter_async_context(http_client)
-                            transport_ctx = streamable_http_client(
-                                url=self.url, http_client=http_client
+                            transport_ctx = _streamable_transport(
+                                url=self.url,
+                                http_client=http_client,
+                                active_contexts=lambda: tuple(
+                                    getattr(self, "_active_calls", {}).values()
+                                ),
                             )
                         else:
                             raise ValueError(f"Unknown transport: {self.transport}")
@@ -588,6 +712,9 @@ class MCPToolkit(BaseToolkit):
         await self._ready_event.wait()
 
         if self._init_exception:
+            from zhenxun.services.ai.run.context import interrupt_network
+
+            interrupt_network("mcp_initialize", self._init_exception)
             raise self._init_exception
 
     async def get_tools(self, context: RunContext | None = None) -> dict[str, BaseTool]:
@@ -601,7 +728,8 @@ class MCPToolkit(BaseToolkit):
 
         tools_dict = {}
         for t in self._tools:
-            tools_dict[t.name] = t
+            key = t.name if t.name not in tools_dict else t.identity
+            tools_dict[key] = t
         return tools_dict
 
     async def release_resource(self, resource_id: str):

@@ -33,7 +33,7 @@ from zhenxun.utils.pydantic_compat import parse_as
 
 from .registry import scheduler_registry
 from .repository import ScheduleRepository
-from .types import ExecutionPolicy, ScheduleContext, TargetType
+from .types import ExecutionPolicy, ScheduleContext, TargetType, TaskOutcome
 
 JOB_PREFIX = "zhenxun_schedule_"
 SCHEDULE_CONCURRENCY_KEY = "all_groups_concurrency_limit"
@@ -70,6 +70,14 @@ class APSchedulerAdapter:
             bool: 是否已调度，指定时间的任务已过期时为 False
         """
         job_id = APSchedulerAdapter._get_job_id(schedule.id)
+        policy = scheduler_registry.tasks.get(schedule.plugin_name, {})
+        recover_missed = policy.get("recover_missed", True)
+        if (
+            schedule.is_one_off
+            and policy.get("retain_finished")
+            and schedule.last_run_status
+        ):
+            return False
 
         try:
             scheduler.remove_job(job_id)
@@ -110,13 +118,15 @@ class APSchedulerAdapter:
             job_params["max_instances"] = 1
             job_params["coalesce"] = False
 
-        if catch_up and schedule.trigger_type == "date":
+        if schedule.trigger_type == "date" and (catch_up or not recover_missed):
             run_at = trigger_params.get("run_date")
             if isinstance(run_at, str):
                 run_at = datetime.fromisoformat(run_at)
             passed = (
                 time.time() - run_at.timestamp() if isinstance(run_at, datetime) else 0
             )
+            if passed > 0 and not recover_missed:
+                return False
             if passed > job_params["misfire_grace_time"]:
                 return False
             if passed > 0:
@@ -139,7 +149,7 @@ class APSchedulerAdapter:
             **job_params,
             **trigger_params,
         )
-        if catch_up and grace and schedule.trigger_type != "date":
+        if catch_up and recover_missed and grace and schedule.trigger_type != "date":
             APSchedulerAdapter._catch_up(schedule, job, grace)
         logger.debug(
             f"已添加或更新APScheduler任务: {job_id} | 并发策略: {concurrency_policy}, "
@@ -308,7 +318,7 @@ async def _run_dependent_task(
         func, "__module__", None
     )
     if await _plugin_blocked(owner, bot, injected_params.get("context")):
-        return
+        return TaskOutcome(status="SKIPPED", reason="插件或目标已停用")
 
     async def wrapper(bot: Bot):
         return await func(bot=bot, **injected_params)
@@ -412,7 +422,7 @@ async def _execute_single_job_instance(
 
     if not task_meta:
         logger.error(f"无法执行任务：插件 '{plugin_name}' 在执行期间变得不可用。")
-        return
+        return TaskOutcome(status="FAILURE", reason="任务插件不可用")
 
     is_blocked = await CommonUtils.task_is_block(bot, plugin_name, actual_group_id)
     if is_blocked:
@@ -425,7 +435,7 @@ async def _execute_single_job_instance(
             f"插件 '{plugin_name}' 的定时任务在目标 [{target_desc}] "
             f"因功能被禁用而跳过执行。"
         )
-        return
+        return TaskOutcome(status="SKIPPED", reason="目标功能已停用")
 
     context = ScheduleContext(
         schedule_id=schedule.id,
@@ -434,12 +444,16 @@ async def _execute_single_job_instance(
         platform_scope=PlatformUtils.get_platform_scope(bot),
         group_id=actual_group_id,
         user_id=actual_user_id,
-        job_kwargs=schedule.job_kwargs if isinstance(schedule.job_kwargs, dict) else {},
+        job_kwargs=dict(schedule.job_kwargs)
+        if isinstance(schedule.job_kwargs, dict)
+        else {},
     )
     state: T_State = {ScheduleContext: context}
 
     policy_data = context.job_kwargs.pop("execution_policy", {})
     policy = ExecutionPolicy(**policy_data)
+    if not task_meta.get("recover_missed", True):
+        policy.retries = 0
 
     async def task_execution_coro():
         injected_params = {"context": context}
@@ -485,24 +499,28 @@ async def _execute_single_job_instance(
             )
 
             decorated_executor = retry_decorator(task_execution_coro)
-            await decorated_executor()
+            return await decorated_executor()
         else:
             logger.debug(
                 f"插件 '{plugin_name}' 开始为目标 [{target_log or '全局'}] "
                 f"执行定时任务 (ID: {schedule.id})。"
             )
-            await task_execution_coro()
+            return await task_execution_coro()
 
-    except (PausedException, FinishedException, SkippedException) as e:
+    except FinishedException:
+        return TaskOutcome()
+    except (PausedException, SkippedException) as e:
         logger.warning(
             f"定时任务 {schedule.id} (目标: {target_log}) 被中断: {type(e).__name__}"
         )
+        return TaskOutcome(status="SKIPPED")
     except Exception as e:
         logger.error(
             f"执行定时任务 {schedule.id} (目标: {target_log}) "
             f"时发生未被策略处理的最终错误",
             e=e,
         )
+        return TaskOutcome(status="FAILURE")
 
 
 class ExecutionDispatcher:
@@ -523,6 +541,7 @@ class ExecutionDispatcher:
             else {}
         )
         interval_seconds = spread_config.get("interval")
+        results = []
 
         if interval_seconds is not None and interval_seconds > 0:
             logger.debug(
@@ -532,7 +551,11 @@ class ExecutionDispatcher:
             for i, target_id in enumerate(resolved_targets):
                 if i > 0:
                     await asyncio.sleep(interval_seconds)
-                await _execute_single_job_instance(schedule, bot, target_id=target_id)
+                results.append(
+                    await _execute_single_job_instance(
+                        schedule, bot, target_id=target_id
+                    )
+                )
         else:
             spread_seconds = spread_config.get("spread", 1.0)
             logger.debug(
@@ -544,13 +567,14 @@ class ExecutionDispatcher:
                 delay = random.uniform(0.1, spread_seconds)
                 await asyncio.sleep(delay)
                 async with semaphore:
-                    await _execute_single_job_instance(
+                    return await _execute_single_job_instance(
                         schedule, bot, target_id=target_id
                     )
 
             tasks_to_run = [worker(target_id) for target_id in resolved_targets]
             if tasks_to_run:
-                await asyncio.gather(*tasks_to_run, return_exceptions=True)
+                results = await asyncio.gather(*tasks_to_run, return_exceptions=True)
+        return TaskOutcome.collect(results)
 
 
 def _detach_event_context() -> None:
@@ -632,16 +656,30 @@ async def _execute_persistent_job(schedule_id: int, force: bool = False):
         return
 
     scheduler_registry.running_tasks.add(schedule_id)
+    current = asyncio.current_task()
+    handles = scheduler_registry.running_handles.setdefault(schedule_id, set())
+    if current:
+        handles.add(current)
     try:
         schedule = await ScheduleRepository.get_by_id(schedule_id)
         if not schedule or (not schedule.is_enabled and not force):
             logger.warning(f"定时任务 {schedule_id} 不存在或已禁用，跳过执行。")
             return
 
+        policy = scheduler_registry.tasks.get(schedule.plugin_name, {})
+        if policy.get("retain_finished"):
+            if schedule.is_one_off and schedule.last_run_status:
+                return
+            await ScheduleRepository.update_run_status(schedule, status="RUNNING")
+
         bot = PlatformUtils.resolve_bot(
             bot_id=schedule.bot_id, log_cmd=f"任务 {schedule_id}"
         )
         if bot is None:
+            if policy.get("retain_finished"):
+                await ScheduleRepository.update_run_status(
+                    schedule, status="SKIPPED", disable=schedule.is_one_off
+                )
             return
 
         resolver = scheduler_registry.target_resolvers.get(schedule.target_type)
@@ -664,12 +702,24 @@ async def _execute_persistent_job(schedule_id: int, force: bool = False):
             f"解析出 {len(resolved_targets)} 个目标"
         )
 
-        await ExecutionDispatcher.dispatch(schedule, bot, resolved_targets)
-
-        await ScheduleRepository.update_run_status(schedule, is_success=True)
+        retain = bool(
+            scheduler_registry.tasks.get(schedule.plugin_name, {}).get(
+                "retain_finished"
+            )
+        )
+        outcome = await ExecutionDispatcher.dispatch(schedule, bot, resolved_targets)
+        outcome = outcome if isinstance(outcome, TaskOutcome) else TaskOutcome()
+        await ScheduleRepository.update_run_status(
+            schedule,
+            status=outcome.status,
+            disable=retain and schedule.is_one_off,
+            reason=outcome.reason,
+        )
         logger.info(f"任务 {schedule.id} 执行完成 | 目标总数={len(resolved_targets)}")
 
-        if schedule.is_one_off and not force:
+        if retain and schedule.is_one_off:
+            APSchedulerAdapter.remove_job(schedule.id)
+        elif schedule.is_one_off and not force and outcome.status == "SUCCESS":
             logger.info(f"一次性任务 {schedule.id} 执行成功，将被删除。")
             await ScheduledJob.filter(id=schedule.id).delete()
             APSchedulerAdapter.remove_job(schedule.id)
@@ -677,12 +727,33 @@ async def _execute_persistent_job(schedule_id: int, force: bool = False):
                 scheduler_registry.tasks.pop(schedule.plugin_name, None)
                 logger.debug(f"已注销一次性运行时任务: {schedule.plugin_name}")
 
+    except asyncio.CancelledError:
+        if schedule:
+            retain = bool(
+                scheduler_registry.tasks.get(schedule.plugin_name, {}).get(
+                    "retain_finished"
+                )
+            )
+            await ScheduleRepository.update_run_status(
+                schedule, status="INTERRUPTED", disable=retain and schedule.is_one_off
+            )
+        raise
     except Exception as e:
         logger.error(f"执行任务 {schedule_id} 期间发生严重错误", e=e)
 
         if schedule:
-            await ScheduleRepository.update_run_status(schedule, is_success=False)
+            retain = bool(
+                scheduler_registry.tasks.get(schedule.plugin_name, {}).get(
+                    "retain_finished"
+                )
+            )
+            await ScheduleRepository.update_run_status(
+                schedule, is_success=False, disable=retain and schedule.is_one_off
+            )
 
     finally:
-        if schedule_id is not None:
+        if current:
+            handles.discard(current)
+        if not handles:
+            scheduler_registry.running_handles.pop(schedule_id, None)
             scheduler_registry.running_tasks.discard(schedule_id)

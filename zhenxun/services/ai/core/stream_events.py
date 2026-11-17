@@ -55,6 +55,9 @@ class ToolCallStartEvent(AgentStreamEvent):
     """调用的工具名称"""
     arguments: dict[str, Any]
     """工具调用参数"""
+    run_id: str | None = None
+    parent_run_id: str | None = None
+    tool_call_id: str | None = None
 
 
 class ToolCallEndEvent(AgentStreamEvent):
@@ -66,6 +69,9 @@ class ToolCallEndEvent(AgentStreamEvent):
     """工具最终返回的结果"""
     is_error: bool
     """工具执行是否失败"""
+    run_id: str | None = None
+    parent_run_id: str | None = None
+    tool_call_id: str | None = None
 
 
 class UserCustomEvent(AgentStreamEvent):
@@ -98,6 +104,7 @@ class EventBus:
         )
         self._background_tasks = set()
         self._async_handlers_queues: dict[Callable, asyncio.Queue] = {}
+        self.parent: EventBus | None = None
 
     def subscribe(
         self, event_type: type[T_Event], handler: Callable[[T_Event], Any]
@@ -127,7 +134,6 @@ class EventBus:
                     try:
                         await h(evt)
                     except asyncio.CancelledError:
-                        queue.task_done()
                         break
                     except Exception as err:
                         logger.error(f"EventBus 订阅者执行异常: {err}")
@@ -145,6 +151,8 @@ class EventBus:
         参数：
             event: 要发布的事件实例（需继承自 AgentStreamEvent）。
         """
+        if self.parent and isinstance(event, ToolCallStartEvent | ToolCallEndEvent):
+            await self.parent.emit(event)
         handlers = []
         for ev_type, cb_list in self._subscribers.items():
             if isinstance(event, ev_type):

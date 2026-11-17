@@ -214,6 +214,8 @@ class SchedulerManager:
         default_jitter: int | None = None,
         default_spread: int | None = None,
         default_interval: int | None = None,
+        recover_missed: bool = True,
+        retain_finished: bool = False,
     ) -> Callable:
         """
         注册可调度的任务函数
@@ -242,6 +244,8 @@ class SchedulerManager:
                 "default_jitter": default_jitter,
                 "default_spread": default_spread,
                 "default_interval": default_interval,
+                "recover_missed": recover_missed,
+                "retain_finished": retain_finished,
             }
             model_name = params_model.__name__ if params_model else "无"
             logger.debug(
@@ -694,6 +698,14 @@ class SchedulerManager:
         schedule = await ScheduleRepository.get_by_id(schedule_id)
         if not schedule or schedule.is_enabled:
             return False, "任务不存在或已启用。"
+        if (
+            schedule.is_one_off
+            and schedule.last_run_status
+            and scheduler_registry.tasks.get(schedule.plugin_name, {}).get(
+                "retain_finished"
+            )
+        ):
+            return False, "此一次性任务已经结束，请创建新计划。"
 
         schedule.is_enabled = True
         await ScheduleRepository.save(schedule, update_fields=["is_enabled"])
@@ -710,6 +722,14 @@ class SchedulerManager:
             return False, f"未找到 ID 为 {schedule_id} 的定时任务。"
         if schedule.plugin_name not in scheduler_registry.tasks:
             return False, f"插件 '{schedule.plugin_name}' 没有注册可用的定时任务。"
+        if (
+            schedule.is_one_off
+            and schedule.last_run_status
+            and scheduler_registry.tasks.get(schedule.plugin_name, {}).get(
+                "retain_finished"
+            )
+        ):
+            return False, "此一次性任务已经结束，不会再次执行。"
         if schedule.id in scheduler_registry.running_tasks:
             return False, f"任务 (ID: {schedule.id}) 正在执行。"
         task = asyncio.create_task(_execute_persistent_job(schedule.id, force=True))

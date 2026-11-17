@@ -69,13 +69,14 @@ class BaseToolkit:
             payload = await t.resolve(context)
             resolved_tools.extend(payload.tools)
 
-        injected_prompts = []
+        builders = []
         if instructions := self.get_instructions():
-            injected_prompts.append(instructions)
+            required = frozenset(t.name for t in resolved_tools)
+            builders.append(
+                lambda names: [instructions] if required and required <= names else []
+            )
 
-        return ResolvedToolPayload(
-            tools=resolved_tools, injected_prompts=injected_prompts
-        )
+        return ResolvedToolPayload(tools=resolved_tools, instruction_builders=builders)
 
     async def get_tools(self, context: RunContext | None = None) -> dict[str, BaseTool]:
         """获取该工具箱中所有合法注册的工具实例映射表"""

@@ -17,15 +17,33 @@ TRes = TypeVar("TRes", bound=BaseModel)
 class CancellationToken:
     """全局取消令牌，用于在异步链路中传递中止信号"""
 
-    def __init__(self):
+    def __init__(self, parent: "CancellationToken | None" = None):
         self._cancelled = False
         self._futures: list[asyncio.Future] = []
+        self.parent = parent
+        self.reason = ""
+        self._children: set[CancellationToken] = set()
+        if parent is not None:
+            parent._children.add(self)
+            if parent.is_cancelled():
+                self.cancel(parent.reason)
 
-    def cancel(self) -> None:
+    def cancel(self, reason: str = "cancelled") -> None:
+        if self._cancelled:
+            return
         self._cancelled = True
-        for f in self._futures:
+        self.reason = reason
+        for child in tuple(self._children):
+            child.cancel(reason)
+        for f in tuple(self._futures):
             if not f.done():
                 f.cancel()
+
+    def detach(self) -> None:
+        """子运行完成后释放父级关联。"""
+        if self.parent is not None:
+            self.parent._children.discard(self)
+        self._futures.clear()
 
     def is_cancelled(self) -> bool:
         return self._cancelled
@@ -39,8 +57,13 @@ class CancellationToken:
     def link_future(self, future: asyncio.Future) -> None:
         if self._cancelled:
             future.cancel()
-        else:
+        elif future not in self._futures:
             self._futures.append(future)
+            future.add_done_callback(self._unlink)
+
+    def _unlink(self, future: asyncio.Future) -> None:
+        if future in self._futures:
+            self._futures.remove(future)
 
 
 class LLMContext(BaseModel, Generic[TReq, TRes]):

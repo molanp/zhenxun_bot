@@ -1,166 +1,1118 @@
-"""DeepSeek Harness（dsh）执行器：以子进程运行 `dsh --profile sdk`，
-在标准输入输出上按行收发 JSON-RPC 2.0，替代本地 Agent 完成一轮对话"""
+"""DSH 桌面会话归属、运行授权与收据结算；不启动或终止桌面进程。"""
 
 import asyncio
 import base64
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+import hashlib
 from io import BytesIO
 import json
-import os
 from pathlib import Path
-import shutil
-import subprocess
-import sys
+import re
+import secrets
+import time
 from typing import Any, ClassVar
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
+import uuid
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+import yaml
 
 from zhenxun.configs.path_config import DATA_PATH
-from zhenxun.services.ai.core.exceptions import LLMException
+from zhenxun.services.ai.core.exceptions import RunInterrupted
 from zhenxun.services.ai.core.messages import ImagePart, TextPart, UsageInfo
+from zhenxun.services.ai.run.dsh_desktop import DesktopClient, DshUnavailable
+from zhenxun.services.ai.utils.runtime import PermissionUtils
 from zhenxun.services.log import logger
+from zhenxun.utils.atomic_json import (
+    AtomicJsonRecordError,
+    mutate_json_locked,
+    read_json_locked,
+    write_json_locked,
+)
 
 LOG_NAME = "dsh"
 DSH_PATH = DATA_PATH / "ai" / "dsh"
-"""dsh 数据目录：home（会话历史）、workspace（工作目录）、patch 与会话映射"""
-IMAGE_TYPES = {
-    "PNG": "image/png",
-    "JPEG": "image/jpeg",
-    "WEBP": "image/webp",
-    "GIF": "image/gif",
-}
-"""dsh 接受的图片格式"""
-LOCAL_TOOLS = (
-    "tool-bash",
-    "tool-pwsh",
-    "tool-jobs",
-    "tool-fs",
-    "tool-fs-search",
-    "tool-skill",
-    "tool-subagent",
-    "tool-subagent-fork",
-    "tool-subagent-control",
-    "tool-workflow",
-    "tool-schedule",
-    "tool-plugin-manager",
-    "tool-web",
-    "present",
+BOOT_ID = uuid.uuid4().hex
+INTEGRATION = Path(__file__).with_name("dsh_guard.mjs")
+PRESETS = {"chat": "zhenxun-chat", "agent": "zhenxun-agent"}
+TOOLS = {"chat": [], "agent": ["zx_list", "zx_read", "zx_write", "ask_user_question"]}
+IMAGE_UNAVAILABLE = (
+    "当前 DSH 桌面的图片上传会在内部降级或重发，无法计入统一五次尝试上限；"
+    "本接入暂不接受图片，请改发文字。"
 )
-"""不允许本地工具时在 patch 中关闭的插件"""
-PERSONA_PREFIX = "你在 QQ 中与用户聊天，用自然的口语回复，不使用 Markdown。"
-
 Approver = Callable[[str, str], Awaitable[bool]]
-"""审批回调：工具名、原因 → 是否允许"""
 Asker = Callable[[str], Awaitable[str]]
-"""提问回调：问题文本 → 回答"""
 
 
 class DshSettings(BaseModel):
-    """dsh 执行器设置"""
+    """已登录桌面的连接设置；不接受 SDK 可执行文件或模型密钥。"""
 
-    bin: str = ""
-    """dsh 可执行文件路径，为空时在 PATH 中查找 dsh"""
-    provider: str = "deepseek-official"
-    """dsh 的服务商路由"""
-    model: str = "deepseek-v4-flash"
-    """全部会话共用的模型"""
-    reasoning_effort: str = ""
-    """推理强度，为空使用模型默认值"""
-    max_tokens: int = Field(default=0, ge=0)
-    """单次输出 token 上限，0 使用模型默认值"""
-    api_provider: str = ""
-    """取 API Key 的服务商名称，为空时用第一个 deepseek 预设的服务商"""
-    base_url: str = ""
-    """DEEPSEEK_BASE_URL，为空使用 dsh 默认地址"""
-    timeout: int = Field(default=300, ge=10)
-    """一轮对话的超时秒数"""
+    desktop_url: str = ""
+    home: str = ""
+    timeout: int = Field(default=300, ge=10, le=1800)
     allow_tools: bool = False
-    """保留 dsh 的本地工具（命令行、文件等），只有超级用户的会话能通过审批"""
+    migration_required: bool = Field(default=False, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            value["migration_required"] = not value.get("desktop_url") and any(
+                value.get(key)
+                for key in ("bin", "api_provider", "base_url", "provider", "model")
+            )
+        return value
+
+
+class DshSessions:
+    """按可信所有者保存桌面会话，旧 SDK 文件不参与读取。"""
+
+    FILE = DSH_PATH / "desktop-sessions.json"
+
+    @classmethod
+    def _read(cls):
+        if not cls.FILE.exists():
+            return {"version": 1, "owners": {}, "archives": []}
+        value = read_json_locked(cls.FILE, None, strict=True)
+        cls._validate(value)
+        return value
+
+    @staticmethod
+    def _validate(value):
+        if (
+            not isinstance(value, dict)
+            or value.get("version") != 1
+            or not isinstance(value.get("owners"), dict)
+            or not isinstance(value.get("archives"), list)
+        ):
+            raise AtomicJsonRecordError("桌面会话记录损坏，需要人工处理")
+        for key, item in value["owners"].items():
+            if (
+                not isinstance(item, dict)
+                or item.get("owner") != key
+                or item.get("mode") not in PRESETS
+                or not isinstance(item.get("revision"), int)
+                or not re.fullmatch(
+                    r"[a-zA-Z0-9_-]{1,128}", str(item.get("remote_id", ""))
+                )
+                or not item.get("local_id")
+            ):
+                raise AtomicJsonRecordError("桌面会话归属不可确认")
+
+    @classmethod
+    def _mutate(cls, callback):
+        cls.FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        def edit(value):
+            cls._validate(value)
+            return callback(value)
+
+        return mutate_json_locked(
+            cls.FILE, {"version": 1, "owners": {}, "archives": []}, edit, strict=True
+        )
+
+    @classmethod
+    def owner(cls, context, mode: str) -> str:
+        return cls.owner_key(context.run.caller, mode)
+
+    @staticmethod
+    def owner_key(caller, mode: str) -> str:
+        """按调用者身份与模式计算会话所有者
+
+        参数:
+            caller: CallerIdentity
+            mode: agent 或 chat
+
+        返回:
+            str: 所有者键
+        """
+        if caller is None or not caller.user_id:
+            raise DshUnavailable("无法确认 DSH 会话发起人。")
+        scene = (
+            ["user", caller.user_id]
+            if mode == "agent" or not caller.group_id
+            else ["group", caller.group_id]
+        )
+        key = [
+            caller.platform,
+            caller.bot_id,
+            "webui" if caller.source == "webui" else "bot",
+            mode,
+            *scene,
+        ]
+        return hashlib.sha256(json.dumps(key, ensure_ascii=False).encode()).hexdigest()
+
+    @classmethod
+    def route(cls, context, mode: str, persona_key: str) -> dict:
+        owner = cls.owner(context, mode)
+
+        def edit(data):
+            item = data["owners"].get(owner)
+            if (
+                item
+                and item.get("inflight")
+                and item["inflight"].get("boot") != BOOT_ID
+            ):
+                item["quarantined"] = "previous_boot_interrupted"
+            if item is None:
+                remote = "zx-" + uuid.uuid4().hex
+                item = {
+                    "owner": owner,
+                    "mode": mode,
+                    "persona": persona_key,
+                    "remote_id": remote,
+                    "local_id": f"ai_chat:dsh:{owner}:{uuid.uuid4().hex}",
+                    "revision": 1,
+                    "created": False,
+                    "inflight": None,
+                    "quarantined": None,
+                    "preset": "standard" if mode == "agent" else PRESETS[mode],
+                    "native": mode == "agent",
+                    "identity": {
+                        "source": context.run.caller.source,
+                        "platform": context.run.caller.platform,
+                        "bot_id": context.run.caller.bot_id,
+                        "user_id": context.run.caller.user_id
+                        if mode == "agent" or not context.run.caller.group_id
+                        else None,
+                        "group_id": context.run.caller.group_id
+                        if mode == "chat"
+                        else None,
+                    },
+                }
+                data["owners"][owner] = item
+            return dict(item)
+
+        item = cls._mutate(edit)
+        context.state["_dsh_binding"] = item
+        context.state["_dsh_persona_at_admission"] = persona_key
+        context.session_id = context.session.session_id = item["local_id"]
+        return item
+
+    @classmethod
+    def switch(cls, caller, selected: dict | None, expected_revision: int) -> dict:
+        """原子切换指定超管的桌面映射，保留旧会话记录且不更改桌面历史。"""
+        owner = cls.owner_key(caller, "agent")
+        remote_id = selected["remote_id"] if selected else "zx-" + uuid.uuid4().hex
+
+        def edit(data):
+            current = data["owners"].get(owner)
+            if (current["revision"] if current else 0) != expected_revision:
+                raise DshUnavailable("会话映射已变化，请重新选择。")
+            for item in [*data["archives"], *data["owners"].values()]:
+                if item["remote_id"] == remote_id and item["owner"] != owner:
+                    raise DshUnavailable("该会话已分配给其他用户。")
+            if current and current.get("inflight"):
+                raise DshUnavailable("会话仍在执行，不能切换。")
+            if current:
+                data["archives"].append(
+                    {**current, "archive_reason": "selection_changed"}
+                )
+            item = {
+                "owner": owner,
+                "mode": "agent",
+                "persona": "",
+                "remote_id": remote_id,
+                "local_id": f"ai_chat:dsh:{owner}:{uuid.uuid4().hex}",
+                "revision": expected_revision + 1,
+                "created": bool(selected),
+                "inflight": None,
+                "quarantined": None,
+                "preset": selected["preset"] if selected else "standard",
+                "native": selected["native"] if selected else True,
+                "inherited": bool(selected),
+                "cwd": selected["cwd"] if selected else None,
+                "model": selected["model"] if selected else None,
+                "plan": selected["plan"] if selected else None,
+                "title": selected["title"] if selected else "新建桌面会话",
+                "identity": {
+                    "source": caller.source,
+                    "platform": caller.platform,
+                    "bot_id": caller.bot_id,
+                    "user_id": caller.user_id,
+                    "group_id": None,
+                },
+            }
+            data["owners"][owner] = item
+            return dict(item)
+
+        return cls._mutate(edit)
+
+    @classmethod
+    def refresh(cls, item: dict) -> None:
+        """取得执行权后读取前一轮结算，不接受已解除的会话映射。"""
+        current = cls._read()["owners"].get(item["owner"])
+        if not current or current["local_id"] != item["local_id"]:
+            raise DshUnavailable("会话已新开或重置，请重新提问。")
+        item.update(current)
+
+    @classmethod
+    def update(cls, item: dict, **changes) -> dict:
+        def edit(data):
+            current = data["owners"].get(item["owner"])
+            if (
+                current is None
+                or current["local_id"] != item["local_id"]
+                or current["revision"] != item["revision"]
+            ):
+                raise DshUnavailable("DSH 会话已变化，本次操作已放弃。")
+            current.update(changes)
+            return dict(current)
+
+        updated = cls._mutate(edit)
+        item.update(updated)
+        return updated
+
+    @classmethod
+    def rotate_remote(cls, item: dict) -> None:
+        def edit(data):
+            current = data["owners"].get(item["owner"])
+            if (
+                not current
+                or current["local_id"] != item["local_id"]
+                or current["revision"] != item["revision"]
+            ):
+                raise DshUnavailable("会话已变化")
+            data["archives"].append(
+                {**current, "archive_reason": current.get("quarantined") or "new"}
+            )
+            current.update(
+                remote_id="zx-" + uuid.uuid4().hex,
+                revision=current["revision"] + 1,
+                created=False,
+                inflight=None,
+                quarantined=None,
+            )
+            return dict(current)
+
+        item.update(cls._mutate(edit))
+
+    @classmethod
+    def reset(cls, session_id: str) -> None:
+        """解除当前映射并保留归属记录；调用方须先等待运行停止。"""
+        if not session_id.startswith("ai_chat:dsh:"):
+            return
+
+        def edit(data):
+            for owner, item in list(data["owners"].items()):
+                if item["local_id"] == session_id:
+                    if item.get("inflight"):
+                        raise DshUnavailable("运行停止尚未确认，不能重置会话。")
+                    data["archives"].append({**item, "archive_reason": "unmapped"})
+                    del data["owners"][owner]
+
+        cls._mutate(edit)
 
 
 @dataclass
 class _Turn:
-    """一个会话正在进行的一轮对话"""
-
+    context: Any
+    binding: dict
+    client: DesktopClient
     approve: Approver
     ask: Asker
-    events: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
-    changed: asyncio.Event = field(default_factory=asyncio.Event)
+    token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    proof: dict = field(default_factory=dict)
+    usage: UsageInfo = field(default_factory=UsageInfo)
+    seen: set[int] = field(default_factory=set)
+    responses: dict[str, str] = field(default_factory=dict)
+    remote_turn: int | None = None
+    admitted: bool = False
+    stop_confirmation: str = "not_requested"
+    revoked: bool = False
+    pending: set = field(default_factory=set)
+    event_ids: set[str] = field(default_factory=set)
 
 
-def _api_key(settings: DshSettings) -> tuple[str, str]:
-    """从已配置的服务商取 API Key 与地址
+class DshRuntime:
+    """仅管理真寻拥有的桌面轮次；运行撤销与消息投递分别结算。"""
 
-    参数:
-        settings: dsh 设置
+    _turns: ClassVar[dict[str, _Turn]] = {}
 
-    返回:
-        tuple[str, str]: API Key, 地址
-    """
-    from zhenxun.services.ai.config.manager import get_llm_config
+    @staticmethod
+    def verify_preset(document: dict, mode: str) -> str:
+        """核对专用预设的完整组成与守卫文件修订，不接受同名替代能力。"""
+        try:
+            rows = yaml.safe_load(document["content"])
+            wanted = {"native-executor", "zhenxun-guard"}
+            if mode == "agent":
+                wanted.add("ask-user")
+            if (
+                not isinstance(rows, list)
+                or len(rows) != len(wanted)
+                or {r.get("id") for r in rows} != wanted
+            ):
+                raise ValueError
+            for row in rows:
+                if set(row) - {"id", "name", "config"}:
+                    raise ValueError
+                name, config = row["name"], row.get("config") or {}
+                if row["id"] == "native-executor":
+                    if name != "@deepseek-ai/dsh-tool-executor-native":
+                        raise ValueError
+                elif row["id"] == "ask-user":
+                    if (
+                        name != "@deepseek-ai/dsh-tool-ask-user"
+                        or config.get("mode", "legacy") != "legacy"
+                    ):
+                        raise ValueError
+                else:
+                    uri = urlsplit(name)
+                    digest = hashlib.sha256(INTEGRATION.read_bytes()).hexdigest()
+                    if (
+                        uri.scheme != "file"
+                        or uri.netloc
+                        or uri.fragment
+                        or uri.query != "revision=" + digest
+                    ):
+                        raise ValueError
+                    source = Path(url2pathname(uri.path))
+                    if (
+                        source.name != "dsh_guard.mjs"
+                        or hashlib.sha256(source.read_bytes()).hexdigest() != digest
+                    ):
+                        raise ValueError
+                    if (
+                        set(config) != {"root", "mode"}
+                        or config["mode"] != mode
+                        or Path(config["root"]).resolve() != DSH_PATH.resolve()
+                    ):
+                        raise ValueError
+            return hashlib.sha256(document["content"].encode()).hexdigest()
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise DshUnavailable("DSH 专用预设或守卫组成不符，未提交问题。") from exc
 
-    providers = get_llm_config().providers
-    name = settings.api_provider.strip()
-    provider = next(
-        (
-            p
-            for p in providers
-            if (p.name == name if name else p.preset == "deepseek") and p.api_keys
-        ),
-        None,
-    )
-    if provider is None:
-        raise LLMException("dsh 执行器没有可用的 API Key，请先配置 DeepSeek 服务商。")
-    return provider.api_keys[0], settings.base_url.strip()
+    @classmethod
+    def running(cls):
+        return bool(cls._turns)
 
+    @classmethod
+    async def status(cls, settings: DshSettings) -> dict:
+        result = {
+            "connected": False,
+            "logged_in": None,
+            "guard_ready": None,
+            "version": None,
+            "presets": {},
+            "capabilities": {
+                "memory": False,
+                "knowledge": False,
+                "background": False,
+                "shell": False,
+                "subagents": False,
+                "workspace_tools": True,
+                "images": False,
+                "native_agent": True,
+            },
+            "image_limitation": IMAGE_UNAVAILABLE,
+            "retry_policy": {"max_attempts": 5, "delays_seconds": [2, 5, 10, 20]},
+            "migration_required": settings.migration_required,
+        }
+        if settings.migration_required:
+            result["reason"] = (
+                "DSH 设置仍是旧格式：请在聊天设置的 DSH 项中改用 desktop_url 与 home，"
+                "无需 API Key。"
+            )
+            return result
+        client = None
+        try:
+            client = await DesktopClient.open(settings.desktop_url, settings.home)
+            presets = await client.rpc("agentPresets/list", args={})
+            entries = (
+                presets if isinstance(presets, list) else presets.get("presets", [])
+            )
+            result.update(connected=True, endpoint=client.endpoint)
+            result["version"] = client.version
+            marker = read_json_locked(
+                DSH_PATH / "forwarding-ready.json", {}, strict=True
+            )
+            result["native_ready"] = bool(
+                marker
+                and marker.get("pid") == client.identity[0]
+                and marker.get("revision")
+                == hashlib.sha256(INTEGRATION.read_bytes()).hexdigest()
+            )
+            result["standard_ready"] = any(p.get("id") == "standard" for p in entries)
+            login = await client.rpc("account/getState", args={})
+            result["login_state"] = login.get("status")
+            result["logged_in"] = False if login.get("status") == "signed-out" else None
+            result["presets"] = {
+                mode: any(p.get("id") == name for p in entries)
+                for mode, name in PRESETS.items()
+            }
+            result["reason"] = "桌面已连接，每轮执行前会再次校验授权。"
+        except (Exception, RunInterrupted) as exc:
+            result["reason"] = (
+                str(exc)
+                if isinstance(exc, DshUnavailable)
+                else "DSH 桌面状态不可确认。"
+            )
+        finally:
+            if client:
+                await client.close()
+        return result
 
-def _patch() -> str:
-    """生成关闭本地工具并设置 QQ 场景前缀的 profile patch
+    @classmethod
+    async def authorize(cls, token: str, payload: dict) -> dict:
+        """按当前运行、会话、预设摘要与真实权限核验一次桌面执行。"""
+        turn = next(
+            (t for t in cls._turns.values() if secrets.compare_digest(t.token, token)),
+            None,
+        )
+        if turn is None or turn.revoked:
+            raise DshUnavailable("运行授权已失效")
+        context, binding = turn.context, turn.binding
+        PermissionUtils.ensure_current(context)
+        current = DshSessions._read()["owners"].get(binding["owner"])
+        if (
+            not current
+            or current["local_id"] != binding["local_id"]
+            or current["remote_id"] != binding["remote_id"]
+        ):
+            raise DshUnavailable("会话映射已失效")
+        if (
+            payload.get("sessionId") != binding["remote_id"]
+            or payload.get("runId") != context.run.run_id
+            or payload.get("revision")
+            != hashlib.sha256(INTEGRATION.read_bytes()).hexdigest()
+        ):
+            raise DshUnavailable("桌面执行归属或守卫修订不匹配")
+        if binding.get("native"):
+            check = context.state.get("_dsh_authorization_check")
+            if (
+                payload.get("scope") != "retry"
+                or payload.get("mode") != "agent"
+                or check is None
+                or await check() != "agent"
+            ):
+                raise DshUnavailable("本次转发已结束，不能继续自动重试。")
+            return {"allowed": True}
+        execution_mode = "chat" if binding["preset"] == PRESETS["chat"] else "agent"
+        if payload.get("mode") != execution_mode or sorted(
+            payload.get("tools") or []
+        ) != sorted(TOOLS[execution_mode]):
+            raise DshUnavailable("桌面工具清单不匹配")
+        check = context.state.get("_dsh_authorization_check")
+        if check is None or await check() != binding["mode"]:
+            raise DshUnavailable("DSH 模式或当前授权已变化")
+        name = payload.get("tool")
+        if name and name not in TOOLS[execution_mode]:
+            raise DshUnavailable("工具未授权")
+        model = payload.get("model") or {}
+        if model.get("provider") not in {"deepseek", "deepseek-account"}:
+            raise DshUnavailable("当前桌面模型提供方的中断契约未核验，已阻止执行。")
+        turn.proof = {
+            "mode": binding["mode"],
+            "tools": payload["tools"],
+            "model": payload.get("model"),
+            "revision": payload["revision"],
+        }
+        context.run.operations.setdefault("dsh", {}).update(
+            {
+                "session_id": binding["remote_id"],
+                "mode": binding["mode"],
+                "guard": "verified",
+                "model": payload.get("model"),
+                "stop": turn.stop_confirmation,
+            }
+        )
+        if payload.get("model"):
+            context.run.current_model = "dsh:" + str(payload["model"].get("model", ""))
+        return {"allowed": True}
 
-    返回:
-        str: patch 内容
-    """
-    lines = [
-        "- id: system-prompt",
-        "  config:",
-        f"    personaPrefix: {json.dumps(PERSONA_PREFIX, ensure_ascii=False)}",
-    ]
-    for plugin in LOCAL_TOOLS:
-        lines += [f"- id: {plugin}", "  disabled: true"]
-    return "\n".join(lines) + "\n"
+    @classmethod
+    async def start(cls, context, binding, settings, approve, ask) -> _Turn:
+        if settings.migration_required:
+            raise DshUnavailable(
+                "旧 SDK 配置不能连接桌面，请更新 desktop_url 与 home。"
+            )
+        if not binding.get("native") and (
+            binding.get("inflight") or binding.get("quarantined")
+        ):
+            DshSessions.rotate_remote(binding)
+        client = await DesktopClient.open(settings.desktop_url, settings.home)
+        turn = _Turn(context, binding, client, approve, ask)
+        cls._turns[context.run.run_id] = turn
+        try:
+            if client.version != "0.2.2-rc.3":
+                raise DshUnavailable("当前桌面版本不在已核验协议范围内，已阻止执行。")
+            guard_revision = hashlib.sha256(INTEGRATION.read_bytes()).hexdigest()
+            if binding.get("native"):
+                await cls._start_native(turn, settings, guard_revision)
+                return turn
+            if (
+                binding["created"]
+                and not binding.get("inherited")
+                and (
+                    binding.get("desktop_identity") != list(client.identity)
+                    or binding.get("guard_revision") != guard_revision
+                )
+            ):
+                DshSessions.rotate_remote(binding)
+            presets = await client.rpc("agentPresets/list", args={})
+            entries = (
+                presets if isinstance(presets, list) else presets.get("presets", [])
+            )
+            if not any(p.get("id") == binding["preset"] for p in entries):
+                raise DshUnavailable("缺少真寻专用 DSH 安全预设，已阻止执行。")
+            document = await client.rpc(
+                "agentPresets/read", args={"agentPreset": binding["preset"]}
+            )
+            execution_mode = "chat" if binding["preset"] == PRESETS["chat"] else "agent"
+            preset_revision = cls.verify_preset(document, execution_mode)
+            if (
+                binding["created"]
+                and not binding.get("inherited")
+                and binding.get("preset_revision") != preset_revision
+            ):
+                DshSessions.rotate_remote(binding)
+            from nonebot import get_driver
 
+            port = int(get_driver().config.port)
+            workspace = (
+                Path(binding["cwd"])
+                if binding.get("inherited")
+                else DSH_PATH / "workspaces" / binding["owner"]
+            )
+            group = None
+            if binding["mode"] == "chat" and not binding.get("inherited"):
+                from .dsh_control import DshControl
 
-def _image_block(part: ImagePart) -> dict[str, Any] | None:
-    """把图片片段转为 dsh 的内联图片块，不支持的格式转为 PNG
+                group = await DshControl.chat_workspace(client)
+                workspace = Path(group["path"])
+                if binding["created"] and binding.get("cwd") != str(workspace):
+                    DshSessions.rotate_remote(binding)
+            workspace.mkdir(parents=True, exist_ok=True)
+            leases = DSH_PATH / "leases"
+            leases.mkdir(parents=True, exist_ok=True)
+            write_json_locked(
+                leases / (binding["remote_id"] + ".json"),
+                {
+                    "sessionId": binding["remote_id"],
+                    "runId": context.run.run_id,
+                    "token": turn.token,
+                    "mode": execution_mode,
+                    "requestId": turn.request_id,
+                    "modelSelection": binding.get("model")
+                    if binding.get("inherited")
+                    else None,
+                    "cwd": str(workspace.resolve()),
+                    "expires": time.time() + settings.timeout,
+                    "authorize": f"http://127.0.0.1:{port}/zhenxun/api/ai/dsh/authorize",
+                },
+            )
+            if not binding["created"]:
+                await client.rpc(
+                    "session/create",
+                    {
+                        "sessionId": binding["remote_id"],
+                        **(
+                            {"workspaceId": group["workspaceId"]}
+                            if group
+                            else {"cwd": str(workspace.resolve())}
+                        ),
+                        "agentPreset": binding["preset"],
+                    },
+                )
+                if not turn.proof:
+                    raise DshUnavailable("专用守卫没有完成执行前握手，未提交问题。")
+                DshSessions.update(
+                    binding,
+                    created=True,
+                    desktop_identity=list(client.identity),
+                    guard_revision=guard_revision,
+                    preset_revision=preset_revision,
+                    cwd=str(workspace),
+                )
+            state = await client.rpc(
+                "session/state", {"sessionId": binding["remote_id"]}
+            )
+            if (
+                (not state.get("active") and not binding.get("inherited"))
+                or state.get("running")
+                or state.get("pendingInput")
+                or state.get("queue")
+            ):
+                raise DshUnavailable("该 DSH 会话仍有未结束的执行，未提交新输入。")
+            DshSessions.update(
+                binding,
+                inflight={
+                    "boot": BOOT_ID,
+                    "run_id": context.run.run_id,
+                    "request_id": turn.request_id,
+                },
+            )
+            return turn
+        except BaseException:
+            try:
+                DshSessions.update(binding, quarantined="initialization_unconfirmed")
+            except Exception as exc:
+                context.run.operations.setdefault("dsh", {})["mapping_error"] = type(
+                    exc
+                ).__name__
+                logger.warning(
+                    "DSH 初始化结果未能写入映射，保留原记录等待核验。", LOG_NAME
+                )
+            finally:
+                await cls.release(turn)
+            raise
 
-    参数:
-        part: 图片片段
+    @classmethod
+    async def _start_native(cls, turn, settings, revision):
+        """接入原生 Agent，保留其模型、思考等级、计划模式及执行权限。"""
+        from nonebot import get_driver
 
-    返回:
-        dict[str, Any] | None: 图片块，读取不到时为空
-    """
-    from PIL import Image
+        from .dsh_control import DshControl
 
-    data = part.raw
-    if data is None and part.path is not None:
-        data = part.path.read_bytes()
-    if not data:
+        binding, client, context = turn.binding, turn.client, turn.context
+        marker = read_json_locked(DSH_PATH / "forwarding-ready.json", None, strict=True)
+        if (
+            not marker
+            or marker.get("pid") != client.identity[0]
+            or marker.get("revision") != revision
+        ):
+            raise DshUnavailable("桌面转发重试组件尚未就绪，未发送问题。")
+        if not binding["created"]:
+            workspace = DSH_PATH / "agent-workspaces" / binding["owner"]
+            workspace.mkdir(parents=True, exist_ok=True)
+            created = await client.rpc(
+                "session/create",
+                {
+                    "sessionId": binding["remote_id"],
+                    "cwd": str(workspace.resolve()),
+                    "agentPreset": "standard",
+                },
+            )
+            if created.get("sessionId") != binding["remote_id"]:
+                raise DshUnavailable("桌面返回了不同会话，未提交问题。")
+            DshSessions.update(binding, created=True, cwd=str(workspace.resolve()))
+        observed = await client.rpc(
+            "session/projections", {"sessionId": binding["remote_id"]}
+        )
+        if not observed or observed.get("kind") != "sequenced":
+            raise DshUnavailable("原会话不存在或需要桌面处理格式升级。")
+        info = DshControl.describe(
+            {
+                "sessionId": binding["remote_id"],
+                "projections": observed,
+                "cwd": binding["cwd"],
+            }
+        )
+        if info["subagent"]:
+            raise DshUnavailable("子代理会话不能作为独立 QQ 会话接入。")
+        state = await client.rpc("session/state", {"sessionId": binding["remote_id"]})
+        if state.get("running") or state.get("queue") or state.get("pendingInput"):
+            raise DshUnavailable("桌面会话仍有任务或等待输入，未抢占原任务。")
+        await client.rpc(
+            "workspace/unarchiveSession", {"sessionId": binding["remote_id"]}
+        )
+        (DSH_PATH / "leases").mkdir(parents=True, exist_ok=True)
+        write_json_locked(
+            DSH_PATH / "leases" / (binding["remote_id"] + ".json"),
+            {
+                "sessionId": binding["remote_id"],
+                "runId": context.run.run_id,
+                "requestId": turn.request_id,
+                "native": True,
+                "token": turn.token,
+                "expires": time.time() + settings.timeout,
+                "authorize": f"http://127.0.0.1:{int(get_driver().config.port)}/zhenxun/api/ai/dsh/authorize",
+            },
+        )
+        DshSessions.update(
+            binding,
+            model=info["model"],
+            plan=info["plan"],
+            preset=info["preset"],
+            title=info["title"],
+            quarantined=None,
+            inflight={
+                "boot": BOOT_ID,
+                "run_id": context.run.run_id,
+                "request_id": turn.request_id,
+            },
+        )
+        turn.proof = {
+            "mode": "native",
+            "model": info["model"],
+            "preset": info["preset"],
+        }
+        context.run.operations["dsh"] = {
+            "session_id": binding["remote_id"],
+            "mode": "native",
+            "guard": "desktop_permissions",
+            "model": info["model"],
+            "preset": info["preset"],
+            "plan": info["plan"],
+            "stop": "not_requested",
+            "background_stop_guarantee": False,
+        }
+        context.run.current_model = "dsh:" + str(
+            (info["model"] or {}).get("model", "desktop")
+        )
+
+    @classmethod
+    async def prompt(cls, turn: _Turn, content: list[dict], timeout: float):
+        from websockets.exceptions import WebSocketException
+
+        if not (turn and turn.binding.get("native")) and any(
+            block.get("type") != "text" for block in content
+        ):
+            raise DshUnavailable(IMAGE_UNAVAILABLE)
+
+        async def collect():
+            await turn.client.verify_process()
+            async with turn.client.mux() as ws:
+                follow, events = uuid.uuid4().hex, uuid.uuid4().hex
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "open",
+                            "streamId": follow,
+                            "endpoint": "session/follow",
+                            "payload": {
+                                "args": {
+                                    "request": {
+                                        "address": {
+                                            "kind": "session",
+                                            "sessionId": turn.binding["remote_id"],
+                                        },
+                                        "activate": False,
+                                        "maxMessages": 1,
+                                    }
+                                }
+                            },
+                        }
+                    )
+                )
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "open",
+                            "streamId": events,
+                            "endpoint": "$events",
+                            "payload": {"args": {}},
+                        }
+                    )
+                )
+                ready = False
+                client_id = None
+                submitted = False
+                while True:
+                    frame = await cls._receive(ws, turn)
+                    if frame.get("type") in {"error", "end"}:
+                        raise RunInterrupted("DSH 事件订阅")
+                    value = frame.get("value") or {}
+                    if frame.get("streamId") == events:
+                        if value.get("type") == "ready":
+                            client_id = value["clientId"]
+                        elif (
+                            value.get("type") == "waterfall"
+                            and value.get("agentId") == turn.binding["remote_id"]
+                            and client_id
+                        ):
+                            task = asyncio.create_task(
+                                cls._answer_event(turn, client_id, value)
+                            )
+                            turn.pending.add(task)
+                    elif frame.get("streamId") == follow:
+                        if value.get("type") == "snapshot":
+                            if submitted:
+                                raise RunInterrupted("DSH 意外历史快照")
+                            ready = True
+                        elif value.get("type") == "event":
+                            outcome = cls.consume(turn, value.get("event") or {})
+                            if outcome is not None:
+                                if not turn.proof:
+                                    raise DshUnavailable("桌面未提供有效执行守卫证据。")
+                                if outcome == "error":
+                                    raise RunInterrupted("DSH 模型请求")
+                                if outcome != "completed":
+                                    raise DshUnavailable(
+                                        f"DSH 本轮未完成（{outcome}）。"
+                                    )
+                                return (
+                                    "\n\n".join(
+                                        t for t in turn.responses.values() if t
+                                    ),
+                                    turn.usage,
+                                    outcome,
+                                )
+                    for task in list(turn.pending):
+                        if task.done():
+                            turn.pending.remove(task)
+                            task.result()
+                    if ready and client_id and not submitted:
+                        submitted = True
+                        receipt = await turn.client.rpc(
+                            "session/prompt",
+                            {
+                                "sessionId": turn.binding["remote_id"],
+                                "requestId": turn.request_id,
+                                "mode": "queue",
+                                "content": content,
+                            },
+                        )
+                        if not receipt or receipt.get("accepted") is not True:
+                            raise RunInterrupted("DSH 输入接收")
+
+        try:
+            return await asyncio.wait_for(collect(), timeout)
+        except (WebSocketException, OSError, ValueError) as exc:
+            raise RunInterrupted("DSH 事件连接") from exc
+
+    @staticmethod
+    async def _receive(ws, turn):
+        incoming = asyncio.create_task(ws.recv())
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {incoming, *turn.pending}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done - {incoming}:
+                    turn.pending.discard(task)
+                    task.result()
+                if incoming in done:
+                    return json.loads(incoming.result())
+        finally:
+            if not incoming.done():
+                incoming.cancel()
+            await asyncio.gather(incoming, return_exceptions=True)
+
+    @staticmethod
+    def consume(turn: _Turn, event: dict) -> str | None:
+        seq = event.get("seq")
+        if not isinstance(seq, int) or seq in turn.seen:
+            return None
+        turn.seen.add(seq)
+        data, kind = event.get("data") or {}, event.get("type")
+        if (
+            kind == "user/message"
+            and (data.get("source") or {}).get("rpcId") == turn.request_id
+        ):
+            turn.admitted = True
+        if kind == "turn/start":
+            turn.remote_turn = data.get("turn")
+        if not turn.admitted or data.get("turn") not in {None, turn.remote_turn}:
+            return None
+        tools = turn.context.run.operations.setdefault("dsh_tools", {})
+        callback = turn.context.state.get("_dsh_event")
+        if kind in {"llm/retry", "llm/retry-started"}:
+            progress = {
+                "attempt": int(data.get("retry") or 0) + 1,
+                "max_attempts": 5,
+                "delay_seconds": float(data.get("delayMs") or 0) / 1000,
+                "state": "waiting" if kind == "llm/retry" else "running",
+                "code": (data.get("failure") or {}).get("code"),
+            }
+            turn.context.run.operations.setdefault("dsh", {})["retry"] = progress
+            if callback:
+                callback(
+                    {"type": "retry", "run_id": turn.context.run.run_id, **progress}
+                )
+        if kind == "tool/call":
+            call_id = str(data.get("callId") or "")
+            tools[call_id] = {"name": data.get("name"), "status": "running"}
+            if callback:
+                callback(
+                    {
+                        "type": "tool_start",
+                        "run_id": turn.context.run.run_id,
+                        "tool_call_id": call_id,
+                        "name": data.get("name"),
+                        "arguments": json.dumps(
+                            data.get("arguments"), ensure_ascii=False
+                        )[:2000],
+                    }
+                )
+        elif kind == "tool/result":
+            message = data.get("message") or {}
+            call_id = str(message.get("toolCallId") or "")
+            if call_id in tools:
+                tools[call_id]["status"] = (
+                    "failed" if message.get("isError") else "completed"
+                )
+                if callback:
+                    callback(
+                        {
+                            "type": "tool_end",
+                            "run_id": turn.context.run.run_id,
+                            "tool_call_id": call_id,
+                            "name": tools[call_id]["name"],
+                            "is_error": bool(message.get("isError")),
+                            "result": "\n".join(
+                                p.get("text", "")
+                                for p in message.get("content", [])
+                                if p.get("type") == "text"
+                            )[:2000],
+                        }
+                    )
+        if kind == "assistant/message":
+            message = data.get("message") or {}
+            message_id = message.get("id")
+            if not message_id or message_id in turn.responses:
+                return None
+            turn.responses[message_id] = "".join(
+                str(p.get("text") or "")
+                for p in message.get("content") or []
+                if p.get("type") == "text"
+            )
+            counts = data.get("usage") or {}
+            cached = int(counts.get("cacheReadTokens") or 0)
+            prompt = int(counts.get("inputTokens") or 0) + cached
+            output = int(counts.get("outputTokens") or 0)
+            turn.usage.prompt_tokens += prompt
+            turn.usage.prompt_cache_hit_tokens += cached
+            turn.usage.completion_tokens += output
+            turn.usage.total_tokens += int(counts.get("totalTokens") or prompt + output)
+            turn.context.run.budget["tokens"] = turn.usage.total_tokens
+        if kind == "turn/end":
+            return (data.get("reason") or {}).get("kind", "unknown")
         return None
-    try:
-        with Image.open(BytesIO(data)) as image:
-            mime = IMAGE_TYPES.get(image.format or "")
-            if mime is None:
-                buffer = BytesIO()
-                image.save(buffer, "PNG")
-                data, mime = buffer.getvalue(), "image/png"
-    except Exception:
-        return None
-    return {"type": "image", "data": base64.b64encode(data).decode(), "mimeType": mime}
+
+    @classmethod
+    async def _answer_event(cls, turn, client_id, value):
+        event_id = value.get("eventId")
+        if not isinstance(event_id, str) or event_id in turn.event_ids:
+            return
+        turn.event_ids.add(event_id)
+        request = value.get("request") or {}
+        PermissionUtils.ensure_current(turn.context)
+        if value.get("event") == "approval/request":
+            allowed = await turn.approve(
+                str(request.get("toolName", "")), str(request.get("reason", ""))
+            )
+            answer = "allowed-once" if allowed else "rejected"
+        elif value.get("event") == "user-questions/request":
+            answers = []
+            for q in request.get("questions") or []:
+                options = [str(o.get("label", "")) for o in q.get("options") or []]
+                question = str(q.get("question", ""))
+                if q.get("detail"):
+                    question += "\n\n" + str(q["detail"])
+                if options:
+                    question += "\n" + "\n".join(
+                        f"{i}. {label}" for i, label in enumerate(options, 1)
+                    )
+                reply = (await turn.ask(question)).strip()
+                if reply.isdigit() and 0 < int(reply) <= len(options):
+                    reply = options[int(reply) - 1]
+                answers.append(
+                    {
+                        "id": q.get("id"),
+                        "selected": [reply] if reply in options else [],
+                        **({"custom": reply} if reply not in options else {}),
+                    }
+                )
+            answer = {"answers": answers}
+        else:
+            return
+        await turn.client.rpc(
+            "$events/result",
+            args={
+                "clientId": client_id,
+                "eventId": value["eventId"],
+                "outcome": {"kind": "result", "value": answer},
+            },
+        )
+
+    @classmethod
+    async def interrupt(cls, turn):
+        turn.revoked = True
+        for entry in turn.context.run.operations.get("dsh_tools", {}).values():
+            if entry["status"] == "running":
+                entry["status"] = "unknown"
+        from zhenxun.services.ai.run.session import session_manager
+
+        remaining = session_manager.cleanup_remaining(turn.context)
+        native = turn.binding.get("native")
+        explicit = (
+            turn.context.run.cancellation_token
+            and turn.context.run.cancellation_token.reason == "cancelled"
+        )
+        try:
+            if native and not explicit:
+                state = await asyncio.wait_for(
+                    turn.client.rpc(
+                        "session/state", {"sessionId": turn.binding["remote_id"]}
+                    ),
+                    max(0.001, remaining),
+                )
+                turn.stop_confirmation = (
+                    "foreground_idle"
+                    if not state.get("running")
+                    and not state.get("queue")
+                    and not state.get("pendingInput")
+                    else "desktop_continues"
+                )
+            else:
+                turn.stop_confirmation = await asyncio.wait_for(
+                    turn.client.stop(turn.binding["remote_id"], turn.request_id),
+                    max(0.001, remaining),
+                )
+                if native and turn.stop_confirmation == "confirmed":
+                    turn.stop_confirmation = "foreground_confirmed"
+        except (Exception, RunInterrupted):
+            turn.stop_confirmation = "unknown"
+        turn.context.run.operations.setdefault("dsh", {})["stop"] = (
+            turn.stop_confirmation
+        )
+        try:
+            DshSessions.update(
+                turn.binding,
+                quarantined="interrupted",
+                inflight=None
+                if turn.stop_confirmation
+                in {"confirmed", "foreground_confirmed", "foreground_idle"}
+                else {
+                    "boot": BOOT_ID,
+                    "run_id": turn.context.run.run_id,
+                    "request_id": turn.request_id,
+                },
+            )
+        except Exception as exc:
+            turn.context.run.operations["dsh"]["mapping_error"] = type(exc).__name__
+            logger.warning("DSH 停止结果未能写入映射，保留原记录等待核验。", LOG_NAME)
+
+    @classmethod
+    async def release(cls, turn):
+        turn.revoked = True
+        for task in turn.pending:
+            task.cancel()
+        if turn.pending:
+            await asyncio.gather(*turn.pending, return_exceptions=True)
+        cls._turns.pop(turn.context.run.run_id, None)
+        try:
+            (DSH_PATH / "leases" / (turn.binding["remote_id"] + ".json")).unlink(
+                missing_ok=True
+            )
+        except OSError:
+            turn.context.run.operations.setdefault("dsh", {})["cleanup_pending"] = True
+            logger.warning("DSH 运行已撤权，授权文件清理待重试。", LOG_NAME)
+        finally:
+            await turn.client.close()
+
+    @classmethod
+    async def close(cls):
+        async def stop(turn):
+            try:
+                await cls.interrupt(turn)
+            finally:
+                await cls.release(turn)
+
+        await asyncio.gather(
+            *(stop(t) for t in list(cls._turns.values())), return_exceptions=True
+        )
 
 
-async def content_blocks(parts: list[Any]) -> list[dict[str, Any]]:
-    """把消息片段转为 dsh 的内容块：文字原样，图片内联，其他媒体换为占位文字
+async def content_blocks(
+    parts: list[Any], *, native: bool = False
+) -> list[dict[str, Any]]:
+    """把文字转换为桌面内容块；不支持可靠中断的图片输入明确拒绝
 
     参数:
         parts: 消息片段
@@ -168,8 +1120,6 @@ async def content_blocks(parts: list[Any]) -> list[dict[str, Any]]:
     返回:
         list[dict[str, Any]]: 内容块
     """
-    from zhenxun.services.ai.utils.utils import MediaFetchError, fetch_media
-
     blocks: list[dict[str, Any]] = []
     for part in parts:
         if isinstance(part, TextPart):
@@ -177,539 +1127,38 @@ async def content_blocks(parts: list[Any]) -> list[dict[str, Any]]:
                 blocks.append({"type": "text", "text": part.text})
             continue
         if isinstance(part, ImagePart):
-            if part.url and part.raw is None and part.path is None:
-                try:
-                    part = ImagePart(
-                        raw=await fetch_media(part.url, allow_private=True)
-                    )
-                except MediaFetchError as e:
-                    logger.debug(f"图片下载失败: {e}", LOG_NAME)
-            if block := await asyncio.to_thread(_image_block, part):
-                blocks.append(block)
-                continue
-            blocks.append({"type": "text", "text": "[图片，未能读取]"})
+            if not native:
+                raise DshUnavailable(IMAGE_UNAVAILABLE)
+            from PIL import Image
+
+            from zhenxun.services.ai.utils.utils import fetch_media
+
+            raw = part.raw
+            if raw is None and part.path is not None:
+                raw = await asyncio.to_thread(part.path.read_bytes)
+            if raw is None and part.url:
+                raw = await fetch_media(part.url)
+            if not raw:
+                raise DshUnavailable("图片内容不可读取，未发送桌面请求。")
+            with Image.open(BytesIO(raw)) as image:
+                mime = {
+                    "PNG": "image/png",
+                    "JPEG": "image/jpeg",
+                    "GIF": "image/gif",
+                    "WEBP": "image/webp",
+                }.get(image.format or "")
+                if not mime:
+                    output = BytesIO()
+                    image.save(output, "PNG")
+                    raw, mime = output.getvalue(), "image/png"
+            blocks.append(
+                {
+                    "type": "image",
+                    "data": base64.b64encode(raw).decode(),
+                    "mediaType": mime,
+                }
+            )
             continue
         kind = getattr(part, "type", "")
         blocks.append({"type": "text", "text": f"[{kind or '附件'}]"})
     return blocks
-
-
-class DshRuntime:
-    """dsh SDK 运行时：懒启动的单个子进程，所有会话共用一套模型；
-    设置变化时重启，退出时先请求 shutdown 再结束进程树"""
-
-    _proc: ClassVar[asyncio.subprocess.Process | None] = None
-    _reader: ClassVar[asyncio.Task | None] = None
-    _stderr: ClassVar[asyncio.Task | None] = None
-    _serving: ClassVar[set[asyncio.Task]] = set()
-    _pending: ClassVar[dict[int, asyncio.Future]] = {}
-    _turns: ClassVar[dict[str, _Turn]] = {}
-    _next_id: ClassVar[int] = 0
-    _key: ClassVar[str] = ""
-    _lock: ClassVar[asyncio.Lock | None] = None
-
-    @classmethod
-    def running(cls) -> bool:
-        """运行时进程是否在运行
-
-        返回:
-            bool: 是否在运行
-        """
-        return cls._proc is not None and cls._proc.returncode is None
-
-    @classmethod
-    async def ensure(cls, settings: DshSettings) -> None:
-        """确保运行时已按当前设置启动并完成握手
-
-        参数:
-            settings: dsh 设置
-
-        异常:
-            LLMException: 找不到 dsh、没有 API Key 或握手失败
-        """
-        if cls._lock is None:
-            cls._lock = asyncio.Lock()
-        key = settings.model_dump_json()
-        async with cls._lock:
-            if cls.running() and cls._key == key:
-                return
-            await cls.close()
-            await cls._start(settings)
-            cls._key = key
-
-    @classmethod
-    async def _start(cls, settings: DshSettings) -> None:
-        """启动子进程并发送 initialize
-
-        参数:
-            settings: dsh 设置
-        """
-        binary = settings.bin.strip() or shutil.which("dsh")
-        if not binary or not Path(binary).exists():
-            raise LLMException("找不到 dsh 可执行文件，请在聊天设置的 DSH 中填写 bin。")
-        api_key, base_url = _api_key(settings)
-        home, workspace = DSH_PATH / "home", DSH_PATH / "workspace"
-        home.mkdir(parents=True, exist_ok=True)
-        workspace.mkdir(parents=True, exist_ok=True)
-        args = [binary, "--profile", "sdk"]
-        if not settings.allow_tools:
-            patch = DSH_PATH / "zhenxun.patch.yml"
-            patch.write_text(_patch(), encoding="utf-8")
-            args += ["--patch", str(patch.resolve())]
-        env = {**os.environ, "DSH_HOME": str(home.resolve())}
-        env["DEEPSEEK_API_KEY"] = api_key
-        if base_url:
-            env["DEEPSEEK_BASE_URL"] = base_url
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
-        cls._proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(workspace.resolve()),
-            env=env,
-            limit=64 * 1024 * 1024,
-            creationflags=flags,
-            start_new_session=sys.platform != "win32",
-        )
-        cls._reader = asyncio.create_task(cls._read_loop(cls._proc))
-        cls._stderr = asyncio.create_task(cls._read_stderr(cls._proc))
-        params: dict[str, Any] = {
-            "cwd": str(workspace.resolve()),
-            "provider": settings.provider,
-            "model": settings.model,
-            "approvalRequests": True,
-            "capabilities": {"userQuestions": True},
-        }
-        if settings.reasoning_effort:
-            params["reasoningEffort"] = settings.reasoning_effort
-        if settings.max_tokens:
-            params["maxTokens"] = settings.max_tokens
-        try:
-            info = await cls.request("initialize", params, 60)
-        except LLMException:
-            await cls.close()
-            raise
-        logger.info(f"dsh 运行时已启动: {info.get('serverInfo')}", LOG_NAME)
-
-    @classmethod
-    async def request(cls, method: str, params: Any, timeout: float = 30) -> Any:
-        """发送一个请求并等待响应
-
-        参数:
-            method: 方法名
-            params: 参数
-            timeout: 超时秒数
-
-        返回:
-            Any: 响应结果
-
-        异常:
-            LLMException: 运行时未启动、超时或返回错误
-        """
-        proc = cls._proc
-        if proc is None or proc.stdin is None or proc.returncode is not None:
-            raise LLMException("dsh 运行时未启动。")
-        cls._next_id += 1
-        request_id = cls._next_id
-        future = asyncio.get_running_loop().create_future()
-        cls._pending[request_id] = future
-        await cls._write(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                **({"params": params} if params is not None else {}),
-            }
-        )
-        try:
-            return await asyncio.wait_for(future, timeout)
-        except asyncio.TimeoutError as e:
-            raise LLMException(f"dsh 请求 {method} 超时。") from e
-        finally:
-            cls._pending.pop(request_id, None)
-
-    @classmethod
-    async def _write(cls, message: dict[str, Any]) -> None:
-        """写入一行 JSON-RPC 消息
-
-        参数:
-            message: 消息
-        """
-        proc = cls._proc
-        if proc is None or proc.stdin is None:
-            return
-        proc.stdin.write(json.dumps(message, ensure_ascii=False).encode() + b"\n")
-        await proc.stdin.drain()
-
-    @classmethod
-    async def _read_loop(cls, proc: asyncio.subprocess.Process) -> None:
-        """读取标准输出，分发响应、通知与服务端请求
-
-        参数:
-            proc: 子进程
-        """
-        assert proc.stdout is not None
-        while line := await proc.stdout.readline():
-            try:
-                message = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(message, dict):
-                continue
-            method, request_id = message.get("method"), message.get("id")
-            if method and request_id is not None:
-                task = asyncio.create_task(cls._serve(request_id, method, message))
-                cls._serving.add(task)
-                task.add_done_callback(cls._serving.discard)
-            elif request_id is not None:
-                future = cls._pending.get(request_id)
-                if future is None or future.done():
-                    continue
-                if error := message.get("error"):
-                    future.set_exception(
-                        LLMException(f"dsh 返回错误: {error.get('message', error)}")
-                    )
-                else:
-                    future.set_result(message.get("result") or {})
-            elif method:
-                cls._notify(method, message.get("params") or {})
-        for future in cls._pending.values():
-            if not future.done():
-                future.set_exception(LLMException("dsh 运行时已退出。"))
-        for turn in cls._turns.values():
-            turn.events.append(("exit", {}))
-            turn.changed.set()
-        logger.warning(f"dsh 运行时已退出，返回码 {await proc.wait()}", LOG_NAME)
-
-    @classmethod
-    async def _read_stderr(cls, proc: asyncio.subprocess.Process) -> None:
-        """把标准错误输出写入调试日志
-
-        参数:
-            proc: 子进程
-        """
-        assert proc.stderr is not None
-        while line := await proc.stderr.readline():
-            logger.debug(line.decode(errors="replace").rstrip(), LOG_NAME)
-
-    @classmethod
-    def _notify(cls, method: str, params: dict[str, Any]) -> None:
-        """把通知交给对应会话正在进行的一轮对话
-
-        参数:
-            method: 通知方法
-            params: 通知参数
-        """
-        if turn := cls._turns.get(str(params.get("sessionId", ""))):
-            turn.events.append((method, params))
-            turn.changed.set()
-
-    @classmethod
-    async def _serve(cls, request_id: Any, method: str, message: dict) -> None:
-        """应答服务端请求：审批交给会话的审批回调，提问交给会话的提问回调，
-        找不到会话时拒绝或给空答案
-
-        参数:
-            request_id: 请求id
-            method: 方法名
-            message: 请求
-        """
-        params = message.get("params") or {}
-        turn = cls._turns.get(str(params.get("sessionId", "")))
-        try:
-            if method == "approval/request":
-                allowed = turn is not None and await turn.approve(
-                    str(params.get("toolName", "")), str(params.get("reason") or "")
-                )
-                result: Any = {"outcome": "allowed-once" if allowed else "rejected"}
-            elif method == "user-question/ask":
-                result = {"answers": await cls._answer(turn, params.get("questions"))}
-            else:
-                await cls._write(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "error": {"code": -32601, "message": "method not found"},
-                    }
-                )
-                return
-        except Exception as e:
-            logger.debug(f"应答 dsh 请求 {method} 失败: {e}", LOG_NAME)
-            result = (
-                {"outcome": "rejected"}
-                if method == "approval/request"
-                else {"answers": cls._blank(params.get("questions"))}
-            )
-        await cls._write({"jsonrpc": "2.0", "id": request_id, "result": result})
-
-    @staticmethod
-    def _blank(questions: Any) -> list[dict[str, Any]]:
-        """不回答时每个问题的空答案
-
-        参数:
-            questions: 问题
-
-        返回:
-            list[dict[str, Any]]: 答案
-        """
-        items = questions if isinstance(questions, list) else []
-        return [{"id": str(q.get("id", "")), "selected": []} for q in items]
-
-    @classmethod
-    async def _answer(cls, turn: _Turn | None, questions: Any) -> list[dict[str, Any]]:
-        """逐个向用户提问，回复选项编号或名称时选中该选项，否则作为自定义回答
-
-        参数:
-            turn: 会话正在进行的一轮对话
-            questions: 问题
-
-        返回:
-            list[dict[str, Any]]: 答案
-        """
-        if turn is None or not isinstance(questions, list):
-            return cls._blank(questions)
-        answers = []
-        for question in questions:
-            options = [str(o.get("label", "")) for o in question.get("options") or []]
-            lines = [str(question.get("question", ""))]
-            if detail := question.get("detail"):
-                lines.append(str(detail))
-            lines += [f"{i}. {label}" for i, label in enumerate(options, 1)]
-            reply = (await turn.ask("\n".join(lines))).strip()
-            if reply.isdigit() and 0 < int(reply) <= len(options):
-                reply = options[int(reply) - 1]
-            answer: dict[str, Any] = {"id": str(question.get("id", ""))}
-            answer["selected"] = [reply] if reply in options else []
-            if reply not in options:
-                answer["custom"] = reply
-            answers.append(answer)
-        return answers
-
-    @classmethod
-    async def prompt(
-        cls,
-        session_id: str,
-        blocks: list[dict[str, Any]],
-        approve: Approver,
-        ask: Asker,
-        timeout: float,
-    ) -> tuple[str, UsageInfo, str | None]:
-        """发送一轮输入，等到会话回到空闲，取最后一条助手消息
-
-        参数:
-            session_id: dsh 会话id，未知时由 dsh 新建
-            blocks: 内容块
-            approve: 审批回调
-            ask: 提问回调
-            timeout: 超时秒数
-
-        返回:
-            tuple[str, UsageInfo, str | None]: 回复, 用量, 结束原因
-
-        异常:
-            LLMException: 运行时退出、超时或本轮出错
-        """
-        turn = _Turn(approve=approve, ask=ask)
-        cls._turns[session_id] = turn
-        try:
-            receipt = await cls.request(
-                "session/prompt", {"sessionId": session_id, "contentBlocks": blocks}
-            )
-            events = await asyncio.wait_for(
-                cls._collect(turn, str(receipt.get("messageId", ""))), timeout
-            )
-        except asyncio.TimeoutError as e:
-            raise LLMException("dsh 回复超时。") from e
-        finally:
-            if cls._turns.get(session_id) is turn:
-                cls._turns.pop(session_id)
-        return cls._result(events)
-
-    @staticmethod
-    async def _collect(turn: _Turn, message_id: str) -> list[dict[str, Any]]:
-        """收集本轮输入被接收之后、会话回到空闲之前的会话事件
-
-        参数:
-            turn: 本轮对话
-            message_id: 输入的消息id
-
-        返回:
-            list[dict[str, Any]]: 会话事件
-        """
-        index, started, events = 0, False, []
-        while True:
-            await turn.changed.wait()
-            turn.changed.clear()
-            while index < len(turn.events):
-                method, params = turn.events[index]
-                index += 1
-                if method == "exit":
-                    raise LLMException("dsh 运行时已退出。")
-                event = params.get("event")
-                if method == "session.event" and isinstance(event, dict):
-                    if not started:
-                        inserted = (event.get("data") or {}).get("inserted") or []
-                        started = event.get("type") == "agent/inbox/spliced" and any(
-                            isinstance(m, dict) and m.get("id") == message_id
-                            for m in inserted
-                        )
-                    if started:
-                        events.append(event)
-                elif (
-                    method == "session.status"
-                    and started
-                    and params.get("status") == "idle"
-                ):
-                    return events
-
-    @staticmethod
-    def _result(events: list[dict[str, Any]]) -> tuple[str, UsageInfo, str | None]:
-        """从会话事件中取最后一条助手消息、累计用量与结束原因
-
-        参数:
-            events: 会话事件
-
-        返回:
-            tuple[str, UsageInfo, str | None]: 回复, 用量, 结束原因
-        """
-        text, usage, reason = "", UsageInfo(), None
-        for event in events:
-            data = event.get("data") or {}
-            if event.get("type") == "assistant/message":
-                if counts := data.get("usage"):
-                    prompt = int(counts.get("inputTokens") or 0)
-                    cached = int(counts.get("cacheReadTokens") or 0)
-                    output = int(counts.get("outputTokens") or 0)
-                    usage.prompt_tokens += prompt + cached
-                    usage.prompt_cache_hit_tokens += cached
-                    usage.completion_tokens += output
-                    usage.total_tokens += int(
-                        counts.get("totalTokens") or prompt + cached + output
-                    )
-                message = data.get("message") or data
-                content = message.get("content") if isinstance(message, dict) else None
-                if isinstance(content, list):
-                    text = (
-                        "".join(
-                            str(block.get("text") or "")
-                            for block in content
-                            if isinstance(block, dict) and block.get("type") == "text"
-                        )
-                        or text
-                    )
-            elif event.get("type") == "turn/end":
-                reason = (data.get("reason") or {}).get("kind")
-        if reason == "error":
-            raise LLMException("dsh 本轮对话出错。")
-        return text, usage, reason
-
-    @classmethod
-    async def close(cls) -> None:
-        """关闭运行时：请求 shutdown，未退出时结束整个进程树"""
-        proc, cls._proc = cls._proc, None
-        cls._key = ""
-        if proc is None:
-            return
-        if proc.returncode is None:
-            cls._proc = proc
-            try:
-                await cls.request("shutdown", None, 5)
-            except LLMException:
-                pass
-            cls._proc = None
-            if proc.stdin:
-                proc.stdin.close()
-            try:
-                await asyncio.wait_for(proc.wait(), 5)
-            except asyncio.TimeoutError:
-                await cls._kill_tree(proc)
-        for task in (cls._reader, cls._stderr):
-            if task and not task.done():
-                task.cancel()
-        cls._reader = cls._stderr = None
-
-    @staticmethod
-    async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
-        """结束子进程及其全部后代进程
-
-        参数:
-            proc: 子进程
-        """
-        if sys.platform == "win32":
-            killer = await asyncio.create_subprocess_exec(
-                "taskkill",
-                "/T",
-                "/F",
-                "/PID",
-                str(proc.pid),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await killer.wait()
-        else:
-            import signal
-
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        try:
-            await asyncio.wait_for(proc.wait(), 5)
-        except asyncio.TimeoutError:
-            logger.warning(f"dsh 进程 {proc.pid} 未能结束", LOG_NAME)
-
-
-class DshSessions:
-    """zhenxun 会话 → dsh 会话的映射，存于 data/ai/dsh/sessions.json；
-    人设变化或重置时换一个新的 dsh 会话"""
-
-    _data: ClassVar[dict[str, dict[str, str]] | None] = None
-    FILE = DSH_PATH / "sessions.json"
-
-    @classmethod
-    def _load(cls) -> dict[str, dict[str, str]]:
-        if cls._data is None:
-            try:
-                cls._data = json.loads(cls.FILE.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                cls._data = {}
-        return cls._data  # type: ignore[return-value]
-
-    @classmethod
-    def _save(cls) -> None:
-        cls.FILE.parent.mkdir(parents=True, exist_ok=True)
-        cls.FILE.write_text(
-            json.dumps(cls._load(), ensure_ascii=False, indent=1), encoding="utf-8"
-        )
-
-    @classmethod
-    def get(cls, session_id: str, persona_key: str) -> tuple[str, bool]:
-        """取会话对应的 dsh 会话，没有或人设已变化时新建
-
-        参数:
-            session_id: zhenxun 会话id
-            persona_key: 人设标识（id 与修改时间）
-
-        返回:
-            tuple[str, bool]: dsh 会话id, 是否为新会话
-        """
-        import uuid
-
-        data = cls._load()
-        item = data.get(session_id)
-        if item and item.get("persona") == persona_key:
-            return item["id"], False
-        data[session_id] = {"id": f"zx-{uuid.uuid4().hex}", "persona": persona_key}
-        cls._save()
-        return data[session_id]["id"], True
-
-    @classmethod
-    def reset(cls, session_id: str) -> None:
-        """忘记会话对应的 dsh 会话，下一轮换新会话
-
-        参数:
-            session_id: zhenxun 会话id
-        """
-        if cls._load().pop(session_id, None) is not None:
-            cls._save()

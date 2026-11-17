@@ -119,6 +119,15 @@ def validate_access_token(token: str) -> bool:
     return _decode_access_token(token) is not None
 
 
+def management_subject_valid(subject: str | None) -> bool:
+    """核对持久计划的管理主体仍有效，不沿用创建时的 JWT。"""
+    return bool(
+        subject
+        and str(Config.get_config("web-ui", "username")) == subject
+        and Config.get_config("web-ui", "password")
+    )
+
+
 def _spawn_expiry_task(websocket: WebSocket, expires_at: float) -> asyncio.Task[None]:
     coroutine = _expire_websocket(websocket, expires_at)
     if _LIFECYCLE_CONTEXT is not None:

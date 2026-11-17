@@ -4,6 +4,7 @@ from .characters import router as characters_router
 from .chat import router as chat_router
 from .configuration import router as configuration_router
 from .console import router as console_router
+from .dsh import router as dsh_router
 from .knowledge import router as knowledge_router
 from .mcp import router as mcp_router
 from .memory import router as memory_router
@@ -22,6 +23,7 @@ router.include_router(proactive_router)
 router.include_router(sessions_router)
 router.include_router(sandbox_router)
 router.include_router(console_router)
+router.include_router(dsh_router)
 router.include_router(stats_router)
 router.include_router(social_router)
 router.include_router(knowledge_router)

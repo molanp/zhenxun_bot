@@ -60,4 +60,18 @@ class AIAgentRun(Model):
             int: 删除条数
         """
         cutoff = localtime(datetime.now(timezone.utc) - timedelta(days=keep_days))
-        return await cls.filter(created_at__lt=cutoff).delete()
+        return (
+            await cls.filter(created_at__lt=cutoff)
+            .exclude(
+                status__in=[
+                    "queued",
+                    "running",
+                    "delivering",
+                    "settling",
+                    "stopping",
+                    "unknown",
+                    "interrupted",
+                ]
+            )
+            .delete()
+        )

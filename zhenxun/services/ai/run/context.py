@@ -4,6 +4,7 @@ import dataclasses
 import inspect
 from typing import Any, Generic, cast, get_origin
 from typing_extensions import TypeVar
+import uuid
 
 from nonebot.adapters import Bot, Event
 from nonebot.matcher import Matcher, current_bot, current_event, current_matcher
@@ -19,6 +20,17 @@ from zhenxun.utils.utils import infer_plugin_namespace
 
 AgentDepsT = TypeVar("AgentDepsT", default=Any)
 """泛型类型变量：外部环境依赖对象 (Agent Dependencies)。"""
+
+
+@dataclasses.dataclass(frozen=True)
+class CallerIdentity:
+    """由入口绑定的调用者与目标，不接收模型提供的身份字段。"""
+
+    source: str
+    platform: str
+    bot_id: str
+    user_id: str | None
+    group_id: str | None
 
 
 class NoneBotDeps(BaseModel):
@@ -121,6 +133,25 @@ class AgentRunContext(Generic[AgentDepsT]):
     """写入短期记忆时附加到本轮消息上的元数据。"""
     user_notice: str | None = None
     """可直接展示给用户的失败原因。"""
+    caller: CallerIdentity | None = None
+    management_check: Any = None
+    tool_ceiling: frozenset[str] | None = None
+    available_tools: frozenset[str] = frozenset()
+    bound_tools: dict[str, Any] = dataclasses.field(default_factory=dict)
+    delegated_agent_tools: list[Any] | None = None
+    operations: dict[str, Any] = dataclasses.field(default_factory=dict)
+    """根运行共享的副作用结果、互斥与诊断，不跨对话轮次复用。"""
+    root_session_id: str | None = None
+    root_revision: int | None = None
+    run_id: str = dataclasses.field(default_factory=lambda: uuid.uuid4().hex)
+    parent_run_id: str | None = None
+    phase: str = "queued"
+    outcome: str | None = None
+    fail_fast: bool = False
+    connection_id: str | None = None
+    on_accept: Any = None
+    prepare_follow_up: Any = None
+    """由当前运行在追加输入消费边界准备背景，不重新执行整套检索。"""
 
     dynamic_prompts: dict[str, str] = dataclasses.field(default_factory=dict)
     """动态提示词字典（保持插入顺序并去重）。
@@ -207,10 +238,14 @@ class RunContext(Generic[AgentDepsT]):
 
     def get_user_id(self) -> str | None:
         """安全提取当前触发任务的用户 ID"""
+        if (run := getattr(self, "run", None)) and run.caller:
+            return run.caller.user_id
         return ContextUtils.extract_user_id(self.deps)
 
     def get_group_id(self) -> str | None:
         """安全提取当前触发任务的群组 ID（私聊则为 None）"""
+        if (run := getattr(self, "run", None)) and run.caller:
+            return run.caller.group_id
         return ContextUtils.extract_group_id(self.deps)
 
     def get_platform(self) -> str:
@@ -271,13 +306,68 @@ def get_current_run_context() -> RunContext | None:
     return _CURRENT_RUN_CONTEXT.get()
 
 
+def fail_fast_enabled() -> bool:
+    """仅当前 AI 运行及继承其上下文的调用采用首次失败即停。"""
+    context = get_current_run_context()
+    return bool(context and context.run.fail_fast)
+
+
+def interrupt_network(stage: str, error: BaseException | None = None) -> None:
+    """中断根运行并取消兄弟执行，不把通信失败降级成可重试工具结果。"""
+    from zhenxun.services.ai.core.exceptions import RunInterrupted
+    from zhenxun.services.ai.run.session import session_manager
+
+    context = get_current_run_context()
+    if context is None or not context.run.fail_fast:
+        return
+    context.run.operations["interruption"] = stage
+    context.run.outcome = "interrupted"
+    session_manager.interrupt_siblings(context, "network")
+    raise RunInterrupted(stage) from error
+
+
+def interrupt_transport(error: BaseException, stage: str) -> None:
+    """按异常类型识别传输失败；完整业务拒绝仍交给工具正常返回。"""
+    import asyncio
+    import ssl
+
+    import anyio
+    import httpx
+
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(
+            item,
+            httpx.TransportError
+            | asyncio.TimeoutError
+            | ConnectionError
+            | ssl.SSLError
+            | anyio.EndOfStream
+            | anyio.BrokenResourceError
+            | anyio.ClosedResourceError,
+        ):
+            interrupt_network(stage, error)
+        if item.__cause__:
+            pending.append(item.__cause__)
+        pending.extend(getattr(item, "exceptions", ()))
+
+
 @contextmanager
 def set_run_context(ctx: RunContext):
     """[内部 API] 挂载当前上下文至全局"""
+    from zhenxun.utils.decorator.retry import network_fail_fast
+
     token = _CURRENT_RUN_CONTEXT.set(ctx)
+    network_token = network_fail_fast.set(bool(ctx and ctx.run.fail_fast))
     try:
         yield
     finally:
+        network_fail_fast.reset(network_token)
         _CURRENT_RUN_CONTEXT.reset(token)
 
 

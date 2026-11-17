@@ -123,6 +123,52 @@ class Trigger:
         return DateTrigger(**kwargs)
 
 
+class TaskOutcome(BaseModel):
+    """任务执行结果；旧插件正常返回 None 仍视为成功。"""
+
+    status: Literal[
+        "SUCCESS",
+        "FAILURE",
+        "SKIPPED",
+        "INTERRUPTED",
+        "CANCELLED",
+        "TIMEOUT",
+        "EXHAUSTED",
+        "UNKNOWN",
+        "MISSED",
+    ] = "SUCCESS"
+    reason: str = ""
+
+    @classmethod
+    def collect(cls, results: list) -> "TaskOutcome":
+        """汇总所有目标，任何未成功结果都不能被覆盖为完整成功。"""
+        if not results:
+            return cls(status="SKIPPED", reason="没有可执行目标")
+        outcomes = [
+            item
+            if isinstance(item, cls)
+            else cls(status="FAILURE")
+            if isinstance(item, BaseException)
+            else cls()
+            for item in results
+        ]
+        for status in (
+            "UNKNOWN",
+            "INTERRUPTED",
+            "CANCELLED",
+            "TIMEOUT",
+            "FAILURE",
+            "EXHAUSTED",
+            "MISSED",
+            "SKIPPED",
+        ):
+            if match := next(
+                (item for item in outcomes if item.status == status), None
+            ):
+                return match
+        return cls()
+
+
 class ExecutionOptions(BaseModel):
     """
     封装定时任务的执行策略，包括重试和回调。

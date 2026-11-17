@@ -6,7 +6,19 @@ from zhenxun.services.ai.utils.runtime import PermissionUtils
 
 
 class SuperuserCapability(AbstractCapability):
-    """仅超级管理员可见"""
+    """仅当前具有超管授权的调用者可见并执行。"""
+
+    async def wrap_tool_execute(self, context, tool_name, arguments, handler):
+        from zhenxun.services.ai.tools.models import ToolResult
+
+        if not await PermissionUtils.check_superuser(context):
+            context.run.operations["permission_reason"] = context.state.get(
+                "_permission_reason", "缺少超管授权"
+            )
+            return ToolResult(output="当前没有超级用户授权，操作未执行。").as_error(
+                False
+            )
+        return await handler(arguments)
 
     async def prepare_tools(
         self, context: RunContext, tool_defs: list[Any]

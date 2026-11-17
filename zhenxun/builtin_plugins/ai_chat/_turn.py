@@ -9,6 +9,7 @@ from zhenxun.models.ai_chat_group import AIChatGroup
 from zhenxun.models.ai_persona import AIPersona
 from zhenxun.models.ai_token_usage import AITokenUsage
 from zhenxun.services.ai.context.memory.engine import chat_backend
+from zhenxun.services.ai.context.memory.models import HistorySettlement
 from zhenxun.services.ai.flow.agent.agent import Agent
 from zhenxun.services.ai.message_segments import is_voice
 from zhenxun.services.ai.run.context import RunContext
@@ -64,6 +65,9 @@ class ChatTurn:
             session_manager.revision(session_id) if revision is None else revision
         )
         self.run_id = start_run(context)
+        session_manager.register(context)
+        context.run.root_session_id = session_id
+        context.run.root_revision = self.revision
         self.started, self.started_at = time.monotonic(), time.time()
         self.result: Any = None
         self.delivery = DeliveryResult()
@@ -76,6 +80,12 @@ class ChatTurn:
             "sender": sender,
             "persona": self.persona,
         }
+
+    def select_agent(self, agent: Agent, persona: AIPersona | None) -> None:
+        """在执行窗口选定 Agent，并让历史及结算采用同一人设。"""
+        self.agent = agent
+        self.persona = persona.name if persona else None
+        self.context.run.history_metadata["persona"] = self.persona
 
     @property
     def current(self) -> bool:
@@ -91,10 +101,16 @@ class ChatTurn:
     @property
     def tool_texts(self) -> list[str]:
         """本轮通过发送工具发出的文本"""
-        return self.context.state.get("_sent_texts", [])
+        return [
+            entry["text"]
+            for record in self.context.run.operations.get("deliveries", {}).values()
+            for entry in record["entries"]
+            if entry["origin"] == "tool"
+        ]
 
     def report(self, error: BaseException | None = None) -> dict:
-        """汇总投递结果，发送工具已经发出内容时视为已送达（出错时为部分送达）
+        """汇总投递结果：本轮回复（含失败提示）确认送达时为已送达，出错前只由发送工具
+        发出部分内容时为部分送达
 
         参数:
             error: 本轮的异常
@@ -103,9 +119,53 @@ class ChatTurn:
             dict: 投递报告
         """
         report = self.delivery.as_dict()
-        report["text"] = "\n".join([*self.tool_texts, *self.delivery.parts])
-        if self.tool_texts and report["status"] in {"pending", "skipped", "failed"}:
-            report["status"] = "partial" if error else "sent"
+        operations = self.context.run.operations
+        records = list(operations.get("deliveries", {}).values())
+        entries = [entry for record in records for entry in record["entries"]]
+        report["text"] = "\n".join(
+            [entry["text"] for entry in entries] if entries else self.delivery.parts
+        )
+        report["uncertain"] |= any(record["uncertain"] for record in records)
+        final_sent = self.delivery.status == "sent" and bool(self.delivery.parts)
+        failed = (
+            (bool(error) and not final_sent)
+            or any(record["failed"] for record in records)
+            or report["status"] in {"failed", "partial"}
+        )
+        if report["uncertain"]:
+            report["status"] = "partial" if report["text"] else "unknown"
+        elif failed:
+            report["status"] = "partial" if report["text"] else report["status"]
+        elif report["text"]:
+            report["status"] = "sent"
+        if entries:
+            report["receipts"] = [entry["receipt"] for entry in entries]
+        report["deduplicated"] = sum(record["deduplicated"] for record in records)
+        report["reused_operations"] = operations.get("reused_operations", 0)
+        report["permission_reason"] = operations.get("permission_reason")
+        report["operation_uncertain"] = (
+            bool(operations.get("uncertain_tools"))
+            or any(
+                item.get("status") == "unknown"
+                for item in operations.get("dsh_tools", {}).values()
+            )
+            or operations.get("dsh", {}).get("stop") == "unknown"
+        )
+        report["tool_conflicts"] = self.context.state.get("_tool_conflicts", [])
+        report["contributors"] = sorted(
+            {entry["agent"] for entry in entries if entry["agent"]}
+        )
+        from ._reply import parse_silent
+
+        report["effective_reply"] = bool(
+            self.tool_texts
+            or (
+                self.delivery.parts
+                and self.result
+                and not self.result.stopped
+                and parse_silent(str(self.result.output))
+            )
+        )
         return report
 
     async def reply(
@@ -127,10 +187,13 @@ class ChatTurn:
             setting: 群聊设置
             persona: 人设
         """
-        from zhenxun.services.ai.core.exceptions import InterventionHandledException
+        from zhenxun.services.ai.core.exceptions import (
+            InterventionHandledException,
+            RunInterrupted,
+        )
 
         from ._data_source import AIChatManager
-        from ._reply import clean_markdown, clean_output, parse_silent, send_reply
+        from ._reply import clean_output, parse_silent, send_reply
         from ._stickers import send_marked, split_sticker
 
         self.result = value
@@ -139,12 +202,24 @@ class ChatTurn:
         directed = self.source != "interject"
         custom = persona.error_message if persona else None
         if error is not None:
+            if isinstance(error, RunInterrupted):
+                if not self.report(error).get(
+                    "uncertain"
+                ) and not context.run.operations.get("notice_sent"):
+                    context.run.operations["notice_sent"] = True
+                    await send_reply(
+                        "本次执行因通信异常中断，未自动重试。",
+                        group_id,
+                        result=delivery,
+                        context=context,
+                    )
+                return
             interrupted = isinstance(
                 error, asyncio.CancelledError | InterventionHandledException
             )
             if not interrupted and directed and not self.tool_texts:
                 notice = context.run.user_notice or custom or FAILED_NOTICE
-                await send_reply(notice, group_id, result=delivery)
+                await send_reply(notice, group_id, result=delivery, context=context)
             elif delivery.status == "pending":
                 delivery.status = "skipped" if interrupted else "failed"
             return
@@ -161,12 +236,12 @@ class ChatTurn:
         sticker_id = None
         if reply:
             reply, sticker_id = split_sticker(reply)
-            if clean_markdown(reply).strip() in self.tool_texts:
-                reply = ""
         if reply:
             voice = setting.voice_reply if setting and setting.voice_reply else None
             voice_input = any(is_voice(seg) for seg in message)
-            await send_reply(reply, group_id, voice_input, voice, delivery)
+            await send_reply(
+                reply, group_id, voice_input, voice, delivery, context=context
+            )
         else:
             delivery.status = "skipped"
         if sticker_id is not None and delivery.status in {"sent", "skipped"}:
@@ -200,9 +275,11 @@ class ChatTurn:
             except Exception as exc:
                 report["usage_error"] = type(exc).__name__
                 logger.warning("本轮用量结算未确认", MODULE)
-        if backend := chat_backend(self.agent.memory_config):
+        receipt = HistorySettlement()
+        backend = chat_backend(self.agent.memory_config)
+        if backend:
             try:
-                await backend.settle_run(
+                receipt = await backend.settle_run(
                     self.context.session_id or "",
                     self.run_id,
                     self.revision,
@@ -212,6 +289,7 @@ class ChatTurn:
             except Exception as exc:
                 report["history_error"] = type(exc).__name__
                 logger.warning("本轮历史保存未确认", MODULE)
+        self._confirm_background(receipt, report, history_enabled=backend is not None)
         if after:
             try:
                 await after(report, error)
@@ -226,3 +304,39 @@ class ChatTurn:
             result=self.result,
             error=error,
         )
+
+    def _confirm_background(
+        self, receipt, report: dict, *, history_enabled: bool
+    ) -> None:
+        """仅确认当前修订中有效送达且输入已保存的背景区段。"""
+        from ._buffer import ChatBuffer
+
+        snapshots = self.context.state.get("_background_snapshots", {})
+        if not snapshots:
+            return
+        confirmed = 0
+        reason = "no_effective_delivery"
+        if not self.current:
+            reason = "stale_revision"
+        elif report.get("effective_reply"):
+            claims = (
+                set(snapshots)
+                if not history_enabled
+                else receipt.visible_claims
+                if isinstance(receipt, HistorySettlement)
+                and receipt.status == "confirmed"
+                else set()
+            )
+            for claim in claims:
+                if snapshot := snapshots.get(claim):
+                    confirmed += ChatBuffer.confirm(
+                        snapshot, self.run_id, self.revision
+                    )
+            reason = "history_unconfirmed" if confirmed < len(snapshots) else None
+        self.context.state["_background_receipt"] = {
+            "status": "confirmed" if confirmed == len(snapshots) else "unconfirmed",
+            "read": len(snapshots),
+            "confirmed": confirmed,
+            "truncated": any(s.truncated for s in snapshots.values()),
+            "reason": reason,
+        }

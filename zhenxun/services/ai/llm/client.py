@@ -36,6 +36,7 @@ from zhenxun.services.ai.core.exceptions import (
 )
 from zhenxun.services.ai.core.models import CancellationToken, ModelProfile
 from zhenxun.services.ai.core.options import CommonLLMConfig, GenerationConfig
+from zhenxun.services.ai.run.context import fail_fast_enabled, interrupt_network
 from zhenxun.services.ai.utils.logger import log_llm as logger
 from zhenxun.services.lifecycle.deadline import remaining_timeout
 from zhenxun.services.network_proxy import ManagedAsyncClient, ProxyRequestError
@@ -207,6 +208,8 @@ class LLMHttpClient:
             try:
                 return await client.request(method, url, **kwargs)
             except (ProxyRequestError, httpx.ConnectError, httpx.ConnectTimeout) as e:
+                if fail_fast_enabled():
+                    interrupt_network("model_connect", e)
                 cause = e.__cause__ if isinstance(e, ProxyRequestError) else e
                 if not isinstance(
                     cause, httpx.ConnectError | httpx.ConnectTimeout
@@ -392,7 +395,7 @@ async def send(
         response = await request
     except httpx.TimeoutException as e:
         raise NetworkTimeoutException(f"[{route.name}] 请求超时: {e}") from e
-    except httpx.HTTPError as e:
+    except (httpx.HTTPError, ProxyRequestError) as e:
         raise NetworkTimeoutException(f"[{route.name}] 网络请求失败: {e!r}") from e
     if isinstance(response, dict):
         return response
@@ -444,10 +447,15 @@ async def _read_stream(
     stream = call.stream()
     await sink("reset", "")
     event, lines = "", []
+    finished = False
 
     async def dispatch() -> None:
+        nonlocal finished
         text = "\n".join(lines)
-        if not text or text == "[DONE]":
+        if text == "[DONE]":
+            finished = True
+            return
+        if not text:
             return
         try:
             data = json.loads(text)
@@ -457,6 +465,24 @@ async def _read_stream(
                 details={"response": text[:500]},
             ) from e
         if isinstance(data, dict):
+            finished |= (
+                event == "message_stop"
+                or data.get("type")
+                in {
+                    "message_stop",
+                    "response.completed",
+                    "response.incomplete",
+                    "response.failed",
+                }
+                or any(
+                    choice.get("finish_reason") is not None
+                    for choice in data.get("choices", [])
+                )
+                or any(
+                    candidate.get("finishReason")
+                    for candidate in data.get("candidates", [])
+                )
+            )
             for kind, delta in stream.feed(event, data):
                 if delta:
                     await sink(kind, delta)
@@ -473,6 +499,8 @@ async def _read_stream(
             elif field == "data":
                 lines.append(value)
     await dispatch()
+    if not finished and fail_fast_enabled():
+        interrupt_network("model_stream_incomplete")
     return stream.result()
 
 
@@ -533,6 +561,8 @@ async def call_route(
             payload = await send(route, call, api_key, token)
             response = parse(route, request, payload)
         except LLMException as e:
+            if fail_fast_enabled():
+                interrupt_network("model", e)
             adapted = (
                 adapt_route(route, request, call.json or {}, e)
                 if adaptations < 3
@@ -720,6 +750,8 @@ async def execute(
         try:
             return await attempt(index)
         except LLMException as e:
+            if fail_fast_enabled():
+                interrupt_network("model", e)
             if not grouped and isinstance(e, NetworkTimeoutException):
                 logger.warning(f"线路 {route.name} 超时，重试一次: {e}")
                 return await attempt(index)

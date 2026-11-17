@@ -1,3 +1,6 @@
+import asyncio
+import inspect
+import time
 from typing import Any
 
 
@@ -94,15 +97,82 @@ class PermissionUtils:
     """运行时权限校验通用工具类"""
 
     @staticmethod
-    async def check_superuser(context: Any) -> bool:
-        """异步校验当前运行上下文中的用户是否为超级用户"""
-        bot = context.get_bot()
-        event = context.get_event()
-        if bot and event:
-            from nonebot.permission import SUPERUSER
+    def bind_caller(context: Any, source: str, management_check=None) -> None:
+        """从受信入口绑定身份，子运行继承身份而不重新解释模型输入。"""
+        from zhenxun.services.ai.run.context import CallerIdentity
+        from zhenxun.utils.platform import PlatformUtils
 
-            return await SUPERUSER(bot, event)
+        if context.run.caller is not None:
+            if context.run.caller.source != source:
+                raise ValueError("不能改变运行来源")
+            return
+        bot = context.get_bot()
+        context.run.caller = CallerIdentity(
+            source=source,
+            platform=PlatformUtils.get_platform_scope(bot) if bot else "webui",
+            bot_id=str(bot.self_id) if bot else "",
+            user_id=context.get_user_id(),
+            group_id=context.get_group_id(),
+        )
+        context.run.management_check = management_check
+
+    @staticmethod
+    def ensure_current(context: Any) -> None:
+        """在执行与投递安全点检查取消、截止时间和根会话修订。"""
+        if token := context.run.cancellation_token:
+            token.raise_if_cancelled()
+        if context.run.connection_id and (bot := context.get_bot()):
+            if vars(bot).get("_zhenxun_connection_id") != context.run.connection_id:
+                raise asyncio.CancelledError("来源连接已变更")
+        if deadline := context.run.budget.get("deadline"):
+            if time.monotonic() >= deadline:
+                raise asyncio.TimeoutError("本轮执行超时")
+        if context.run.root_revision is not None:
+            from zhenxun.services.ai.run.session import session_manager
+
+            if context.run.root_revision != session_manager.revision(
+                context.run.root_session_id or ""
+            ):
+                raise asyncio.CancelledError("会话已重置")
+
+    @staticmethod
+    def _deny(context: Any, reason: str) -> bool:
+        context.state["_permission_reason"] = reason
         return False
+
+    @staticmethod
+    async def check_superuser(context: Any) -> bool:
+        """按可信来源和当前授权校验超管，不复用旧事件角色。"""
+        caller = context.run.caller
+        if caller is None or caller.source not in {"qq", "task", "webui"}:
+            return PermissionUtils._deny(context, "当前来源没有管理授权")
+        if caller.source == "webui" or (
+            caller.source == "task" and context.run.management_check is not None
+        ):
+            check = context.run.management_check
+            try:
+                allowed = check() if check else False
+                if inspect.isawaitable(allowed):
+                    allowed = await allowed
+                if allowed:
+                    return True
+            except Exception:
+                return PermissionUtils._deny(context, "管理会话授权暂不可确认")
+            return PermissionUtils._deny(context, "管理会话已失效或未授权")
+        bot = context.get_bot()
+        try:
+            from zhenxun.utils.platform import PlatformUtils
+
+            if (
+                bot
+                and str(bot.self_id) == caller.bot_id
+                and PlatformUtils.get_platform_scope(bot) == caller.platform
+                and PlatformUtils.is_superuser(bot, caller.user_id)
+            ):
+                return True
+        except Exception:
+            return PermissionUtils._deny(context, "权限读取失败")
+        return PermissionUtils._deny(context, "当前调用者不是超级用户")
 
     @staticmethod
     async def check_admin_level(context: Any, min_level: int) -> bool:
@@ -118,13 +188,40 @@ class PermissionUtils:
         if min_level <= 0 or await PermissionUtils.check_superuser(context):
             return True
         bot = context.get_bot()
-        event = context.get_event()
-        if not bot or not event:
+        caller = context.run.caller
+        if (
+            not bot
+            or caller is None
+            or caller.source not in {"qq", "task"}
+            or not caller.group_id
+            or not caller.user_id
+        ):
             return False
-
-        from nonebot_plugin_uninfo import get_session
+        from nonebot_plugin_uninfo import SceneType, get_interface, get_session
 
         from zhenxun.utils.platform import PlatformUtils
 
-        session = await get_session(bot, event)
-        return bool(session) and await PlatformUtils.is_group_admin(bot, session)
+        if (
+            str(bot.self_id) != caller.bot_id
+            or PlatformUtils.get_platform_scope(bot) != caller.platform
+        ):
+            return PermissionUtils._deny(context, "调用者与当前连接不匹配")
+        try:
+            scene_type, scene_id = SceneType.GROUP, caller.group_id
+            if event := context.get_event():
+                session = await get_session(bot, event)
+                scene = (session.group or session.guild) if session else None
+                if scene is None or str(scene.id) != caller.group_id:
+                    return PermissionUtils._deny(context, "群身份无法确认")
+                scene_type, scene_id = scene.type, scene.id
+            interface = get_interface(bot)
+            member = (
+                await interface.get_member(scene_type, scene_id, caller.user_id)
+                if interface
+                else None
+            )
+            if member and member.role and member.role.level >= 10:
+                return True
+        except Exception:
+            return PermissionUtils._deny(context, "当前群管理权限暂不可确认")
+        return PermissionUtils._deny(context, "当前调用者不是本群管理员")

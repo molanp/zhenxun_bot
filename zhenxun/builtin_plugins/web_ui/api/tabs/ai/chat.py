@@ -24,6 +24,7 @@ class ChatSwitchRequest(BaseModel):
 
 @router.get("/chat/switch", dependencies=[authentication()], response_model=Result)
 async def chat_switch_state() -> Result:
+    from zhenxun.configs.config import Config
     from zhenxun.services.plugin_policy import plugin_policy_service
 
     state = await plugin_policy_service.global_state()
@@ -31,6 +32,7 @@ async def chat_switch_state() -> Result:
         {
             "enabled": state["switches"].get(MODULE, False),
             "revision": state["revision"],
+            "executor": Config.get_config(MODULE, "AGENT_RUNNER", "local"),
         }
     )
 

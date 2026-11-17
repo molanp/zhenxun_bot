@@ -240,15 +240,26 @@ register_runtime_bootstrap(driver)
 async def _mark_bot_connected(bot: Bot):
     from zhenxun.utils.platform import PlatformUtils
 
-    connection_epochs.connect(bot, PlatformUtils.get_platform_scope(bot))
+    old = connection_epochs.get(bot, PlatformUtils.get_platform_scope(bot))
+    epoch = connection_epochs.connect(bot, PlatformUtils.get_platform_scope(bot))
+    bot._zhenxun_connection_id = epoch.connection_id
+    if old is not None:
+        from zhenxun.services.ai.run.session import session_manager
+
+        await session_manager.stop_source(bot, old.connection_id)
 
 
 @driver.on_bot_disconnect
 async def _mark_bot_disconnected(bot: Bot):
+    from zhenxun.services.ai.run.session import session_manager
     from zhenxun.services.uninfo_patch import clear_uninfo_sessions
     from zhenxun.utils.platform import PlatformUtils
 
+    epoch = connection_epochs.get(bot, PlatformUtils.get_platform_scope(bot))
     connection_epochs.disconnect(bot, PlatformUtils.get_platform_scope(bot))
+    if epoch is not None:
+        bot._zhenxun_connection_id = None
+    await session_manager.stop_source(bot, epoch.connection_id if epoch else None)
     await clear_uninfo_sessions(bot)
 
 

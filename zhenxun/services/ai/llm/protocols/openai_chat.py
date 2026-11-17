@@ -39,6 +39,7 @@ from zhenxun.services.ai.utils.logger import log_llm as logger
 from . import (
     ChatStream,
     HttpCall,
+    deepseek_server_tool,
     dump_arguments,
     ensure_content,
     filter_modalities,
@@ -137,7 +138,11 @@ def _assistant_message(message: AssistantMessage) -> dict:
         "content": "".join(p.text for p in message.content if isinstance(p, TextPart)),
     }
     for part in message.content:
-        data = replay_data(part, PROTOCOL) if isinstance(part, ThoughtPart) else None
+        data = (
+            replay_data(part, PROTOCOL)
+            if isinstance(part, TextPart | ThoughtPart)
+            else None
+        )
         for key, value in (data or {}).items():
             if key not in result:
                 result[key] = value
@@ -276,10 +281,12 @@ def apply_server_tools(body: dict[str, Any], server: list[Any], route) -> None:
     vendor = detect_preset(route.base_url) or route.provider.preset
     for tool in server:
         type_id = getattr(tool, "type_id", "")
-        allowed = type_id == "web_search" and native_tool_allowed(route, type_id)
-        if allowed and vendor == "dashscope":
+        allowed = native_tool_allowed(route, type_id)
+        if allowed and (payload := deepseek_server_tool(route, type_id)):
+            body.setdefault("tools", []).append(payload)
+        elif allowed and type_id == "web_search" and vendor == "dashscope":
             body["enable_search"] = True
-        elif allowed and vendor in _WEB_SEARCH_TOOLS:
+        elif allowed and type_id == "web_search" and vendor in _WEB_SEARCH_TOOLS:
             body.setdefault("tools", []).append(deepcopy(_WEB_SEARCH_TOOLS[vendor]))
         else:
             logger.warning(
@@ -423,6 +430,12 @@ def parse_message(message: dict[str, Any]) -> list[Any]:
                 metadata=replay_metadata(PROTOCOL, extra) if extra else None,
             )
         )
+    if calls := message.get("server_tool_calls"):
+        target = next((p for p in parts if isinstance(p, TextPart)), None)
+        if target is None:
+            target = ThoughtPart(thought_text="")
+            parts.append(target)
+        target.metadata = replay_metadata(PROTOCOL, {"server_tool_calls": calls})
     return parts
 
 
@@ -594,6 +607,8 @@ class OpenAIChatStream(ChatStream):
             for key in ("images", "annotations"):
                 if items := delta.get(key):
                     self.message.setdefault(key, []).extend(items)
+            if calls := delta.get("server_tool_calls"):
+                self.message["server_tool_calls"] = calls
             for call in delta.get("tool_calls") or []:
                 if isinstance(call, dict):
                     self._merge_call(call)

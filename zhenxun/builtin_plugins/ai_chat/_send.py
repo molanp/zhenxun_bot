@@ -1,4 +1,3 @@
-import asyncio
 from collections import deque
 import time
 from typing import Any, ClassVar
@@ -15,7 +14,7 @@ from zhenxun.services.ai.tools.models import ResolvedToolPayload, ToolResult
 from zhenxun.services.log import logger
 from zhenxun.utils.platform import PlatformUtils
 
-from ._buffer import AI_SEND, ChatBuffer, ChatLine
+from ._buffer import ChatBuffer, ChatLine
 from ._data_source import MODULE
 from ._reply import clean_markdown
 from ._safety import Safety, prune
@@ -244,29 +243,40 @@ class QQSendToolkit(BaseToolkit):
             return ToolResult(output="只能引用当前群里的消息。").as_error()
         if reason := SendQuota.take(scene.key, len(texts)):
             return ToolResult(output=reason).as_error(False)
-        for index, text in enumerate(texts):
-            if index:
-                await asyncio.sleep(min(3.0, 0.8 + 0.02 * len(texts[index - 1])))
+        from ._reply import DeliveryResult, _deliver, delivery_target
+
+        async def send(message, first):
             segments: list[Segment] = []
-            if not index and reply_to:
+            if first and reply_to:
                 segments.append(Reply(reply_to))
-            if not index and at:
+            if first and at:
                 segments += [At("user", at), Text(" ")]
-            segments.append(Text(text))
-            send_token = AI_SEND.set(True)
-            try:
-                delivered = await PlatformUtils.send_message(
-                    scene.bot, scene.user_id, scene.group_id, UniMessage(segments)
-                )
-            finally:
-                AI_SEND.reset(send_token)
-            if not delivered:
-                SendQuota.refund(scene.key, len(texts) - index)
-                return ToolResult(
-                    output=f"第 {index + 1} 条未确认送达，不要重发。"
-                ).as_error(False)
-            context.state.setdefault("_sent_texts", []).append(text.strip())
-        return ToolResult(output=f"已发送 {len(texts)} 条。")
+            return await PlatformUtils.send_message(
+                scene.bot, scene.user_id, scene.group_id, UniMessage(segments) + message
+            )
+
+        result = DeliveryResult()
+        try:
+            result = await _deliver(
+                "\n".join(texts),
+                scene.bot,
+                send,
+                result=result,
+                context=context,
+                origin="tool",
+                chunks=[(UniMessage(Text(text)), text) for text in texts],
+                target=delivery_target(scene.bot, scene.group_id, scene.user_id),
+                request_key=(tuple(texts), reply_to, at),
+            )
+        finally:
+            SendQuota.refund(scene.key, max(0, len(texts) - result.attempted))
+        if result.status != "sent":
+            return ToolResult(output=result.error or "消息未全部送达。").as_error(
+                False, uncertain=result.uncertain
+            )
+        return ToolResult(
+            output=f"已发送 {len(result.parts)} 条。", reused=result.reused
+        )
 
     @tool(
         name="poke",
@@ -305,7 +315,7 @@ class QQSendToolkit(BaseToolkit):
                 logger.debug(f"戳一戳结果未知: {type(exc).__name__}", MODULE)
                 return ToolResult(
                     output="戳一戳未确认完成，本轮不要再次执行。"
-                ).as_error(False)
+                ).as_error(False, uncertain=True)
             self._poke_methods[(scene.bot.self_id, kind)] = api
             scene.note(f"[戳了戳 {target}]")
             return ToolResult(output="已戳了一下。")

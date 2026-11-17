@@ -404,7 +404,9 @@ class GlobalMCPProvider(ToolProvider):
                     continue
                 tools = cast(dict[str, ToolExecutable], res)
                 self._remember(s_name, tools)
-                all_tools.update(tools)
+                all_tools.update(
+                    {f"{s_name}:{name}": tool for name, tool in tools.items()}
+                )
 
             if allowed_servers is None and excluded_servers is None:
                 self._discovered_tools = all_tools

@@ -46,21 +46,35 @@ class ScheduleRepository:
         return await ScheduledJob.all()
 
     @staticmethod
-    async def update_run_status(schedule: ScheduledJob, is_success: bool):
+    async def update_run_status(
+        schedule: ScheduledJob,
+        is_success: bool | None = None,
+        *,
+        status: str | None = None,
+        disable: bool = False,
+        reason: str | None = None,
+    ):
         """
         统一更新任务的最后运行状态
         """
         schedule.last_run_at = timezone.now()
-        if is_success:
-            schedule.last_run_status = "SUCCESS"
+        schedule.last_run_status = status or ("SUCCESS" if is_success else "FAILURE")
+        if schedule.last_run_status == "SUCCESS":
             schedule.consecutive_failures = 0
-        else:
-            schedule.last_run_status = "FAILURE"
+        elif schedule.last_run_status == "FAILURE":
             schedule.consecutive_failures = (schedule.consecutive_failures or 0) + 1
-
-        await schedule.save(
-            update_fields=["last_run_at", "last_run_status", "consecutive_failures"]
-        )
+        fields = ["last_run_at", "last_run_status", "consecutive_failures"]
+        if reason is not None:
+            options = schedule.execution_options
+            schedule.execution_options = {
+                **(options if isinstance(options, dict) else {}),
+                "last_result_reason": reason,
+            }
+            fields.append("execution_options")
+        if disable:
+            schedule.is_enabled = False
+            fields.append("is_enabled")
+        await schedule.save(update_fields=fields)
 
     @staticmethod
     async def save(schedule: ScheduledJob, update_fields: list[str] | None = None):

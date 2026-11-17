@@ -596,16 +596,6 @@ CONFIGS = [
         unit="个",
     ),
     _config(
-        "主动任务",
-        "TASK_CATCH_UP",
-        30,
-        int,
-        "错过补跑时限",
-        "任务错过执行时间（如 Bot 停机）后在该时间内仍会补跑，超过则跳过本次；"
-        "对新建或修改的任务生效",
-        unit="分钟",
-    ),
-    _config(
         "Agent 与执行器",
         "AGENT_ENABLED",
         False,
@@ -620,7 +610,8 @@ CONFIGS = [
         "local",
         str,
         "回复执行器",
-        "使用 DeepSeek Harness 时工具、知识库与记忆不生效，"
+        "DeepSeek Harness 使用已登录的桌面版；普通聊天无宿主工具，"
+        "不桥接长期记忆、知识库及本地 Agent 工具；"
         "主动插话仍在本地执行；"
         "可按群设置",
         options=_options(local="本地 Agent", dsh="DeepSeek Harness"),
@@ -723,11 +714,12 @@ CONFIGS = [
         model_dump(DshSettings()),
         dict,
         "DeepSeek Harness 设置",
-        "bin：dsh 路径，留空在 PATH 中查找；"
-        "provider / model：所有会话共用的模型；"
-        "api_provider：提供 API Key 的服务商，留空用 DeepSeek 预设服务商；"
-        "timeout：每轮超时秒数；allow_tools：保留 dsh 本地工具，"
-        "只有超级用户的会话能通过审批",
+        "desktop_url：桌面回环 HTTP 地址，留空自动识别；home：DSH home，"
+        "留空使用当前用户 .dsh；timeout：每轮超时；allow_tools：允许符合"
+        "当前授权的超管通过 QQ 操作 DSH 原生 Agent，不另加工具白名单。"
+        "无需 API Key；新建使用 standard，继承保留原会话模型、思考等级和模式。"
+        "超管 Agent 跨群和私聊共享历史，完整回复发到本轮触发位置，"
+        "群内回复可能包含此前私聊或工具读取的信息。",
         advanced=True,
         visible_when=_when("AGENT_RUNNER", "dsh"),
     ),

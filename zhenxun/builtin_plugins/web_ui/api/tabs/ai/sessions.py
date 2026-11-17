@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from tortoise.functions import Count, Max, Sum
@@ -30,6 +30,32 @@ def _parse_session(session_id: str) -> dict[str, Any]:
         dict[str, Any]: Bot id、群号（私聊为空）、用户id
     """
     from zhenxun.builtin_plugins.ai_chat._data_source import parse_session
+
+    if session_id.startswith("ai_chat:dsh:"):
+        from zhenxun.services.ai.run.dsh import DshSessions
+
+        data = DshSessions._read()
+        item = next(
+            (
+                item
+                for item in [*data["owners"].values(), *data["archives"]]
+                if item["local_id"] == session_id
+            ),
+            {},
+        )
+        return {
+            **item.get("identity", {}),
+            "dsh": {
+                key: item.get(key)
+                for key in (
+                    "remote_id",
+                    "mode",
+                    "revision",
+                    "quarantined",
+                    "archive_reason",
+                )
+            },
+        }
 
     bot_id, group_id, user_id = parse_session(session_id)
     return {"bot_id": bot_id, "group_id": group_id, "user_id": user_id or ""}
@@ -130,10 +156,66 @@ async def session_messages(
 @router.delete("/chat/sessions", dependencies=[authentication()], response_model=Result)
 async def reset_session(
     session_id: str = Query(min_length=1, max_length=255),
+    action: Literal["reset", "new", "archive"] = "reset",
+    expected_revision: int | None = None,
 ) -> Result:
     from zhenxun.builtin_plugins.ai_chat._data_source import AIChatManager
 
-    await AIChatManager.reset(_require_session(session_id))
+    _require_session(session_id)
+    if session_id.startswith("ai_chat:dsh:"):
+        from zhenxun.builtin_plugins.ai_chat._runner import dsh_settings
+        from zhenxun.services.ai.core.exceptions import RunInterrupted
+        from zhenxun.services.ai.run.dsh import DshSessions
+        from zhenxun.services.ai.run.dsh_desktop import DesktopClient
+        from zhenxun.services.ai.run.session import session_manager
+
+        item = next(
+            (
+                i
+                for i in DshSessions._read()["owners"].values()
+                if i["local_id"] == session_id
+            ),
+            None,
+        )
+        if not item or (
+            expected_revision is not None and item["revision"] != expected_revision
+        ):
+            raise HTTPException(409, detail={"code": "dsh_session_changed"})
+        session_manager.invalidate(session_id)
+        await AIChatManager.stop(session_id)
+        DshSessions.refresh(item)
+        if item.get("inflight"):
+            raise HTTPException(409, detail={"code": "dsh_stop_unconfirmed"})
+        archived = False
+        client = None
+        try:
+            settings = dsh_settings()
+            client = await DesktopClient.open(settings.desktop_url, settings.home)
+            if item["created"] and (not item.get("native") or action == "archive"):
+                await client.rpc(
+                    "workspace/archiveSession", {"sessionId": item["remote_id"]}
+                )
+                archived = True
+        except (Exception, RunInterrupted):
+            pass
+        finally:
+            if client:
+                await client.close()
+        if action == "reset":
+            await AIChatManager.reset(session_id)
+        else:
+            DshSessions.reset(session_id)
+        return Result.ok(
+            {"archived": archived, "history_deleted": False},
+            info="已解除关联；原生 DSH 会话、历史和设置均保留。"
+            if item.get("native") and action != "archive"
+            else "已解除会话映射；桌面历史已归档但未删除。"
+            if archived
+            else "已解除会话映射；桌面归档暂未确认，原历史仍保留。",
+        )
+    if action != "reset":
+        raise HTTPException(422, detail={"code": "dsh_session_required"})
+    await AIChatManager.reset(session_id)
     logger.info(f"WebUI 重置了 AI 聊天会话 {session_id}", "WebUi")
     return Result.ok(info="会话记忆已清空。")
 

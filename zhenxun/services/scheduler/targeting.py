@@ -12,6 +12,7 @@ from nonebot.adapters import Bot
 from zhenxun.services.tags import tag_manager
 
 from .engine import APSchedulerAdapter
+from .registry import scheduler_registry
 from .repository import ScheduleRepository
 
 __all__ = [
@@ -159,6 +160,11 @@ class ScheduleTargeter:
             return 0, f"没有找到{target_desc}可供移除的任务。"
 
         for schedule in schedules:
+            if scheduler_registry.tasks.get(schedule.plugin_name, {}).get(
+                "retain_finished"
+            ):
+                if not await scheduler_registry.stop_running(schedule.id):
+                    return 0, "当前执行尚未确认停止，未删除计划。"
             APSchedulerAdapter.remove_job(schedule.id)
 
         query = ScheduleRepository.filter(**self._filters)

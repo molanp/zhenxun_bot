@@ -109,7 +109,7 @@ async def _video_request(part: VideoPart) -> ChatRequest | str | None:
 
 
 async def _media_to_text(
-    part: MediaPart, model: str, token: CancellationToken | None
+    part: MediaPart, model: str | None, token: CancellationToken | None
 ) -> str | None:
     """用视觉模型描述图片或视频截帧，或用语音识别模型转写语音，结果按地址或内容缓存
 
@@ -123,7 +123,8 @@ async def _media_to_text(
     """
     is_image = isinstance(part, ImagePart)
     kind = "image" if is_image else "video" if isinstance(part, VideoPart) else "audio"
-    key = f"{kind}:{await _media_key(part)}"
+    converter = model or f"deepseek-tools:{get_llm_config().deepseek_tools.provider}"
+    key = f"{kind}:{converter}:{await _media_key(part)}"
     if key in _media_text_cache:
         _media_text_cache.move_to_end(key)
         return _media_text_cache[key]
@@ -133,6 +134,13 @@ async def _media_to_text(
             if not isinstance(request, ChatRequest):
                 return request
             text = (await invoke("chat", request, model, token)).text
+        elif is_image and model is None:
+            from .deepseek_tools import ocr_file, ocr_text
+
+            result = await ocr_file(
+                await part.get_raw_bytes(), "image.png", token=token
+            )
+            text = ocr_text(result)
         elif is_image:
             request = ChatRequest(
                 messages=[UserMessage(content=[TextPart(text=_CAPTION_PROMPT), part])],
@@ -156,7 +164,7 @@ async def _media_to_text(
 
 def _converter(
     modality: str, routes: list[Route]
-) -> tuple[type[MediaPart], str, str] | None:
+) -> tuple[type[MediaPart], str | None, str] | None:
     """取对话线路不支持的媒体所对应的转换模型
 
     参数:
@@ -175,6 +183,11 @@ def _converter(
         "video": (VideoPart, "vision", "视频描述"),
     }[modality]
     if not (model := get_default_model(task)):
+        settings = get_llm_config().deepseek_tools
+        if modality == "audio" and settings.asr_enabled:
+            return part_type, None, label
+        if modality == "image" and settings.ocr_enabled:
+            return part_type, None, "图片文字识别（OCR，不含场景描述）"
         return None
     route_task = "chat" if task == "vision" else task
     try:
@@ -272,6 +285,26 @@ async def invoke(
     返回:
         Any: 统一响应对象
     """
+    if (
+        task == "stt"
+        and not model
+        and not get_default_model("stt")
+        and get_llm_config().deepseek_tools.asr_enabled
+    ):
+        from .deepseek_tools import transcribe
+
+        pending = transcribe(request.audio, token=token)
+        try:
+            return (
+                await asyncio.wait_for(pending, request.timeout)
+                if request.timeout
+                else await pending
+            )
+        except asyncio.TimeoutError as exc:
+            from zhenxun.services.ai.run.context import interrupt_transport
+
+            interrupt_transport(exc, "deepseek_asr")
+            raise NetworkTimeoutException("DeepSeek ASR 请求超时，未自动重发") from exc
     routes = resolve_routes(model, task)
     if task == "chat":
         messages = lift_tool_media(request.messages)
@@ -652,6 +685,14 @@ async def create_speech(
     if not text:
         raise LLMException("TTS 输入文本不能为空")
     try:
+        if (
+            not model
+            and not get_default_model("tts")
+            and get_llm_config().deepseek_tools.tts_enabled
+        ):
+            from .deepseek_tools import synthesize
+
+            return await synthesize(text, voice, config=config)
         request = SpeechRequest(input_text=text, voice=voice, config=config)
         return await invoke("tts", request, model)
     except LLMException as e:

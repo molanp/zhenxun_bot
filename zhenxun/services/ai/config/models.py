@@ -1,5 +1,5 @@
 import re
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -253,6 +253,23 @@ class WebSearchSettings(BaseModel):
         return value
 
 
+class DeepSeekToolsSettings(BaseModel):
+    """DeepSeek 独立工具接口，复用已保存的官方服务商密钥。"""
+
+    provider: str = ""
+    """官方 DeepSeek 服务商名称；为空时取第一个官方服务商，不使用 DSH 登录凭据。"""
+    ocr_enabled: bool = False
+    """对话线路不支持图片且未指定视觉模型时，使用 OCR 提取图片文字。"""
+    asr_enabled: bool = False
+    """未指定语音识别模型时，使用 DeepSeek ASR 转写音频。"""
+    tts_enabled: bool = False
+    """未指定语音合成模型时，使用 DeepSeek TTS。"""
+    voice: Literal["stella", "tide"] = "stella"
+    """语音合成默认音色：stella（海星女声）或 tide（暗潮男声）。"""
+    timeout: int = Field(default=180, ge=10, le=300)
+    """单次工具请求的总超时秒数；超时不自动重新上传或重放。"""
+
+
 class AgentEngineSettings(BaseModel):
     """全局默认的 Agent 推理引擎配置"""
 
@@ -322,3 +339,5 @@ class LLMConfig(BaseModel):
     """沙箱基础设施环境相关配置"""
     web_search: WebSearchSettings = Field(default_factory=WebSearchSettings)
     """联网搜索设置"""
+    deepseek_tools: DeepSeekToolsSettings = Field(default_factory=DeepSeekToolsSettings)
+    """DeepSeek 独立 OCR、语音识别与语音合成设置"""

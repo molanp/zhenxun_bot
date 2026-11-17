@@ -21,10 +21,15 @@ from zhenxun.services.ai.core.messages import LLMMessage
 from zhenxun.services.ai.run.context import RunContext, ScheduledDeps
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
-from zhenxun.services.ai.tools.models import ToolResult
+from zhenxun.services.ai.tools.models import ToolOptions, ToolResult
 from zhenxun.services.ai.utils.runtime import PermissionUtils
 from zhenxun.services.scheduler import ScheduleContext, Trigger, scheduler_manager
-from zhenxun.services.scheduler.types import BaseTrigger, ExecutionOptions, JobConfig
+from zhenxun.services.scheduler.types import (
+    BaseTrigger,
+    ExecutionOptions,
+    JobConfig,
+    TaskOutcome,
+)
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.pydantic_compat import model_validate
 from zhenxun.utils.time_utils import TimeUtils
@@ -44,8 +49,6 @@ TASK_PLUGIN = "ai_chat"
 KINDS = {"cron": "cron 表达式", "interval": "间隔分钟", "date": "指定时间"}
 MIN_INTERVAL = 600
 """两次执行的最小间隔秒数"""
-RETRY_DELAY = 60
-"""模型调用失败后重试一次前等待的秒数"""
 WEEKDAYS = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
 """crontab 星期序号对应的 APScheduler 星期名称"""
 
@@ -57,6 +60,8 @@ class TaskParams(BaseModel):
     creator: str
     group_id: str | None = None
     user_id: str | None = None
+    source: str | None = None
+    management_subject: str | None = None
 
 
 def build_trigger(kind: str, value: str) -> BaseTrigger:
@@ -178,13 +183,8 @@ def describe_trigger(job: ScheduledJob) -> str:
 
 
 def _options() -> dict[str, Any]:
-    """主动任务的执行选项：不并发运行，错过时在 TASK_CATCH_UP 分钟内补跑
-
-    返回:
-        dict[str, Any]: 执行选项
-    """
-    minutes = max(int(Config.get_config(MODULE, "TASK_CATCH_UP", 30) or 0), 1)
-    return {"concurrency_policy": "SKIP", "misfire_grace_time": minutes * 60}
+    """主动任务不重叠执行，不补跑停机期间错过的触发。"""
+    return {"concurrency_policy": "SKIP", "misfire_grace_time": 1, "retries": 0}
 
 
 class AITasks:
@@ -220,6 +220,16 @@ class AITasks:
             "trigger": describe_trigger(job),
             "enabled": job.is_enabled,
             "last_run_at": job.last_run_at.isoformat() if job.last_run_at else None,
+            "last_run_status": job.last_run_status,
+            "finished": bool(
+                job.is_one_off
+                and job.last_run_status
+                and job.last_run_status != "RUNNING"
+            ),
+            "source": kwargs.get("source", "legacy"),
+            "last_run_reason": (job.execution_options or {}).get(
+                "last_result_reason", ""
+            ),
             "created_at": job.create_time.isoformat(),
         }
 
@@ -272,6 +282,11 @@ class AITasks:
             for job in await cls.all()
             if isinstance(job.job_kwargs, dict)
             and job.job_kwargs.get("creator") == creator
+            and not (
+                job.is_one_off
+                and job.last_run_status
+                and job.last_run_status != "RUNNING"
+            )
         )
 
     @classmethod
@@ -315,7 +330,17 @@ class AITasks:
         if not (params.group_id or params.user_id):
             raise ValueError("需要指定目标群或私聊对象。")
         limit = int(Config.get_config(MODULE, "TASK_LIMIT") or 20)
-        if await ScheduledJob.filter(plugin_name=TASK_PLUGIN).count() >= limit:
+        if (
+            sum(
+                not (
+                    job.is_one_off
+                    and job.last_run_status
+                    and job.last_run_status != "RUNNING"
+                )
+                for job in await cls.all()
+            )
+            >= limit
+        ):
             raise ValueError(f"主动任务已达上限 {limit} 个。")
         trigger = build_trigger(kind, value)
         job = await scheduler_manager.add_schedule(
@@ -354,6 +379,8 @@ class AITasks:
         异常:
             ValueError: 参数无效
         """
+        if job.is_one_off and job.last_run_status and job.last_run_status != "RUNNING":
+            raise ValueError("此一次性任务已结束，请创建新计划。")
         if not prompt.strip():
             raise ValueError("任务说明不能为空。")
         trigger = build_trigger(kind, value)
@@ -388,13 +415,20 @@ class AITasks:
         """
         if await cls.get(task_id) is None:
             return False
+        from zhenxun.services.ai.run.context import get_current_run_context
+        from zhenxun.services.scheduler.registry import scheduler_registry
+
+        current = get_current_run_context()
+        if current and getattr(current.deps, "schedule_id", None) == task_id:
+            raise ValueError("正在执行的任务不能删除自身，请从任务页面停止后删除。")
+        if not await scheduler_registry.stop_running(task_id):
+            raise ValueError("当前执行尚未确认停止，未删除计划。")
         count, _ = await scheduler_manager.target(id=task_id).remove()
         return count > 0
 
     @classmethod
     async def execute(cls, bot: Bot, task_id: int, name: str, params: TaskParams):
-        """按创建者权限及额度运行主动任务，在会话锁内投递并结算；尚未生成任何内容就
-        失败时延迟后重试一次
+        """按创建者权限及额度运行一次，在会话锁内投递并结算。
 
         参数:
             bot: Bot
@@ -413,114 +447,152 @@ class AITasks:
         setting = await AIChatGroup.get_setting(group_id) if group_id else None
         target = SimpleNamespace(group_id=group_id, user_id=user_id)
         platform = PlatformUtils.get_platform_scope(bot)
-        quota_id = scoped_user_id(params.creator, platform)
+        management_check = None
+        if params.source == "management":
+            from zhenxun.builtin_plugins.web_ui.security import management_subject_valid
+
+            def management_check():
+                return management_subject_valid(params.management_subject)
+
+            if not management_check():
+                await scheduler_manager.pause_schedule(task_id)
+                return TaskOutcome(
+                    status="SKIPPED", reason="管理账号已更名或停用，请处理任务来源"
+                )
+        quota_scope = "webui" if management_check else platform
+        quota_id = scoped_user_id(params.creator, quota_scope)
         if (setting and setting.disabled) or await _plugin_blocked(
             PLUGIN_MODULE, bot, target
         ):
-            return
+            return TaskOutcome(status="SKIPPED")
         persona = await AIPersona.get_for_scene(group_id, user_id)
         agent = AIChatManager.get_agent(persona)
         prompt = (
             f"任务 #{task_id}「{name}」：{params.prompt}。"
             f"只输出需要发送的内容，不必发言时输出 {SILENT}。"
         )
-        for attempt in range(2):
-            context = RunContext(
-                deps=ScheduledDeps(
-                    bot=bot,
-                    group_id=group_id,
-                    user_id=params.creator,
-                    schedule_id=task_id,
-                    platform=platform,
-                ),
-                session_id=f"{MODULE}:{bot.self_id}:task:{task_id}",
-            )
-            bind_source(context, "task")
-            context.state[USER_KEY] = params.creator
-            context.state["_retrieval_query"] = params.prompt
-            if setting and setting.model:
-                context.run.current_model = setting.model
+        context = RunContext(
+            deps=ScheduledDeps(
+                bot=bot,
+                group_id=group_id,
+                user_id=params.creator,
+                schedule_id=task_id,
+                platform=platform,
+            ),
+            session_id=f"{MODULE}:{bot.self_id}:task:{task_id}",
+        )
+        bind_source(context, "task", management_check=management_check)
+        context.state[USER_KEY] = params.creator
+        AIChatManager.prepare_input(context, params.prompt)
+        turn = ChatTurn(
+            context,
+            agent,
+            "task",
+            persona,
+            params.prompt,
+            quota_id,
+            usage_id=quota_id,
+        )
+        delivery = turn.delivery
+
+        async def prepare_run():
+            nonlocal setting, persona, agent
+            setting = await AIChatGroup.get_setting(group_id) if group_id else None
+            if setting and setting.disabled:
+                raise asyncio.CancelledError("目标会话已停用")
+            persona = await AIPersona.get_for_scene(group_id, user_id)
+            agent = AIChatManager.get_agent(persona)
+            turn.select_agent(agent, persona)
+            AIChatManager.configuration(context, setting, persona)
+            context.run.current_model = context.state["_configuration"]["model"]
             if group_id:
                 context.state[BACKGROUND_KEY] = ChatBuffer.background(
                     bot.self_id, group_id, None, 20
                 )
-            turn = ChatTurn(
-                context,
-                agent,
-                "task",
-                persona,
-                params.prompt,
-                quota_id,
-                usage_id=quota_id,
+            return agent, prompt
+
+        async def before_run():
+            notice = await AIChatManager._check_quota(
+                params.creator,
+                PlatformUtils.get_platform(bot),
+                scope=quota_scope,
+                check_gold=False,
             )
-            delivery = turn.delivery
+            if notice:
+                raise LLMException(notice)
+            if await _plugin_blocked(PLUGIN_MODULE, bot, target):
+                raise asyncio.CancelledError("目标会话已停用")
 
-            async def before_run():
-                notice = await AIChatManager._check_quota(
-                    params.creator,
-                    PlatformUtils.get_platform(bot),
-                    scope=platform,
-                    check_gold=False,
-                )
-                if notice:
-                    raise LLMException(notice)
-                if await _plugin_blocked(PLUGIN_MODULE, bot, target):
-                    raise asyncio.CancelledError("目标会话已停用")
-
-            async def finalize(result, error=None, turn=turn, delivery=delivery):
-                turn.result = result
-                try:
-                    reply = (
-                        parse_silent(str(result.output))
-                        if result and not result.stopped
-                        else None
-                    )
-                    sticker_id = None
-                    if reply:
-                        reply, sticker_id = split_sticker(reply)
-                    if reply and reply.strip() not in turn.tool_texts:
-                        await deliver(
-                            bot,
-                            group_id,
-                            None if group_id else user_id,
-                            reply,
-                            voice_mode=setting.voice_reply if setting else None,
-                            result=delivery,
-                        )
-                    else:
-                        delivery.status = "skipped" if error is None else "failed"
-                    if sticker_id is not None and delivery.status in {
-                        "sent",
-                        "skipped",
-                    }:
-                        await send_marked(context, sticker_id)
-                    if delivery.parts and not group_id and user_id:
-                        await cls.remember(
-                            bot, user_id, name, "\n".join(delivery.parts)
-                        )
-                except BaseException as exc:
-                    await turn.settle(exc)
-                    raise
-                await turn.settle(error)
-
+        async def finalize(result, error=None, turn=turn, delivery=delivery):
+            turn.result = result
             try:
-                await agent.run(
-                    prompt, context=context, finalize=finalize, before_run=before_run
+                reply = (
+                    parse_silent(str(result.output))
+                    if result and not result.stopped
+                    else None
                 )
-                return
-            except asyncio.CancelledError as error:
-                await turn.settle(error)
+                sticker_id = None
+                if reply:
+                    reply, sticker_id = split_sticker(reply)
+                if reply:
+                    await deliver(
+                        bot,
+                        group_id,
+                        None if group_id else user_id,
+                        reply,
+                        voice_mode=setting.voice_reply if setting else None,
+                        result=delivery,
+                        context=context,
+                    )
+                else:
+                    delivery.status = "skipped" if error is None else "failed"
+                if sticker_id is not None and delivery.status in {
+                    "sent",
+                    "skipped",
+                }:
+                    await send_marked(context, sticker_id)
+                if delivery.parts and not group_id and user_id:
+                    await cls.remember(bot, user_id, name, "\n".join(delivery.parts))
+            except BaseException as exc:
+                await turn.settle(exc)
                 raise
-            except Exception as error:
-                await turn.settle(error)
-                if (
-                    context.run.messages
-                    or delivery.uncertain
-                    or delivery.parts
-                    or attempt
-                ):
-                    return
-                await asyncio.sleep(RETRY_DELAY)
+            await turn.settle(error)
+
+        try:
+            await agent.run(
+                prompt,
+                context=context,
+                finalize=finalize,
+                before_run=before_run,
+                prepare_run=prepare_run,
+            )
+            report = turn.report()
+            if report.get("uncertain") or report.get("operation_uncertain"):
+                return TaskOutcome(status="UNKNOWN")
+            outcome = context.run.outcome
+            if outcome and outcome != "completed":
+                return TaskOutcome(
+                    status={
+                        "interrupted": "INTERRUPTED",
+                        "cancelled": "CANCELLED",
+                        "timeout": "TIMEOUT",
+                        "exhausted": "EXHAUSTED",
+                        "failed": "FAILURE",
+                    }.get(outcome, "UNKNOWN")
+                )
+            return TaskOutcome(
+                status="FAILURE"
+                if report["status"] in {"failed", "partial"}
+                else "SKIPPED"
+                if report["status"] == "skipped"
+                else "SUCCESS"
+            )
+        except asyncio.CancelledError as error:
+            await turn.settle(error)
+            raise
+        except Exception as error:
+            await turn.settle(error)
+            return TaskOutcome(status="FAILURE")
 
     @classmethod
     async def remember(cls, bot: Bot, user_id: str, name: str, reply: str) -> None:
@@ -550,14 +622,20 @@ class AITasks:
 
 async def _run_task(bot: Bot, context: ScheduleContext, params: TaskParams):
     job = await AITasks.get(context.schedule_id)
-    await AITasks.execute(bot, context.schedule_id, job.name if job else "", params)
+    return await AITasks.execute(
+        bot, context.schedule_id, job.name if job else "", params
+    )
 
 
 def register_task_job() -> None:
     """在定时任务服务中注册主动任务的执行函数"""
     if TASK_PLUGIN not in scheduler_manager.get_registered_plugins():
         scheduler_manager.register(
-            TASK_PLUGIN, params_model=TaskParams, default_permission=9
+            TASK_PLUGIN,
+            params_model=TaskParams,
+            default_permission=9,
+            recover_missed=False,
+            retain_finished=True,
         )(_run_task)
 
 
@@ -603,6 +681,7 @@ class TaskToolkit(BaseToolkit):
 
     @tool(
         name="list_scheduled_tasks",
+        rules=ToolOptions(metadata={"read_only": True}),
         description="列出当前用户可以管理的主动任务（群管理员可看到本群的任务）。",
     )
     async def list_scheduled_tasks(self, context: RunContext) -> ToolResult:

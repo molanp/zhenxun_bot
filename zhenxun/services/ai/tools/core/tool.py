@@ -43,6 +43,16 @@ class BaseTool:
     _param_model: Any = None
 
     @property
+    def identity(self) -> str:
+        """工具的稳定来源标识，不随本轮参数或权限变化。"""
+        target = self.get_signature_target()
+        return (
+            f"local:{getattr(target, '__module__', type(target).__module__)}:"
+            f"{getattr(target, '__qualname__', type(target).__qualname__)}:"
+            f"{self.name.lower()}"
+        )
+
+    @property
     def metadata(self) -> dict[str, Any]:
         return self.settings.metadata
 

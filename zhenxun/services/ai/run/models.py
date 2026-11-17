@@ -28,6 +28,8 @@ class AgentRunResult(BaseModel, Generic[OutputDataT]):
     usage: UsageInfo = Field(default_factory=UsageInfo)
     """本次运行的Token消耗总计"""
     stopped: ControlFlowExit | None = None
+    outcome: str = "completed"
+    reason: str | None = None
     """运行被中止的原因（审批被拒、消息已追加、任务被中止等），此时 output 为空"""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

@@ -25,7 +25,7 @@ PRESETS: dict[str, dict[str, Any]] = {
             "anthropic": "https://api.deepseek.com/anthropic",
         },
         "reasoning_param": "deepseek",
-        "web_search": ("anthropic",),
+        "web_search": ("openai_chat", "openai_responses", "anthropic"),
     },
     "ark": {
         "label": "火山方舟 (豆包)",

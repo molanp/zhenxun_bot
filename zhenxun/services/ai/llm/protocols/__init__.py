@@ -317,6 +317,12 @@ def native_tool_allowed(route: "Route", type_id: str) -> bool:
     profile = route.profile
     if type_id in profile.native_tools_off:
         return False
+    vendor = detect_preset(route.base_url) or route.provider.preset
+    if vendor == "deepseek" and type_id in {"web_search", "url_context"}:
+        return type_id in profile.native_tools or (
+            detect_preset(route.base_url) == "deepseek"
+            and route.model.name in {"deepseek-flash", "deepseek-v4-flash-vision-exp"}
+        )
     if route.protocol == "openai_chat":
         vendor = detect_preset(route.base_url) or route.provider.preset
         searchable = "openai_chat" in PRESETS.get(vendor or "", {}).get(
@@ -332,6 +338,23 @@ def native_tool_allowed(route: "Route", type_id: str) -> bool:
     if type_id == "web_search":
         return route.protocol in PRESETS[vendor].get("web_search", ())
     return _PROTOCOL_VENDORS.get(route.protocol) == vendor
+
+
+def deepseek_server_tool(route: "Route", type_id: str) -> dict[str, str] | None:
+    """编码 DeepSeek 的原生搜索与读链接工具。"""
+    if (detect_preset(route.base_url) or route.provider.preset) != "deepseek":
+        return None
+    kind = {
+        "web_search": "deepseek_web_search",
+        "url_context": "deepseek_read_url",
+    }.get(type_id)
+    if not kind:
+        return None
+    return (
+        {"type": kind, "name": kind}
+        if route.protocol == "anthropic"
+        else {"type": kind}
+    )
 
 
 def ensure_content(

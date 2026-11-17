@@ -7,10 +7,13 @@ from zhenxun.configs.config import Config
 from zhenxun.services.ai.run.context import RunContext
 from zhenxun.services.ai.tools.core.decorators import tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
-from zhenxun.services.ai.tools.models import ResolvedToolPayload, ToolResult
+from zhenxun.services.ai.tools.models import (
+    ResolvedToolPayload,
+    ToolOptions,
+    ToolResult,
+)
 from zhenxun.services.ai.utils.utils import MediaFetchError
 from zhenxun.services.log import logger
-from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.pydantic_compat import model_validate
 
 from ._data_source import MODULE
@@ -64,10 +67,7 @@ class StickerToolkit(BaseToolkit):
             hidden.add("send_sticker")
         if not Config.get_config(MODULE, "STICKER_COLLECT", True):
             hidden.add("collect_sticker")
-        bot = context.get_bot() if context else None
-        manage = bool(
-            bot and context and PlatformUtils.is_superuser(bot, context.get_user_id())
-        )
+        manage = bool(context) and await self._manager(context)
         if not manage:
             hidden |= MANAGE_TOOLS
         top = await Stickers.candidates()
@@ -204,6 +204,7 @@ class StickerToolkit(BaseToolkit):
 
     @tool(
         name="find_stickers",
+        rules=ToolOptions(metadata={"read_only": True}),
         description="按关键词搜索表情库（备注、标签、适用场合），为空时列出最常用的。",
     )
     async def find_stickers(self, context: RunContext, query: str = "") -> ToolResult:
@@ -308,11 +309,11 @@ class StickerToolkit(BaseToolkit):
         返回:
             bool: 是否为超级用户
         """
-        bot = context.get_bot()
+        from zhenxun.services.ai.utils.runtime import PermissionUtils
+
         from ._agent import source_policy
 
         return bool(
             source_policy(context)["privileged"]
-            and bot
-            and PlatformUtils.is_superuser(bot, context.get_user_id())
+            and await PermissionUtils.check_superuser(context)
         )

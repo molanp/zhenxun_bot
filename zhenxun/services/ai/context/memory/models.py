@@ -3,10 +3,19 @@
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from zhenxun.services.ai.core.messages import LLMMessage
+
+
+@dataclass(frozen=True)
+class HistorySettlement:
+    """历史后端确认的本轮可见输入，不以未抛异常代替收据。"""
+
+    status: str = "unconfirmed"
+    visible_claims: frozenset[str] = field(default_factory=frozenset)
 
 
 class BaseChatContext(ABC):

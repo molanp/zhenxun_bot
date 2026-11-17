@@ -100,6 +100,7 @@ async def _rule(bot: Bot, event: Event, message: UniMsg, state: T_State) -> bool
             time.time(),
         )
         ChatBuffer.record(bot.self_id, group_id, line)
+        state["ai_chat_anchor"] = line.sequence
         Proactive.wake(bot.self_id, group_id)
         await Steal.observe(bot, group_id, user_id, message)
         if AtWaiter.feed(bot.self_id, group_id, user_id, message, line.message_id):
@@ -150,11 +151,17 @@ async def _(bot: Bot, event: Event, message: UniMsg, state: T_State):
         event,
         state.get(MESSAGE_KEY, message),
         proactive=state.get(PROACTIVE_KEY),
+        input_anchor=state.get("ai_chat_anchor"),
     )
 
 
 @_stop_matcher.handle()
 async def _(bot: Bot, event: Event, session: Uninfo):
+    from zhenxun.services.ai.run.context import RunContext
+
+    from ._agent import bind_source
+    from ._runner import stop_dsh_runs
+
     deps = NoneBotDeps(bot=bot, event=event)
     user_id = ContextUtils.extract_user_id(deps)
     manage = PlatformUtils.is_superuser(bot, user_id) or (
@@ -164,13 +171,22 @@ async def _(bot: Bot, event: Event, session: Uninfo):
     count = await AIChatManager.stop(
         AIChatManager.session_id(bot, event), None if manage else user_id
     )
+    context = RunContext(deps=deps)
+    bind_source(context, "qq")
+    stopped, uncertain = await stop_dsh_runs(context, manage)
     await MessageUtils.build_message(
-        "已停止对应的会话任务。" if count else "没有对应的进行中任务。"
+        "已请求停止，部分桌面任务的停止结果仍待核验。"
+        if uncertain
+        else "已停止对应的会话任务。"
+        if count or stopped
+        else "没有对应的进行中任务。"
     ).finish(reply_to=quote_reply(ContextUtils.extract_group_id(deps)))
 
 
 @_reset_matcher.handle()
 async def _(bot: Bot, event: Event, session: Uninfo):
+    from ._runner import scene_session
+
     group_id = ContextUtils.extract_group_id(NoneBotDeps(bot=bot, event=event))
     quote = quote_reply(group_id)
     if (
@@ -181,9 +197,14 @@ async def _(bot: Bot, event: Event, session: Uninfo):
         await MessageUtils.build_message(
             "群聊的对话记忆是全群共用的，只有群管理员可以重置。"
         ).finish(reply_to=quote)
-    await AIChatManager.reset(AIChatManager.session_id(bot, event))
+    target = await scene_session(bot, event)
+    await AIChatManager.reset(target)
     await MessageUtils.build_message(
-        "已清空本群的对话记忆。" if group_id else "已清空你的对话记忆。"
+        "已重置真寻短期对话并解除 DSH 映射；桌面旧历史仍保留。"
+        if target.startswith("ai_chat:dsh:")
+        else "已清空本群的对话记忆。"
+        if group_id
+        else "已清空你的对话记忆。"
     ).finish(reply_to=quote)
 
 
@@ -202,6 +223,9 @@ if Memory.cursors not in HISTORY_RETAIN:
 )
 async def _():
     Proactive.upgrade_config()
+    from zhenxun.services.ai.run.session import session_manager
+
+    await session_manager.start()
     await AIChatManager.upgrade_personas()
     if Config.get_config(MODULE, "MEMORY_MODE", "off") != "off" or (
         await AIKnowledgeBase.exists()
@@ -215,8 +239,9 @@ async def _():
     priority=60, timeout=15, component_id="runtime:ai_chat_dsh"
 )
 async def _():
-    for session_id in list(AIChatManager._requests):
-        await AIChatManager.stop(session_id)
+    from zhenxun.services.ai.run.session import session_manager
+
+    await session_manager.shutdown()
     await Memory.stop(shutdown=True)
     await DshRuntime.close()
 

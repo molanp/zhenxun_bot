@@ -12,7 +12,7 @@ from zhenxun.services.ai.sandbox.docker import (
 from zhenxun.services.ai.sandbox.manager import SandboxManager
 from zhenxun.services.ai.tools.core.decorators import Rules, tool
 from zhenxun.services.ai.tools.core.toolkit import BaseToolkit
-from zhenxun.services.ai.tools.models import ToolkitConfig, ToolResult
+from zhenxun.services.ai.tools.models import ToolkitConfig, ToolOptions, ToolResult
 from zhenxun.services.ai.utils.logger import log_tool as logger
 
 _FENCE = re.compile(r"^```[\w+-]*\r?\n(.*?)\r?\n?```$", re.DOTALL)
@@ -82,12 +82,17 @@ class SandboxToolkit(BaseToolkit):
         code = code.strip()
         if match := _FENCE.match(code):
             code = match.group(1)
+        started = False
         try:
             sandbox = await self._sandbox(context)
             timeout = get_llm_config().sandbox.exec_timeout
+            started = True
             result = await sandbox.run_code(lang, code, timeout)
         except Exception as e:
-            return ToolResult(output=f"沙箱不可用：{e}").as_error()
+            logger.warning(f"沙箱调用未完成: {type(e).__name__}")
+            return ToolResult(output="沙箱执行未完成，请核查结果。").as_error(
+                False, uncertain=started
+            )
         logger.info(f"沙箱执行 {lang} 代码 {len(code)} 字符，退出码 {result.exit_code}")
         text = result.text()
         if result.exit_code == 127:
@@ -105,15 +110,20 @@ class SandboxToolkit(BaseToolkit):
     async def execute_terminal_command(
         self, command: str, context: RunContext, is_interactive: bool = False
     ) -> ToolResult:
+        started = False
         try:
             sandbox = await self._sandbox(context)
+            started = True
             if not is_interactive:
                 timeout = get_llm_config().sandbox.exec_timeout
                 result = await sandbox.exec(["sh", "-c", command], timeout)
                 return ToolResult(output=result.text())
             terminal = await sandbox.open_terminal(command)
         except Exception as e:
-            return ToolResult(output=f"沙箱不可用：{e}").as_error()
+            logger.warning(f"沙箱命令未完成: {type(e).__name__}")
+            return ToolResult(output="沙箱命令未完成，请核查结果。").as_error(
+                False, uncertain=started
+            )
         await asyncio.sleep(1.5)
         return ToolResult(output=f"终端已启动，当前画面:\n{terminal.screen()}")
 
@@ -132,7 +142,11 @@ class SandboxToolkit(BaseToolkit):
         await asyncio.sleep(1.5)
         return ToolResult(output=f"已发送，当前画面:\n{terminal.screen()}")
 
-    @tool(name="read_sandbox_screen", description="读取沙箱终端的当前画面。")
+    @tool(
+        name="read_sandbox_screen",
+        rules=ToolOptions(metadata={"read_only": True}),
+        description="读取沙箱终端的当前画面。",
+    )
     async def read_sandbox_screen(self, context: RunContext) -> ToolResult:
         terminal = self._terminal(context)
         if not terminal:
@@ -158,15 +172,21 @@ class SandboxToolkit(BaseToolkit):
     async def write_sandbox_file(
         self, path: str, content: str, context: RunContext
     ) -> ToolResult:
+        started = False
         try:
             sandbox = await self._sandbox(context)
+            started = True
             await sandbox.write_file(path, content.encode("utf-8"))
         except Exception as e:
-            return ToolResult(output=f"写入失败：{e}").as_error()
+            logger.warning(f"沙箱写入未完成: {type(e).__name__}")
+            return ToolResult(output="文件写入未完成，请核查内容。").as_error(
+                False, uncertain=started
+            )
         return ToolResult(output=f"已写入 {path}（{len(content)} 字符）")
 
     @tool(
         name="read_sandbox_file",
+        rules=ToolOptions(metadata={"read_only": True}),
         description="读取沙箱文件的文本内容（最多 1MB），相对路径位于 /workspace 下。",
     )
     async def read_sandbox_file(self, path: str, context: RunContext) -> ToolResult:

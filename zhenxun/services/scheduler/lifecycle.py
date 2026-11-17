@@ -175,6 +175,13 @@ async def _drain_scheduler_jobs() -> None:
         with contextlib.suppress(Exception):
             job.pause()
     deadline = asyncio.get_running_loop().time() + 10
+    for schedule_id, handles in list(scheduler_registry.running_handles.items()):
+        schedule = await ScheduleRepository.get_by_id(schedule_id)
+        if schedule and scheduler_registry.tasks.get(schedule.plugin_name, {}).get(
+            "retain_finished"
+        ):
+            for handle in handles:
+                handle.cancel()
     while scheduler_registry.running_tasks:
         if asyncio.get_running_loop().time() >= deadline:
             raise TimeoutError("scheduler_drain_timeout")
@@ -205,11 +212,25 @@ async def _load_schedules_from_db(context):
     count = 0
     for schedule in schedules:
         if schedule.plugin_name in scheduler_registry.tasks:
+            policy = scheduler_registry.tasks[schedule.plugin_name]
+            if policy.get("retain_finished") and schedule.last_run_status == "RUNNING":
+                await ScheduleRepository.update_run_status(
+                    schedule, status="INTERRUPTED", disable=schedule.is_one_off
+                )
+                if schedule.is_one_off:
+                    continue
             if APSchedulerAdapter.add_or_reschedule_job(schedule, catch_up=True):
                 count += 1
             elif schedule.is_one_off:
-                await ScheduledJob.filter(id=schedule.id).delete()
-                logger.info(f"一次性任务 {schedule.id} 已错过执行时间，已删除")
+                if policy.get("retain_finished"):
+                    await ScheduleRepository.update_run_status(
+                        schedule,
+                        status=schedule.last_run_status or "MISSED",
+                        disable=True,
+                    )
+                else:
+                    await ScheduledJob.filter(id=schedule.id).delete()
+                    logger.info(f"一次性任务 {schedule.id} 已错过执行时间，已删除")
         else:
             logger.warning(f"跳过加载定时任务：插件 '{schedule.plugin_name}' 未注册。")
     logger.info(f"数据库定时任务加载完成，共成功加载 {count} 个任务。")

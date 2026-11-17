@@ -37,6 +37,7 @@ from zhenxun.services.ai.utils.logger import log_llm as logger
 from . import (
     ChatStream,
     HttpCall,
+    deepseek_server_tool,
     encodable_inputs,
     ensure_content,
     filter_modalities,
@@ -230,8 +231,8 @@ async def build_chat(route, request: ChatRequest) -> HttpCall:
                 body["tool_choice"] = {"type": "any"}
     server_types = set()
     for tool in server:
-        payload = _server_tool(tool, adaptive)
         type_id = getattr(tool, "type_id", "")
+        payload = deepseek_server_tool(route, type_id) or _server_tool(tool, adaptive)
         if payload and native_tool_allowed(route, type_id):
             server_types.add(type_id)
             tools.append(payload)
@@ -264,7 +265,7 @@ async def build_chat(route, request: ChatRequest) -> HttpCall:
     )
 
 
-_SEARCH_TOOLS = ("web_search", "web_search_prime")
+_SEARCH_TOOLS = ("web_search", "web_search_prime", "deepseek_web_search")
 """服务端网页搜索的工具名，web_search_prime 为智谱的写法"""
 _STOP_UNFINISHED = ("max_tokens", "pause_turn", "model_context_window_exceeded")
 _RESULT_TEXT = re.compile(
@@ -317,6 +318,9 @@ def _grounding(content: list[dict[str, Any]]) -> LLMGroundingMetadata | None:
             query = args.get("query") or args.get("search_query")
             if isinstance(query, str) and query not in queries:
                 queries.append(query)
+            for query in args.get("queries") or []:
+                if isinstance(query, str) and query not in queries:
+                    queries.append(query)
         elif kind == "web_search_tool_result" or (
             kind == "tool_result" and block.get("tool_use_id") in search_ids
         ):
@@ -357,6 +361,14 @@ def parse_chat(route, request: ChatRequest, payload: dict[str, Any]) -> ChatResp
                     thought_text=block.get("thinking") or "",
                     metadata=replay_metadata(PROTOCOL, block),
                 )
+            )
+        elif kind in {
+            "server_tool_use",
+            "web_search_tool_result",
+            "web_fetch_tool_result",
+        } and deepseek_server_tool(route, "web_search"):
+            parts.append(
+                ThoughtPart(thought_text="", metadata=replay_metadata(PROTOCOL, block))
             )
         elif kind == "text" and block.get("text"):
             parts.append(TextPart(text=block["text"]))

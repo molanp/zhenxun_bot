@@ -288,6 +288,14 @@ class AsyncHttpx:
                     )
                 return result
             except Exception as e:
+                from zhenxun.utils.decorator.retry import network_fail_fast
+
+                if network_fail_fast.get():
+                    if isinstance(e, HTTPStatusError) and e.response.status_code < 500:
+                        raise
+                    from zhenxun.services.ai.run.context import interrupt_network
+
+                    interrupt_network("http_fallback", e)
                 if isinstance(e, HTTPStatusError):
                     status = getattr(e.response, "status_code", "?")
                     try:

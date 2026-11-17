@@ -112,9 +112,46 @@ async def resolve_tools(
                 defs.append(item)
 
     _flatten(tool_definitions or [])
-    payloads = await asyncio.gather(*(_resolve_one(item, context) for item in defs))
+    from zhenxun.services.ai.run.context import RunContext
+    from zhenxun.services.ai.run.session import session_manager
+
+    owner = context or RunContext()
+    token = owner.run.cancellation_token
+    if token:
+        token.raise_if_cancelled()
+    tasks = [asyncio.create_task(_resolve_one(item, context)) for item in defs]
+    session_manager.own_preparations(owner, tasks)
+    owner.state["_preparation"] = {"status": "running", "sources": len(tasks)}
+    batch = asyncio.gather(*tasks)
+    batch.add_done_callback(
+        lambda future: None if future.cancelled() else future.exception()
+    )
+    try:
+        payloads = await asyncio.shield(batch)
+        if token:
+            token.raise_if_cancelled()
+    except BaseException as error:
+        owner.state["_preparation"] = {
+            "status": "cancelled"
+            if isinstance(error, asyncio.CancelledError)
+            else "failed",
+            "reason": type(error).__name__,
+        }
+        await session_manager.drain_preparations(owner, tasks)
+        raise
+    owner.state["_preparation"] = {"status": "completed", "sources": len(tasks)}
     final_payload = ResolvedToolPayload()
-    for payload in payloads:
+    for item, payload in zip(defs, payloads):
         if payload:
+            if not payload.injection_sources:
+                payload.injection_sources.append(
+                    {
+                        "source": type(item).__name__,
+                        "role": "user",
+                        "characters": sum(map(len, payload.reminders)),
+                        "count": len(payload.reminders),
+                        "temporary": True,
+                    }
+                )
             final_payload.merge(payload)
     return final_payload

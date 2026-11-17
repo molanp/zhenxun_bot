@@ -26,7 +26,27 @@ from zhenxun.services.ai.core.messages import (
 from zhenxun.utils.pydantic_compat import TypeAdapter, model_copy, model_dump
 from zhenxun.utils.time_utils import TimeUtils
 
-from .models import BaseChatContext
+from .models import BaseChatContext, HistorySettlement
+
+
+def _settlement_receipt(messages, run_id, revision):
+    """仅返回本轮已结算可见用户输入的背景收据。"""
+    matched = [
+        m
+        for m in messages
+        if (m.metadata or {}).get("chat_run") == run_id
+        and (m.metadata or {}).get("chat_revision") == revision
+    ]
+    claims = frozenset(
+        m.metadata["background_claim"]
+        for m in matched
+        if m.role == "user"
+        and m.metadata.get("chat_settled")
+        and m.metadata.get("chat_visible")
+        and m.metadata.get("background_claim")
+    )
+    return HistorySettlement("confirmed" if matched else "unconfirmed", claims)
+
 
 _MEDIA_NAMES = {
     ImagePart: "图片",
@@ -259,7 +279,7 @@ class InMemoryChatContext(BaseChatContext):
         from zhenxun.services.ai.run.session import session_manager
 
         if revision != session_manager.revision(session_id):
-            return
+            return HistorySettlement("stale")
         self._messages[session_id] = [
             _settled_message(m, run_id, revision, delivery) or m
             for m in self._messages.get(session_id, [])
@@ -268,6 +288,7 @@ class InMemoryChatContext(BaseChatContext):
             self._messages[session_id], run_id, revision, delivery
         ):
             await self.add_messages(session_id, [fallback])
+        return _settlement_receipt(self._messages[session_id], run_id, revision)
 
     async def clear(self, session_id: str) -> None:
         """清空指定会话的全部历史消息"""
@@ -349,17 +370,18 @@ class DatabaseChatContext(BaseChatContext):
 
     async def settle_run(self, session_id, run_id, revision, delivery, started_at):
         """定向结算本轮记录，旧会话修订不能改写新历史。"""
+        from tortoise.timezone import now as orm_now
         from tortoise.transactions import in_transaction
 
         from zhenxun.services.ai.run.session import session_manager
 
         if revision != session_manager.revision(session_id):
-            return
+            return HistorySettlement("stale")
         if not self._ready():
             return await self._memory.settle_run(
                 session_id, run_id, revision, delivery, started_at
             )
-        since = datetime.datetime.fromtimestamp(started_at - 1, TimeUtils.zone())
+        since = datetime.datetime.fromtimestamp(started_at - 1, orm_now().tzinfo)
         async with in_transaction() as connection:
             rows = (
                 await self._model()
@@ -397,6 +419,9 @@ class DatabaseChatContext(BaseChatContext):
                     ],
                     using_db=connection,
                 )
+        return _settlement_receipt(
+            [_row_to_message(row) for row in rows], run_id, revision
+        )
 
     async def clear(self, session_id: str) -> None:
         """删除会话的全部消息"""

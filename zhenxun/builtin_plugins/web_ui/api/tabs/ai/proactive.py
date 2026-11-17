@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 import nonebot
 from pydantic import BaseModel, Field
 
@@ -125,12 +125,27 @@ async def _last_runs() -> dict[str, Any]:
 @router.get("/chat/tasks", dependencies=[authentication()], response_model=Result)
 async def list_tasks() -> Result:
     from zhenxun.builtin_plugins.ai_chat._tasks import AITasks
+    from zhenxun.services.ai.run.session import session_manager
+
+    active = {
+        str(getattr(context.deps, "schedule_id", "")): {
+            "run_id": run_id,
+            "phase": context.run.phase,
+            "parent_run_id": context.run.parent_run_id,
+        }
+        for run_id, (context, _) in session_manager.runs.items()
+        if not context.run.parent_run_id
+    }
 
     runs = await _last_runs()
     return Result.ok(
         {
             "tasks": [
-                {**AITasks.item(job), "last_run": runs.get(str(job.id))}
+                {
+                    **AITasks.item(job),
+                    "last_run": runs.get(str(job.id)),
+                    "active_run": active.get(str(job.id)),
+                }
                 for job in await AITasks.all()
             ],
             "bots": list(nonebot.get_bots()),
@@ -139,7 +154,7 @@ async def list_tasks() -> Result:
 
 
 @router.post("/chat/tasks", dependencies=[authentication()], response_model=Result)
-async def create_task(payload: TaskPayload) -> Result:
+async def create_task(payload: TaskPayload, request: Request) -> Result:
     from zhenxun.builtin_plugins.ai_chat._tasks import AITasks, TaskParams
 
     bot_id = payload.bot_id or next(iter(nonebot.get_bots()), None)
@@ -147,10 +162,19 @@ async def create_task(payload: TaskPayload) -> Result:
         raise HTTPException(
             422, detail={"code": "no_bot", "message": "没有在线的 Bot。"}
         )
-    superusers = sorted(nonebot.get_driver().config.superusers)
+    from ....security import decode_access_token_status
+
+    principal, status = decode_access_token_status(
+        request.headers.get("Authorization", "")
+    )
+    if status != "valid" or not principal:
+        raise HTTPException(401, detail={"code": "invalid_auth"})
+    subject = str(principal["sub"])
     params = TaskParams(
         prompt=payload.prompt.strip(),
-        creator=superusers[0] if superusers else "WebUI",
+        creator=f"webui:{subject}",
+        source="management",
+        management_subject=subject,
         group_id=(payload.group_id or "").strip() or None,
         user_id=None if payload.group_id else (payload.user_id or "").strip() or None,
     )
@@ -198,7 +222,10 @@ async def delete_task(task_id: int) -> Result:
     from zhenxun.builtin_plugins.ai_chat._tasks import AITasks
 
     await _require_task(task_id)
-    await AITasks.remove(task_id)
+    try:
+        await AITasks.remove(task_id)
+    except ValueError as error:
+        raise _task_error(error) from error
     logger.info(f"WebUI 删除了主动任务 #{task_id}", "WebUi")
     return Result.ok(info="主动任务已删除。")
 
@@ -209,11 +236,25 @@ async def delete_task(task_id: int) -> Result:
     response_model=Result,
 )
 async def task_action(
-    task_id: int, action: Literal["run", "pause", "resume"]
+    task_id: int,
+    action: Literal["run", "pause", "resume", "stop"],
+    run_id: str | None = None,
 ) -> Result:
     from zhenxun.services.scheduler import scheduler_manager
 
     await _require_task(task_id)
+    if action == "stop":
+        from zhenxun.services.ai.run.session import session_manager
+
+        entry = session_manager.runs.get(run_id or "")
+        if not run_id:
+            raise HTTPException(422, detail={"message": "需要指定本次运行标识"})
+        if entry and str(getattr(entry[0].deps, "schedule_id", "")) != str(task_id):
+            raise HTTPException(409, detail={"message": "运行不属于此计划"})
+        stopped = await session_manager.stop(run_id)
+        return Result.ok(
+            info="本次运行已停止。" if stopped else "正在停止，执行结果待核验。"
+        )
     handler = {
         "run": scheduler_manager.trigger_now,
         "pause": scheduler_manager.pause_schedule,

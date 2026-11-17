@@ -107,11 +107,14 @@ class RestApiToolkit(BaseToolkit):
             result = ToolResult(output=result_dict)
 
             if is_error:
-                result = result.as_error()
+                result = result.as_error(False, uncertain=response.status_code >= 500)
             return result
 
         except Exception as e:
-            logger.error(f"RestApiToolkit 请求失败: {e}")
+            from zhenxun.services.ai.run.context import interrupt_transport
+
+            interrupt_transport(e, "http_tool")
+            logger.error(f"RestApiToolkit 结果未确认: {type(e).__name__}")
             return ToolResult(
-                output=f"网络请求失败: {type(e).__name__} - {e}"
-            ).as_error()
+                output="HTTP 操作结果未确认，请核查目标服务；本轮不自动重试。"
+            ).as_error(False, uncertain=True)

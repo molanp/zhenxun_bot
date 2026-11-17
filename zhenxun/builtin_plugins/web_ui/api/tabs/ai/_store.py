@@ -133,6 +133,9 @@ def _llm_payload(ai: dict[str, Any]) -> dict[str, Any]:
         ),
         "sandbox": ai_get(ai, "sandbox", model_dump(current.sandbox)),
         "web_search": ai_get(ai, "web_search", model_dump(current.web_search)),
+        "deepseek_tools": ai_get(
+            ai, "deepseek_tools", model_dump(current.deepseek_tools)
+        ),
     }
 
 
@@ -647,6 +650,9 @@ def configuration_view(config: LLMConfig, revision: str) -> dict[str, Any]:
             "context": section("context_settings", model_dump(config.context_settings)),
             "agent": section("agent_settings", model_dump(config.agent_settings)),
             "web_search": section("web_search", model_dump(config.web_search)),
+            "deepseek_tools": section(
+                "deepseek_tools", model_dump(config.deepseek_tools)
+            ),
             "advanced": {
                 "client_settings": section(
                     "client_settings", model_dump(config.client_settings)

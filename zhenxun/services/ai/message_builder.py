@@ -132,6 +132,9 @@ class MessageBuilder:
                         else:
                             parts.append(cast(UserContentUnion, part))
                 except Exception as e:
+                    from zhenxun.services.ai.run.context import interrupt_transport
+
+                    interrupt_transport(e, "media_input")
                     logger.warning(f"处理消息段 {seg} 失败: {e}", "LLMUtils")
         merged_parts: list[UserContentUnion] = []
         for part in parts:
