@@ -157,7 +157,7 @@ def stage_environment_resync() -> bool:
     from packaging.version import InvalidVersion, Version
 
     from .environment import capture_environment
-    from .policy import ORM_PACKAGES
+    from .policy import ORM_PACKAGES, retained_conflicts
     from .storage import defer_transaction, draft_transaction
 
     manifest = load_manifest()
@@ -194,12 +194,13 @@ def stage_environment_resync() -> bool:
         manifest["environment"] = current
         save_manifest(manifest)
         return False
+    target["dependency_warnings"] = retained_conflicts(snapshot, dropped)
     transaction = draft_transaction(
         None,
         target,
         action="environment_repair",
         resync_environment=current,
-        remaining_conflicts=deepcopy(snapshot.conflicts),
+        remaining_conflicts=deepcopy(target["dependency_warnings"]),
         source_build_confirmed=True,
         operations=[
             {
@@ -594,13 +595,11 @@ def _build_generation(
                     },
                 )
         from .environment import capture_environment, validate_candidate
-        from .policy import bind_trials
 
         snapshot = capture_environment(
             manifest=transaction["target_manifest"], candidate_path=staging
         )
-        bind_trials(snapshot)
-        validate_candidate(staging, transaction, snapshot=snapshot)
+        validate_candidate(staging, transaction, snapshot=snapshot, migrate_trials=True)
         native_files = _scan_native_extensions(staging)
         (staging / ".zhenxun-generation.json").write_text(
             json.dumps({"native_extensions": native_files}, indent=2), encoding="utf-8"

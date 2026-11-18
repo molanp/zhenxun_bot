@@ -86,7 +86,11 @@ async def resolve_console_session(
     request: Request, persona_id: int | None = None, agent: bool = False
 ) -> Result:
     from zhenxun.builtin_plugins.ai_chat._agent import AGENT_ACTIVE_KEY, bind_source
-    from zhenxun.builtin_plugins.ai_chat._runner import agent_runner, dsh_mode
+    from zhenxun.builtin_plugins.ai_chat._runner import (
+        agent_runner,
+        dsh_mode,
+        dsh_settings,
+    )
     from zhenxun.models.ai_persona import AIPersona
     from zhenxun.services.ai.run.context import RunContext, ScheduledDeps
     from zhenxun.services.ai.run.dsh import DshSessions
@@ -108,7 +112,8 @@ async def resolve_console_session(
     context.state[AGENT_ACTIVE_KEY] = agent
     persona = await AIPersona.get_or_none(id=persona_id) if persona_id else None
     mode = await dsh_mode(context, persona)
-    item = DshSessions._read()["owners"].get(DshSessions.owner(context, mode))
+    records = DshSessions.for_settings(dsh_settings())
+    item = records._read()["owners"].get(records.owner(context, mode))
     return Result.ok(
         {
             "session_id": item["local_id"] if item else None,

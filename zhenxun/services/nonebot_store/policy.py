@@ -7,7 +7,8 @@ from pathlib import Path
 import shlex
 import sys
 
-from packaging.requirements import Requirement
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 
 # nonebot-plugin-orm 的数据库迁移依赖的包，已安装时只能在控制台改变版本
@@ -126,8 +127,9 @@ def _same_state(recorded: dict | None, current: dict) -> bool:
     返回:
         bool: 当前状态中的每个键是否都与已保存状态一致
     """
-    recorded = recorded or {}
-    return all(recorded.get(key) == value for key, value in current.items())
+    return isinstance(recorded, dict) and all(
+        key in recorded and recorded[key] == value for key, value in current.items()
+    )
 
 
 def unchanged_conflict(snapshot, issue: dict, permitted: list[dict]) -> bool:
@@ -154,66 +156,122 @@ def unchanged_conflict(snapshot, issue: dict, permitted: list[dict]) -> bool:
     )
 
 
-def trial_context(snapshot, owner: str, name: str) -> dict:
-    """记录兼容性例外绑定的求解策略、插件版本与依赖版本
+def trial_evidence(
+    name: str,
+    owner_version: str | None,
+    owner_source: str | None,
+    version: str | None,
+    source: str | None,
+) -> dict | None:
+    """记录当前包的适用规则和双方身份，与安装计划的全局修订号无关。"""
+    from .dependencies import (
+        FORBIDDEN_LAYER_PACKAGES,
+        _project_requirement_map,
+        dependency_floors,
+        protected_core,
+    )
 
-    参数:
-        snapshot: 环境快照
-        owner: 声明依赖的插件包名
-        name: 依赖包名
-
-    返回:
-        dict: 兼容性例外的绑定条件
-    """
-    from .dependencies import SOLVER_POLICY_VERSION
-
+    if (
+        name in ORM_PACKAGES
+        or name in FORBIDDEN_LAYER_PACKAGES
+        or name in protected_core()
+    ):
+        return None
+    floor = dependency_floors().get(name)
+    project = _project_requirement_map().get(name)
+    bounds = SpecifierSet(floor or "")
+    if project:
+        bounds &= project.specifier
+    if (
+        not version
+        or not owner_version
+        or owner_source not in {"active_generation", "base"}
+        or source not in {"active_generation", "base"}
+        or not bounds.contains(version, prereleases=True)
+    ):
+        return None
     return {
-        "policy_version": SOLVER_POLICY_VERSION,
-        "owner_version": snapshot.versions.get(owner),
-        "dependency_version": snapshot.versions.get(name),
-        "dependency_source": snapshot.sources[name]["layer"],
+        "schema": 1,
+        "constraint": str(bounds) if floor is not None or project else None,
+        "owner_version": owner_version,
+        "owner_source": owner_source,
+        "dependency_version": version,
+        "dependency_source": source,
     }
 
 
-def bind_trials(snapshot) -> None:
-    """Bind newly prepared exceptions; previously verified exceptions stay immutable."""
-    for plugin in snapshot.manifest.get("plugins", {}).values():
-        owner = canonicalize_name(plugin["project_link"])
-        for item in plugin.get("compatibility_overrides", []):
-            name = item["name"]
-            if (
-                not item.get("evidence")
-                and owner in snapshot.selected
-                and name in snapshot.selected
-            ):
-                item["evidence"] = trial_context(snapshot, owner, name)
+def unresolved_conflict(
+    snapshot, conflict: dict, permitted: list[dict], *, migrations=None
+) -> dict | None:
+    """兼容例外按批准时的证据核验；其余历史冲突按双方基线核验。"""
+    from .dependencies import SOLVER_POLICY_VERSION
 
-
-def trial_permits(snapshot, conflict: dict) -> bool:
-    from .dependencies import protected_core
-
-    if conflict.get("kind") or not conflict.get("actual"):
-        return False
     owner, name = conflict["owner"], conflict["name"]
-    if name in ORM_PACKAGES or name in protected_core():
-        return False
+    matched = False
     for plugin in snapshot.manifest.get("plugins", {}).values():
         if canonicalize_name(plugin["project_link"]) != owner:
             continue
         for item in plugin.get("compatibility_overrides", []):
+            if item.get("name") != name:
+                continue
+            matched = True
+            evidence = item.get("evidence")
             if (
-                item.get("name") == name
-                and (
-                    item.get("requirement", item.get("declared_requirement"))
-                    == conflict["requirement"]
-                )
-                and item.get("effective_version") == conflict["actual"]
+                not isinstance(evidence, dict)
+                or not evidence
+                or conflict.get("kind")
+                or not conflict.get("actual")
+                or item.get("effective_version") != conflict["actual"]
+            ):
+                continue
+            try:
+                if Requirement(
+                    item.get("requirement") or item.get("declared_requirement") or ""
+                ) != Requirement(conflict["requirement"]):
+                    continue
+            except InvalidRequirement:
+                continue
+            expected = trial_evidence(
+                name,
+                snapshot.versions.get(owner),
+                snapshot.sources.get(owner, {}).get("layer"),
+                snapshot.versions.get(name),
+                snapshot.sources.get(name, {}).get("layer"),
+            )
+            if not expected:
+                continue
+            if evidence == expected:
+                return None
+            # 旧收据仅在其已知策略下转换；声明方的旧来源由托管插件清单佐证。
+            legacy = evidence.get("policy_version")
+            if (
+                "schema" not in evidence
+                and SOLVER_POLICY_VERSION == 13
+                and (legacy == 13 or (legacy == 12 and "blitz-py" not in {owner, name}))
+                and expected["owner_source"] == "active_generation"
+                and snapshot.manifest.get("packages", {}).get(owner, {}).get("version")
+                == plugin.get("version")
+                == expected["owner_version"]
+                and item.get("tier")
+                == ("shared_compatible" if expected["constraint"] else "plugin_private")
                 and _same_state(
-                    item.get("evidence"), trial_context(snapshot, owner, name)
+                    evidence,
+                    {
+                        k: expected[k]
+                        for k in (
+                            "owner_version",
+                            "dependency_version",
+                            "dependency_source",
+                        )
+                    },
                 )
             ):
-                return True
-    return False
+                if migrations is not None:
+                    migrations.append((item, expected))
+                return None
+    if matched:
+        return {**conflict, "reason": "compatibility_trial_recheck_required"}
+    return None if unchanged_conflict(snapshot, conflict, permitted) else conflict
 
 
 def summary_revision(value: dict) -> str:

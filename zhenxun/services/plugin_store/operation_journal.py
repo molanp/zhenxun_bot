@@ -109,7 +109,12 @@ def record_operation(store_key: str, result: dict[str, Any]) -> str:
 
 
 def settle_operations(
-    operation_ids: list[str], status: str, apply_mode: str, reason: str = ""
+    operation_ids: list[str],
+    status: str,
+    apply_mode: str,
+    reason: str = "",
+    *,
+    diagnostic: str = "",
 ) -> None:
     """更新待重启操作的最终状态
 
@@ -133,6 +138,8 @@ def settle_operations(
             result.update(changes, restart_required=False, restart_available=False)
             if reason:
                 result.update(reason=reason, reason_codes=[reason])
+            if diagnostic:
+                result["diagnostic"] = diagnostic
 
     mutate_json_locked(_JOURNAL_FILE, {}, update)
 

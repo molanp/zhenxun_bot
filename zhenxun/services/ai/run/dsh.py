@@ -1089,6 +1089,10 @@ class DshRuntime:
             output = int(counts.get("outputTokens") or 0)
             turn.usage.prompt_tokens += prompt
             turn.usage.prompt_cache_hit_tokens += cached
+            if "cacheReadTokens" in counts:
+                turn.context.run.budget["reported_cache_read"] = (
+                    turn.usage.prompt_cache_hit_tokens
+                )
             turn.usage.completion_tokens += output
             turn.usage.total_tokens += int(counts.get("totalTokens") or prompt + output)
             turn.context.run.budget["tokens"] = turn.usage.total_tokens

@@ -120,6 +120,8 @@ class ChatTurn:
         """
         report = self.delivery.as_dict()
         operations = self.context.run.operations
+        if attachment := operations.get("attachment"):
+            report["attachment"] = dict(attachment)
         records = list(operations.get("deliveries", {}).values())
         entries = [entry for record in records for entry in record["entries"]]
         report["text"] = "\n".join(
@@ -191,6 +193,7 @@ class ChatTurn:
         """
         from zhenxun.services.ai.core.exceptions import (
             InterventionHandledException,
+            LLMException,
             RunInterrupted,
         )
 
@@ -221,6 +224,11 @@ class ChatTurn:
             )
             if not interrupted and directed and not self.tool_texts:
                 notice = context.run.user_notice or custom or FAILED_NOTICE
+                if (
+                    isinstance(error, LLMException)
+                    and (error.details or {}).get("code") == "follow_up_unconsumed"
+                ):
+                    notice = "上一轮已结束，追加消息未被处理，请重新发送。"
                 await send_reply(notice, group_id, result=delivery, context=context)
             elif delivery.status == "pending":
                 delivery.status = "skipped" if interrupted else "failed"
@@ -230,6 +238,20 @@ class ChatTurn:
             return
         if not directed and AIChatManager.directed_pending(context.session_id or ""):
             delivery.status = "skipped"
+            return
+        if payload := context.state.pop("_qq_attachment", None):
+            from ._attachments import send_export
+
+            await send_export(context, payload, delivery)
+            if delivery.status == "failed":
+                await send_reply(
+                    "附件未发送：" + (delivery.error or "平台拒绝了上传"),
+                    group_id,
+                    result=delivery,
+                    context=context,
+                )
+            return
+        if context.run.operations.get("attachment", {}).get("name"):
             return
         reply = parse_silent(str(value.output))
         empty = not clean_output(str(value.output)).strip()

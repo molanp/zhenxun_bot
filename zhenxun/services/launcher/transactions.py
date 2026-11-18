@@ -94,7 +94,8 @@ class PluginTransactions:
         if nonebot_failed and source_before:
             source_store.fail_pending_transaction(
                 (nonebot_after or {}).get("error_code")
-                or "dependency_layer_build_failed"
+                or "dependency_layer_build_failed",
+                (nonebot_after or {}).get("error_details"),
             )
         source_applied = (
             await run_maintenance("source-apply")

@@ -4,7 +4,10 @@ import time
 from typing import Any
 import uuid
 
-from zhenxun.services.ai.core.exceptions import InterventionHandledException
+from zhenxun.services.ai.core.exceptions import (
+    InterventionHandledException,
+    LLMException,
+)
 from zhenxun.services.ai.core.models import CancellationToken
 from zhenxun.services.ai.utils.logger import log_flow as logger
 
@@ -150,6 +153,7 @@ class AgentSessionManager:
             "preparation": context.state.get("_preparation"),
             "configuration": context.state.get("_configuration"),
             "injections": context.state.get("_injections"),
+            "reported_cache_read_tokens": context.run.budget.get("reported_cache_read"),
             "background": context.state.get("_background_receipt"),
         }
 
@@ -314,19 +318,17 @@ class AgentSessionManager:
         """
         revision = self.revision(session_id) + 1
         self._revisions[session_id] = revision
-        self._follow_ups.pop(session_id, None)
+        self._release_follow_ups(session_id)
         return revision
 
-    def drain_follow_ups(self, session_id: str) -> list[Any]:
-        """取出会话中等待并入当前运行的用户输入
-
-        参数:
-            session_id: 会话 ID
-
-        返回:
-            list[Any]: 追加的用户输入
-        """
+    def drain_follow_ups(self, session_id: str) -> list[tuple[Any, asyncio.Future]]:
+        """交接待并入的输入及消费回执，消费方负责结算每张回执。"""
         return self._follow_ups.pop(session_id, [])
+
+    def _release_follow_ups(self, session_id: str) -> None:
+        for _, receipt in self.drain_follow_ups(session_id):
+            if not receipt.done():
+                receipt.set_result(False)
 
     def update_admission(self, session_id: str, admission: Any) -> None:
         """在已取得执行权的窗口内更新追加输入的兼容条件。"""
@@ -388,8 +390,17 @@ class AgentSessionManager:
                     and self._admissions.get(session_id) == admission
                     and (revision is None or revision == self.revision(session_id))
                 ):
-                    self._follow_ups.setdefault(session_id, []).append(follow_up)
-                    raise InterventionHandledException("Follow-up successful")
+                    receipt = asyncio.get_running_loop().create_future()
+                    self._follow_ups.setdefault(session_id, []).append(
+                        (follow_up, receipt)
+                    )
+                    if await receipt:
+                        raise InterventionHandledException("Follow-up successful")
+                    cancel_token.raise_if_cancelled()
+                    raise LLMException(
+                        "上一轮已结束，追加消息未被处理，请重新发送。",
+                        details={"code": "follow_up_unconsumed"},
+                    )
                 logger.info(f"⏳ [并发控制] 会话 {session_id} 正忙，新请求排队等待...")
             async with lock:
                 cancel_token.raise_if_cancelled()
@@ -403,7 +414,7 @@ class AgentSessionManager:
                     self._owners.pop(session_id, None)
                     self._admissions.pop(session_id, None)
                     self._in_tools.discard(session_id)
-                    self._follow_ups.pop(session_id, None)
+                    self._release_follow_ups(session_id)
         finally:
             tasks.remove(entry)
             if not tasks:

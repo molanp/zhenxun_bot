@@ -1330,7 +1330,7 @@ async def solve_install(
         dict[str, Any]: 安装计划
     """
     from .environment import capture_environment
-    from .policy import guard_orm_request, retained_conflicts
+    from .policy import guard_orm_request, retained_conflicts, trial_evidence
 
     snapshot = capture_environment()
     report = environment_report(snapshot=snapshot)
@@ -1392,6 +1392,22 @@ async def solve_install(
     if overrides:
         packages[candidate_name] = {"version": str(plugin["version"])}
     layer_packages = {name: str(info["version"]) for name, info in packages.items()}
+    for item in overrides:
+        name = item["name"]
+        base_dist = snapshot.base.get(name)
+        effective = layer_packages.get(name, base_dist.version if base_dist else None)
+        evidence = trial_evidence(
+            name,
+            str(plugin["version"]),
+            "active_generation",
+            effective,
+            "active_generation" if name in layer_packages else "base",
+        )
+        if effective != item["effective_version"] or not evidence:
+            raise DependencyAnalysisError(
+                "current_environment_dependency_conflict", details=[item]
+            )
+        item["evidence"] = evidence
     shared = shared_dependencies()
     changes = list(result["changes"])
     if overrides and current.get(candidate_name) != str(plugin["version"]):

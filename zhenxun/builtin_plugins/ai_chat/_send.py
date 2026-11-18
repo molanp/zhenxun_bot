@@ -16,7 +16,7 @@ from zhenxun.utils.platform import PlatformUtils
 
 from ._buffer import ChatBuffer, ChatLine
 from ._data_source import MODULE
-from ._reply import clean_markdown
+from ._reply import clean_markdown, clean_output
 from ._safety import Safety, prune
 from ._tools import GroupHistory
 
@@ -222,7 +222,11 @@ class QQSendToolkit(BaseToolkit):
         scene = Scene.of(context)
         if scene is None:
             return ToolResult(output="当前不在会话中。").as_error()
-        texts = [clean_markdown(m) for m in messages if m and m.strip()]
+        texts = [
+            text
+            for m in messages
+            if m and (text := clean_markdown(clean_output(m)).strip())
+        ]
         if not texts or len(texts) > SEND_MAX_MESSAGES:
             return ToolResult(output="一次发送 1 到 5 条消息。").as_error()
         if any(len(m) > SEND_MAX_CHARS for m in texts):

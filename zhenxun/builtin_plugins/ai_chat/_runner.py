@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import time
 
 """第三方执行器：选用非 local 执行器时由它代替本地 Agent 完成一轮对话，
@@ -128,6 +129,7 @@ async def _run_dsh(
     from zhenxun.services.ai.core.messages import LLMMessage
     from zhenxun.services.ai.run.hitl import HITLController
 
+    from ._attachments import collect_export, export_instruction, export_slot
     from ._reply import clean_output
     from ._safety import Safety
 
@@ -274,14 +276,18 @@ async def _run_dsh(
                 )
                 new = new or remote_id != binding["remote_id"]
                 blocks = []
-                if not binding.get("native"):
-                    persona_text = AIChatManager.build_instruction(selected)
+                persona_text = AIChatManager.build_instruction(selected)
+                stamp = hashlib.sha256(
+                    (binding["remote_id"] + "\0" + persona_text).encode()
+                ).hexdigest()
+                if new or binding.get("applied_persona") != stamp:
                     blocks.append(
                         {
                             "type": "text",
                             "text": f"<本轮人设>\n{persona_text}\n</本轮人设>",
                         }
                     )
+                if not binding.get("native"):
                     if new:
                         transcript = []
                         for message in history[-40:]:
@@ -301,6 +307,8 @@ async def _run_dsh(
                                 }
                             )
                     blocks.append({"type": "text", "text": _time_prompt(context)})
+                    if hint := context.run.dynamic_prompts.get("proactive"):
+                        blocks.append({"type": "text", "text": hint})
                 blocks += await content_blocks(
                     prepared, native=bool(binding.get("native"))
                 )
@@ -311,9 +319,16 @@ async def _run_dsh(
                         **context.state.get("_dsh_input_metadata", {}),
                     }
                     await backend.add_messages(session_id, [user_message])
-                raw, usage, reason = await DshRuntime.prompt(remote, blocks)
-                settling = True
-                text = Safety.filter_output(clean_output(raw))[0]
+                with export_slot(context, binding) as slot:
+                    if slot:
+                        blocks.append(
+                            {"type": "text", "text": export_instruction(slot[1])}
+                        )
+                    raw, usage, reason = await DshRuntime.prompt(remote, blocks)
+                    settling = True
+                    text, blocked = Safety.filter_output(clean_output(raw))
+                    if slot and not blocked:
+                        text = collect_export(context, slot, text)
                 if backend:
                     assistant = LLMMessage.assistant_text_response(text)
                     assistant.metadata = {
@@ -370,10 +385,15 @@ async def _run_dsh(
                 if finalize:
                     await finalize(result, None)
                 delivery = context.state.get("_delivery", {})
+                attachment = delivery.get("attachment")
                 clean = (
                     delivery.get("status") == "sent"
                     and not delivery.get("uncertain")
-                    and text == raw
+                    and (
+                        attachment.get("status") == "sent"
+                        if attachment
+                        else text == raw
+                    )
                 )
                 DshSessions.for_binding(binding).update(
                     binding,
@@ -382,6 +402,7 @@ async def _run_dsh(
                     if clean or binding.get("native")
                     else "delivery_or_filter_changed",
                     delivery_uncertain=not clean,
+                    applied_persona=stamp,
                 )
                 return result
             except BaseException:

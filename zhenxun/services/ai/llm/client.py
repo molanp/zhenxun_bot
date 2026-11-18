@@ -36,7 +36,11 @@ from zhenxun.services.ai.core.exceptions import (
 )
 from zhenxun.services.ai.core.models import CancellationToken, ModelProfile
 from zhenxun.services.ai.core.options import CommonLLMConfig, GenerationConfig
-from zhenxun.services.ai.run.context import fail_fast_enabled, interrupt_network
+from zhenxun.services.ai.run.context import (
+    RunContext,
+    fail_fast_enabled,
+    interrupt_network,
+)
 from zhenxun.services.ai.utils.logger import log_llm as logger
 from zhenxun.services.lifecycle.deadline import remaining_timeout
 from zhenxun.services.network_proxy import ManagedAsyncClient, ProxyRequestError
@@ -549,7 +553,13 @@ async def call_route(
     cooldowns = {"rate": settings.rate_limit_cooldown, "quota": settings.quota_cooldown}
     provider = route.provider
     tried: set[str] = set()
-    api_key = health_manager.pick_key(provider.name, provider.api_keys, tried)
+    context = request.extra.get("run_context") if task == "chat" else None
+    affinity = None
+    if isinstance(context, RunContext) and context.run.source:
+        affinity = context.run.root_session_id or context.session_id
+    api_key = health_manager.pick_key(
+        provider.name, provider.api_keys, tried, affinity=affinity
+    )
     if api_key is None:
         raise _no_key_error(route)
     attempt = 0

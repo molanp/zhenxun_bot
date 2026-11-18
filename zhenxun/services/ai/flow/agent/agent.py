@@ -519,7 +519,7 @@ class Agent:
         defs = list(await capability.prepare_tools(context, defs) or [])
         defs_by_name = {d.name.lower(): d for d in defs if d}
         tools = []
-        for name, (t, _) in candidates.items():
+        for name, (t, _) in sorted(candidates.items()):
             if name in defs_by_name:
                 tool = copy.copy(t)
                 setattr(tool, "_dynamic_def", defs_by_name.pop(name))
@@ -561,6 +561,10 @@ class Agent:
         tools, payload = await self._build_tools(context, resources.capability)
         static.extend(payload.injected_prompts)
         reminders.extend(payload.reminders)
+        static = list(dict.fromkeys(static))
+        reminders = list(
+            dict.fromkeys(text for text in reminders if text not in static)
+        )
         context.state["_injections"] = {
             "system": {
                 "count": len(static),
@@ -703,4 +707,5 @@ class Agent:
             output=output,
             messages=new_msgs,
             usage=result.usage or UsageInfo(),
+            outcome=result.outcome,
         )

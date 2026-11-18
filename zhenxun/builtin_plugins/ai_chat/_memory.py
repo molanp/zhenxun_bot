@@ -118,7 +118,9 @@ def session_scope(session_id: str) -> Scope | None:
     返回:
         Scope | None: 记忆范围
     """
-    if not session_id.startswith(f"{MODULE}:"):
+    if not session_id.startswith(f"{MODULE}:") or session_id.startswith(
+        f"{MODULE}:dsh:"
+    ):
         return None
     _, group_id, user_id = parse_session(session_id)
     if group_id:

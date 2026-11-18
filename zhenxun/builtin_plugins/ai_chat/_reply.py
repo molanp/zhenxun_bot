@@ -68,6 +68,11 @@ def _echo_label(nickname: str) -> re.Pattern[str]:
 _SENTENCE_END = re.compile(r"[。！？!?…~]")
 _FENCE = re.compile(r"^\s*(```|~~~)")
 _INLINE_CODE = re.compile(r"(`[^`\n]+`)")
+_DSML_TAG = re.compile(
+    r"\\?<(?P<close>/?)\s*[｜|]{2}DSML[｜|]{2}\s*"
+    r"(?P<name>tool_calls|calls|invoke|parameter)\b[^>]*(?:>|$)",
+    re.I,
+)
 _LINE_RULES = [
     (re.compile(r"^\s{0,3}#{1,6}\s+"), ""),
     (re.compile(r"^\s{0,3}>\s?"), ""),
@@ -700,6 +705,8 @@ def clean_output(text: str) -> str:
     返回:
         str: 清理后的文本
     """
+    if "dsml" in text.lower():
+        text = _strip_dsml(text)
     output: list[str] = []
     hidden = False
     for code, block in _segments(text):
@@ -732,6 +739,35 @@ def clean_output(text: str) -> str:
         if content := "".join(cleaned):
             output.append(content)
     return "\n".join(output).strip()
+
+
+def _strip_dsml(text: str) -> str:
+    """移除正文中的 DSML 调用及参数，不解析执行，保留独立代码示例。"""
+    hidden = ""
+    blocks = []
+    for code, block in _segments(text):
+        parts = []
+        for index, part in enumerate([block] if code else _INLINE_CODE.split(block)):
+            if code or index % 2:
+                if not hidden:
+                    parts.append(part)
+                continue
+            start = 0
+            for match in _DSML_TAG.finditer(part):
+                if not hidden:
+                    parts.append(part[start : match.start()])
+                name = match["name"].lower()
+                if match["close"]:
+                    if name == hidden:
+                        hidden = ""
+                elif not hidden:
+                    hidden = name
+                start = match.end()
+            if not hidden:
+                parts.append(part[start:])
+        if parts:
+            blocks.append("".join(parts))
+    return "\n".join(blocks).strip()
 
 
 def parse_silent(text: str) -> str | None:

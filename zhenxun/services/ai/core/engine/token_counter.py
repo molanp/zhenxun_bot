@@ -137,6 +137,12 @@ def parse_usage_info(usage_info: dict | None) -> UsageInfo:
         cache_hit = (usage_info.get("input_tokens_details") or {}).get(
             "cached_tokens", 0
         )
+        if (
+            "cache_read_input_tokens" in usage_info
+            or "cache_creation_input_tokens" in usage_info
+        ):
+            cache_hit = usage_info.get("cache_read_input_tokens") or 0
+            prompt += cache_hit + (usage_info.get("cache_creation_input_tokens") or 0)
         reasoning = (usage_info.get("output_tokens_details") or {}).get(
             "reasoning_tokens", 0
         )

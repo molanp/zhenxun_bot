@@ -686,7 +686,7 @@ def dropped_core_packages(previous: set[str]) -> list[str]:
 def verify_effective_environment() -> dict:
     """Verify the base and active layer after a dependency synchronization."""
     from .dependencies import DependencyAnalysisError, environment_report
-    from .policy import trial_permits, unchanged_conflict
+    from .policy import unresolved_conflict
 
     report = environment_report()
     snapshot = capture_environment()
@@ -696,10 +696,9 @@ def verify_effective_environment() -> dict:
         *report["immutable_drift"],
         *report["incompatible_shared_drift"],
         *[
-            item
+            error
             for item in snapshot.conflicts
-            if not trial_permits(snapshot, item)
-            and not unchanged_conflict(snapshot, item, permitted)
+            if (error := unresolved_conflict(snapshot, item, permitted))
         ],
     ]
     if failures:
@@ -714,6 +713,7 @@ def validate_candidate(
     transaction: dict[str, Any],
     *,
     snapshot: EnvironmentSnapshot | None = None,
+    migrate_trials: bool = False,
 ) -> dict:
     """校验候选依赖层：包版本与计划一致，不引入新的依赖冲突
 
@@ -741,7 +741,7 @@ def validate_candidate(
         raise DependencyAnalysisError(
             "dependency_layer_state_mismatch", details=duplicate_layer
         )
-    from .policy import guard_orm_changes, trial_permits, unchanged_conflict
+    from .policy import guard_orm_changes, unresolved_conflict
 
     baseline = capture_environment(
         manifest=transaction.get("base_manifest") or load_manifest()
@@ -779,22 +779,22 @@ def validate_candidate(
                     }
                 ],
             )
-    allowed = (
-        {conflict_key(item) for item in permitted}
-        if transaction.get("action") == "environment_repair"
-        else set()
-    )
+    migrations = [] if migrate_trials else None
     errors = [
-        item
+        error
         for item in snapshot.conflicts
-        if conflict_key(item) not in allowed
-        and not unchanged_conflict(snapshot, item, permitted)
-        and not trial_permits(snapshot, item)
+        if (
+            error := unresolved_conflict(
+                snapshot, item, permitted, migrations=migrations
+            )
+        )
     ]
     if errors:
         raise DependencyAnalysisError(
             "current_environment_dependency_conflict", details=errors
         )
+    for item, evidence in migrations or []:
+        item["evidence"] = evidence
     return {
         "state": "partial" if snapshot.conflicts or remaining_core else "passed",
         "remaining_conflicts": [*snapshot.conflicts, *remaining_core],

@@ -1002,6 +1002,8 @@ class StoreManager:
             str: 错误码，或“包名: 错误码”
         """
         code = getattr(error, "code", "")
+        if code == "current_environment_dependency_conflict":
+            return str(error)
         if code == "dependency_requirement_unsupported":
             return f"{str(error).partition(': ')[2]}: {code}"
         if code == "orm_dependency_console_required":

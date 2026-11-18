@@ -23,7 +23,7 @@ class AIPersona(Model):
     tools = fields.JSONField(null=True, description="工具组白名单，为空不限制")
     """可用的工具组（见 ai_chat 的 TOOL_GROUPS），为空不限制，空列表为不提供工具"""
     knowledge_bases = fields.JSONField(null=True, description="绑定的知识库")
-    """旧版绑定的知识库 id，启动时并入全局知识库设置后清空"""
+    """人设绑定的知识库 id，群有独立限制时取交集"""
     skills = fields.JSONField(null=True, description="技能白名单，为空不限制")
     """可用的技能名，为空时可用全部已启用技能，空列表为不提供技能"""
     subagents = fields.JSONField(null=True, description="子代理")

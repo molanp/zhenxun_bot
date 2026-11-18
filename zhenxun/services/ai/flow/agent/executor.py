@@ -60,19 +60,31 @@ class AgentExecutor:
             AgentRunResult[Any]: 运行结果
         """
         cycle = 0
-        resources.run_context.run.budget.setdefault(
-            "model_limit", resources.config.max_cycles
-        )
+        run = resources.run_context.run
+        run.budget.setdefault("model_limit", resources.config.max_cycles)
+        if not run.parent_run_id:
+            run.budget["reserve_summary"] = resources.config.enable_fallback_summary
         while cycle < resources.config.max_cycles:
             state.current_cycle = cycle
             if token := resources.run_context.run.cancellation_token:
                 token.raise_if_cancelled()
+            remaining = run.budget["model_limit"] - run.budget.get("model_calls", 0)
+            if (
+                not run.parent_run_id
+                and run.budget.get("model_calls")
+                and remaining == 1
+                and resources.config.enable_fallback_summary
+            ):
+                return await self._fallback(state, resources)
             self._build_request(state, resources)
             state.current_response = await self._invoke_and_record(
                 state,
                 resources,
                 state.current_request_messages,
-                list(state.tools) if state.tools else None,
+                list(state.tools)
+                if state.tools
+                and not (remaining == 1 and run.budget.get("reserve_summary"))
+                else None,
             )
             if await self._collect_tool_calls(state, resources):
                 session_id = resources.run_context.session_id or "default_session"
@@ -117,13 +129,20 @@ class AgentExecutor:
             resources: 运行资源
         """
         context = resources.run_context
-        for prompt in session_manager.drain_follow_ups(
+        items = session_manager.drain_follow_ups(
             context.session_id or "default_session"
-        ):
-            if context.run.prepare_follow_up:
-                prompt = await context.run.prepare_follow_up(prompt)
-            if msgs := await MessageBuilder.normalize_to_llm_messages(prompt):
+        )
+        try:
+            for prompt, receipt in items:
+                if receipt.done():
+                    continue
+                if context.run.prepare_follow_up:
+                    prompt = await context.run.prepare_follow_up(prompt)
+                msgs = await MessageBuilder.normalize_to_llm_messages(prompt)
+                if not msgs or receipt.done():
+                    continue
                 context.run.messages.append(msgs[-1])
+                receipt.set_result(True)
                 if injections := context.state.get("_injections"):
                     injections["sources"].append(
                         {
@@ -135,6 +154,10 @@ class AgentExecutor:
                         }
                     )
                 state.should_reset_cycle = True
+        finally:
+            for _, receipt in items:
+                if not receipt.done():
+                    receipt.set_result(False)
 
     async def _invoke_and_record(
         self,
@@ -159,9 +182,10 @@ class AgentExecutor:
         run_context = resources.run_context
         flattened = await self._fit_request(messages, tools, state, resources)
         budget = run_context.run.budget
-        if budget.get("model_calls", 0) >= budget.get(
-            "model_limit", resources.config.max_cycles
-        ):
+        call_limit = budget.get("model_limit", resources.config.max_cycles)
+        if run_context.run.parent_run_id and budget.get("reserve_summary"):
+            call_limit -= 1
+        if budget.get("model_calls", 0) >= call_limit:
             from zhenxun.services.ai.core.exceptions import RunBudgetExceeded
 
             raise RunBudgetExceeded("本轮模型调用预算已用完，未继续请求。")
@@ -182,9 +206,24 @@ class AgentExecutor:
             response = await invoke(
                 "chat", ctx.request, model_name, ctx.cancellation_token
             )
-            known = parse_usage_info(response.usage_info).total_tokens
+            usage = parse_usage_info(response.usage_info)
             budget = run_context.run.budget
-            budget["tokens"] = budget.get("tokens", 0) + known
+            budget["tokens"] = budget.get("tokens", 0) + usage.total_tokens
+            raw = response.usage_info or {}
+            if any(
+                key in raw
+                for key in (
+                    "prompt_cache_hit_tokens",
+                    "cachedContentTokenCount",
+                    "cache_read_input_tokens",
+                )
+            ) or any(
+                "cached_tokens" in (raw.get(key) or {})
+                for key in ("input_tokens_details", "prompt_tokens_details")
+            ):
+                budget["reported_cache_read"] = (
+                    budget.get("reported_cache_read", 0) + usage.prompt_cache_hit_tokens
+                )
             return response
 
         async def emit_delta(kind: str, text: str) -> None:
@@ -221,6 +260,7 @@ class AgentExecutor:
             MessageDropper,
             ToolPrunerReducer,
         )
+        from zhenxun.services.ai.llm.protocols import split_tools
         from zhenxun.utils.pydantic_compat import model_dump
 
         context = resources.run_context
@@ -242,15 +282,19 @@ class AgentExecutor:
             4096, window // 4
         )
         limit = max(1, min(limit, window - reserve))
+        definitions, server = await split_tools(tools)
+        schemas = [model_dump(t) for t in definitions] + [
+            {"type": t.type_id, "name": t.name, **t.metadata} for t in server
+        ]
         overhead = sum(
             token_counter._count_text(
                 json.dumps(
-                    model_dump(t) if hasattr(t, "model_dump") else t,
+                    t,
                     ensure_ascii=False,
                     default=str,
                 )
             )
-            for t in tools or []
+            for t in schemas
         )
 
         def count(values):
@@ -380,6 +424,7 @@ class AgentExecutor:
             else:
                 target = model_copy(history[index])
                 target.content = [*target.content, TextPart(text=block)]
+                target.token_cost = None
                 history[index] = target
         messages.extend(history)
         return messages

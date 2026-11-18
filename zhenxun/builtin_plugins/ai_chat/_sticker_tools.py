@@ -45,15 +45,6 @@ class StickerNote(BaseModel):
 class StickerToolkit(BaseToolkit):
     """AI 聊天的表情包工具：收藏、搜索、发送，超级用户还能修改说明、删除与合并"""
 
-    default_instructions = (
-        "## 表情包\n"
-        "你有一个自己的表情库。看到有意思的图片或表情可以用 `collect_sticker` 收藏，"
-        "写清备注（表情的意思）和适用场合，一条消息里的多张图片一次收藏。"
-        "想用表情时在回复末尾写 `[表情:#id]`"
-        "（最多一个，只发表情时回复只写这个标记），文字发出后会接着发这个表情，"
-        "按当前表情发送倾向自然使用。提醒里列出了部分表情，找别的用 `find_stickers`；"
-        "要引用某条消息发表情时用 `send_sticker`。"
-    )
     manage_instructions = (
         "当前对话者是超级用户，可以整理表情库：说明不准的用 `update_sticker` 修改，"
         "重复的用 `merge_stickers` 合并，不好用的用 `delete_stickers` 删除，"
@@ -91,15 +82,21 @@ class StickerToolkit(BaseToolkit):
         payload.tools = [t for t in payload.tools if t.name not in hidden]
         if top and "send_sticker" not in hidden:
             payload.reminders.append(
-                "可用表情（在回复末尾写 [表情:#id] 发送）："
-                + "；".join(Stickers.describe(s) for s in top)
+                "本轮候选表情：" + "；".join(Stickers.describe(s) for s in top)
             )
-            payload.reminders.append(
-                "表情发送倾向（同时适用于回复中的 [表情:#id] 和 send_sticker 工具）："
-                + hints.get(frequency, hints["balanced"])
+        if "send_sticker" not in hidden:
+            hint = hints.get(frequency, hints["balanced"])
+            payload.instruction_builders.append(
+                lambda names: ["回复末尾可用一个 [表情:#id] 发送本轮候选表情。" + hint]
+                if "send_sticker" in names
+                else []
             )
         if manage:
-            payload.reminders.append(self.manage_instructions)
+            payload.instruction_builders.append(
+                lambda names: [self.manage_instructions]
+                if MANAGE_TOOLS <= names
+                else []
+            )
         return payload
 
     @tool(

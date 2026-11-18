@@ -188,12 +188,24 @@ class HealthManager:
         ]
 
     def pick_key(
-        self, provider: str, api_keys: list[str], exclude: set[str]
+        self,
+        provider: str,
+        api_keys: list[str],
+        exclude: set[str],
+        *,
+        affinity: str | None = None,
     ) -> str | None:
-        """轮询选择一个可用密钥，全部失效或冷却中时为 None"""
+        """同一会话优先使用相同的健康密钥；无会话请求轮询。"""
         available = self.available_keys(provider, api_keys, exclude)
         if not available:
             return None
+        if affinity:
+            return max(
+                available,
+                key=lambda key: hashlib.sha256(
+                    f"{provider}\0{affinity}\0{key_id(key)}".encode()
+                ).digest(),
+            )
         cursor = self._cursor.get(provider, 0)
         self._cursor[provider] = cursor + 1
         return available[cursor % len(available)]

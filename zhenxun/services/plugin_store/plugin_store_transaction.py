@@ -3,11 +3,13 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import threading
@@ -15,6 +17,7 @@ from typing import Any
 import uuid
 
 from filelock import FileLock, Timeout
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
 from zhenxun.services.plugin_store.operation_journal import settle_operations
@@ -400,7 +403,45 @@ def dependency_packages() -> dict[str, str]:
     return packages
 
 
-def fail_pending_transaction(code: str) -> None:
+def _conflict_diagnostic(details: Any) -> str:
+    """提取可展示的包名、版本及使用者，不展示来源地址或原始异常。"""
+    if not isinstance(details, list):
+        return ""
+    lines = []
+    for issue in details[:8]:
+        if not isinstance(issue, dict):
+            continue
+
+        def label(key):
+            value = issue.get(key)
+            return (
+                value
+                if isinstance(value, str) and re.fullmatch(r"[\w.+:-]{1,160}", value)
+                else ""
+            )
+
+        if not (name := label("name")):
+            continue
+        try:
+            required = str(Requirement(str(issue.get("requirement"))).specifier)
+        except InvalidRequirement:
+            required = ""
+        version = label("actual") or (
+            "未安装" if "actual" in issue and issue["actual"] is None else "未知"
+        )
+        expected = required or label("expected")
+        lines.append(
+            f"{label('owner') or '依赖检查'}：{name}{expected}，实际 {version}"
+            + (
+                "（历史兼容记录需要重新核验）"
+                if issue.get("reason") == "compatibility_trial_recheck_required"
+                else ""
+            )
+        )
+    return "；".join(lines)
+
+
+def fail_pending_transaction(code: str, details: Any = None) -> None:
     """将待重启的源码事务标记为失败
 
     参数:
@@ -413,6 +454,13 @@ def fail_pending_transaction(code: str) -> None:
         transaction["state"] = "failed"
         transaction["rollback_confirmed"] = True
         transaction["failure_reasons"] = [{"code": code}]
+        diagnostic = (
+            _conflict_diagnostic(details)
+            if code == "current_environment_dependency_conflict"
+            else ""
+        )
+        if diagnostic:
+            transaction["failure_reasons"][0]["diagnostic"] = diagnostic
         transaction["updated_at"] = _now()
         _write_pending(transaction)
         settle_operations(
@@ -420,6 +468,7 @@ def fail_pending_transaction(code: str) -> None:
             "failed",
             "failed",
             code,
+            diagnostic=diagnostic,
         )
 
 
@@ -660,6 +709,12 @@ def reconcile_operation(value: dict[str, Any]) -> bool:
             restart_available=False,
             cleanup_error=record.get("cleanup_error"),
         )
+        if record.get("rollback_confirmed"):
+            reasons = record.get("failure_reasons") or []
+            if reasons and isinstance(reasons[0], dict):
+                for key, source in (("reason", "code"), ("diagnostic", "diagnostic")):
+                    if reasons[0].get(source):
+                        value["result"][key] = reasons[0][source]
         return True
     return False
 
@@ -749,6 +804,7 @@ async def preflight_source_requirements(
     from zhenxun.services.nonebot_store import dependencies
     from zhenxun.services.nonebot_store.dependencies import DependencyAnalysisError
     from zhenxun.services.nonebot_store.environment import capture_environment
+    from zhenxun.services.nonebot_store.policy import unresolved_conflict
     from zhenxun.services.nonebot_store.storage import (
         pending_transaction as layer_transaction,
     )
@@ -790,9 +846,10 @@ async def preflight_source_requirements(
         if pending.get("state") == "pending_restart"
         else None
     ) or dependencies.load_manifest()
+    snapshot = capture_environment()
     result = await dependencies.resolve_layer(
         requirements,
-        snapshot=capture_environment(),
+        snapshot=snapshot,
         manifest=manifest,
         sources=receipt_dependency_inputs(overrides),
         allow_build=allow_build,
@@ -802,6 +859,24 @@ async def preflight_source_requirements(
         for item in result["changes"]
         if item["to"] and item["name"] in result["resolved"]
     ]
+    if changes:
+        affected = {item["name"] for item in result["changes"]}
+        planned = replace(snapshot, manifest=manifest)
+        permitted = manifest.get("dependency_warnings", [])
+        if pending.get("state") == "pending_restart":
+            permitted = pending.get("remaining_conflicts", permitted)
+        unresolved = [
+            error
+            for issue in snapshot.conflicts
+            if not affected.intersection((issue["name"], issue["owner"]))
+            and (error := unresolved_conflict(planned, issue, permitted))
+        ]
+        if unresolved:
+            raise DependencyAnalysisError(
+                "current_environment_dependency_conflict",
+                _conflict_diagnostic(unresolved),
+                details=unresolved,
+            )
     return {
         "resolved_packages": {item["name"]: item["to"] for item in changes},
         "package_changes": {

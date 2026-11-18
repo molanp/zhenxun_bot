@@ -98,8 +98,6 @@ class KnowledgeManage:
     _rebuilding: ClassVar[dict[int, dict[str, int]]] = {}
     """正在重建的库及进度"""
     _tasks: ClassVar[set[asyncio.Task]] = set()
-    _no_image_vector: ClassVar[set[str]] = set()
-    """不支持图片向量的 embedding 模型"""
 
     @staticmethod
     def kb_dir(kb_id: int) -> Path:
@@ -194,7 +192,7 @@ class KnowledgeManage:
         from zhenxun.services.ai.llm.manager import embeds_modality
 
         model = kb.embedding_model or ""
-        if model in cls._no_image_vector or not embeds_modality(model, "image"):
+        if not embeds_modality(model, "image"):
             return None
         try:
             response = await embed(
@@ -206,8 +204,7 @@ class KnowledgeManage:
             )
             return to_blob(np.array(response.embeddings[0]))
         except Exception as e:
-            cls._no_image_vector.add(model)
-            logger.info(f"embedding 模型 {model} 不支持图片向量: {e}", "AI知识库")
+            logger.warning(f"本次图片向量未生成: {type(e).__name__}", "AI知识库")
             return None
 
     @classmethod
@@ -769,9 +766,20 @@ async def session_bases(group_id: str | None) -> list[int]:
 class KnowledgeToolkit(BaseToolkit):
     """AI 聊天的知识库工具：检索会话使用的知识库、发送其中的图片"""
 
-    @staticmethod
-    async def _ids(context: RunContext | None) -> list[int]:
+    def __init__(self, *, persona_bases=None):
+        super().__init__()
+        self.persona_bases = persona_bases
+
+    async def _ids(self, context: RunContext | None) -> list[int]:
         """当前会话使用的知识库 id"""
+        if self.persona_bases is not None:
+            ids = [int(i) for i in self.persona_bases if str(i).isdigit()]
+            group = context.get_group_id() if context else None
+            setting = await AIChatGroup.get_setting(group) if group else None
+            if setting and setting.knowledge_bases is not None:
+                allowed = {str(i) for i in setting.knowledge_bases}
+                return [i for i in ids if str(i) in allowed]
+            return ids
         return await session_bases(context.get_group_id() if context else None)
 
     @staticmethod

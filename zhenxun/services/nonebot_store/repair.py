@@ -47,16 +47,23 @@ def select_repair_groups(preview: dict, selected: list[str] | None) -> dict:
                 target["packages"].pop(name, None)
             else:
                 target["packages"][name] = deepcopy(value)
-    remaining = [item for item in preview["issues"] if item["name"] not in repaired]
+    affected = repaired | set(updates)
     target["dependency_warnings"] = [
         item
         for item in preview.get("bound_conflicts", [])
-        if item["name"] not in repaired and item["owner"] not in repaired
+        if item["name"] not in affected and item["owner"] not in affected
     ]
     return {
         "target_manifest": target,
         "changes": changes,
-        "remaining_conflicts": remaining,
+        "remaining_conflicts": [
+            *target["dependency_warnings"],
+            *(
+                item
+                for item in preview["issues"]
+                if item.get("tier") == "immutable_core" and item["name"] not in affected
+            ),
+        ],
         "source_build_required": any(
             group.get("source_build_required")
             for group in groups

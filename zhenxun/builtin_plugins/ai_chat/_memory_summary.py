@@ -76,10 +76,23 @@ async def summarize(
                 )
                 selected, lines, total = [], [], 0
                 end_id, partial_id, offset = cursor.message_id, 0, 0
+                interrupted = set()
                 for row in rows:
                     meta = row.metadata or {}
-                    if meta.get("chat_run") and not meta.get("chat_settled"):
-                        break
+                    unsettled = meta.get("chat_run") and not meta.get("chat_settled")
+                    if unsettled and meta["chat_run"] not in interrupted:
+                        record = await AIAgentRun.get_or_none(
+                            run_id=meta["chat_run"],
+                            session_id=session_id,
+                            status="interrupted",
+                        )
+                        if (
+                            not record
+                            or (record.details or {}).get("interruption")
+                            != "previous_boot"
+                        ):
+                            break
+                        interrupted.add(meta["chat_run"])
                     if selected and (
                         (row.created_at - selected[-1].created_at).total_seconds()
                         > SPLIT_GAP
@@ -92,7 +105,9 @@ async def summarize(
                         if row.role in {"user", "assistant"}
                         else ""
                     )
-                    if meta.get("chat_run") and not meta.get("chat_visible"):
+                    if unsettled or (
+                        meta.get("chat_run") and not meta.get("chat_visible")
+                    ):
                         text = ""
                     if (
                         row.role == "assistant"
