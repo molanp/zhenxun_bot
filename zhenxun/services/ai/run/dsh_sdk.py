@@ -16,6 +16,20 @@ import psutil
 from zhenxun.services.ai.core.exceptions import RunInterrupted
 from zhenxun.services.ai.run.dsh_desktop import DshUnavailable
 
+BWRAP_PROBE = [
+    "--ro-bind",
+    "/",
+    "/",
+    "--dev",
+    "/dev",
+    "--unshare-pid",
+    "--proc",
+    "/proc",
+    "--die-with-parent",
+    "--",
+    "true",
+]
+
 
 def eligible_providers():
     """返回可供独立 SDK 使用的官方服务商，凭据仅在后端消费。"""
@@ -40,6 +54,7 @@ def eligible_providers():
 class SdkClient:
     transport = "sdk"
     _starting = asyncio.Lock()
+    _sandbox: tuple[float, dict] | None = None
 
     def __init__(self, home: Path, endpoint: dict, mode: str):
         self.home, self.endpoint, self.mode = home, endpoint, mode
@@ -156,6 +171,7 @@ class SdkClient:
             "api_key": provider.api_keys[0],
             "model": model,
             "thinking": settings.sdk_thinking,
+            "permission": settings.permission,
         }
 
     @classmethod
@@ -236,6 +252,8 @@ class SdkClient:
             },
             "retry_policy": {"max_attempts": 5, "delays": [2, 5, 10, 20]},
             "restart_required": False,
+            "permission": settings.permission,
+            "sandbox": await cls.sandbox(),
         }
         try:
             client = await cls.open(settings)
@@ -255,6 +273,10 @@ class SdkClient:
                 ),
                 reason="独立宿主保活；Bot 退出只结束原生 Agent 转发，不自动补发。",
                 restart_required=restart_required,
+                permission_pending=bool(
+                    workers.get("agent", {}).get("ready")
+                    and workers["agent"].get("permission") != settings.permission
+                ),
                 restart_reason=(
                     "SDK 宿主连接契约不匹配或无法确认。请确认没有需要保留的后台任务，"
                     "再通过更多操作停止 SDK 宿主并重新连接；不会自动重启。"
@@ -264,6 +286,51 @@ class SdkClient:
             )
         except (DshUnavailable, RunInterrupted) as exc:
             result["reason"] = str(exc)
+        return result
+
+    @classmethod
+    async def sandbox(cls) -> dict:
+        """探测 Linux 上 SDK 沙箱可用的执行器，结果缓存五分钟
+
+        返回:
+            dict: available 是否可用，runner 选中的执行器，detail 不可用原因
+        """
+        if sys.platform != "linux":
+            return {"available": True, "runner": None, "detail": ""}
+        if cls._sandbox and time.monotonic() - cls._sandbox[0] < 300:
+            return cls._sandbox[1]
+
+        def probe() -> dict:
+            reasons = []
+            if bwrap := shutil.which("bwrap"):
+                try:
+                    done = subprocess.run(
+                        [bwrap, *BWRAP_PROBE],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if done.returncode == 0:
+                        return {"available": True, "runner": "bwrap", "detail": ""}
+                    reasons.append(
+                        "bubblewrap 无法创建命名空间："
+                        + (done.stderr.strip().splitlines() or ["未知错误"])[-1][:160]
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    reasons.append("bubblewrap 探测失败")
+            else:
+                reasons.append("未安装 bubblewrap")
+            try:
+                lsm = Path("/sys/kernel/security/lsm").read_text().split(",")
+            except OSError:
+                lsm = []
+            if "landlock" in (item.strip() for item in lsm):
+                return {"available": True, "runner": "landlock", "detail": ""}
+            reasons.append("内核未启用 Landlock")
+            return {"available": False, "runner": None, "detail": "；".join(reasons)}
+
+        result = await asyncio.to_thread(probe)
+        cls._sandbox = (time.monotonic(), result)
         return result
 
     async def rpc(self, method, args=None):
@@ -310,7 +377,7 @@ class SdkClient:
         DshRuntime._turns[context.run.run_id] = turn
         return turn
 
-    async def prompt(self, turn, content, timeout):
+    async def prompt(self, turn, content):
         from .dsh import DshRuntime, DshSessions
 
         if any(block.get("type") != "text" for block in content):
@@ -332,13 +399,10 @@ class SdkClient:
             raise RunInterrupted("SDK 输入收据未知，未重发")
         DshSessions.for_binding(turn.binding).update(turn.binding, created=True)
         cursor = receipt["cursor"]
-        deadline = time.monotonic() + timeout
         answered = set()
-        while time.monotonic() < deadline:
+        while True:
             batch = await self.call(
-                "poll",
-                {"run_id": self.run_id, "cursor": cursor},
-                timeout=min(20, max(0.1, deadline - time.monotonic())),
+                "poll", {"run_id": self.run_id, "cursor": cursor}, timeout=20
             )
             cursor = batch["cursor"]
             for question in batch["questions"]:
@@ -374,7 +438,6 @@ class SdkClient:
                         turn.usage,
                         outcome,
                     )
-        raise RunInterrupted("SDK 本轮超时")
 
     async def answer(self, turn, question):
         from zhenxun.services.ai.utils.runtime import PermissionUtils

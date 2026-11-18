@@ -225,7 +225,7 @@ async def _run(
     context.state[USER_KEY] = "WebUI"
     context.state["_dsh_event"] = queue.put_nowait
 
-    async def ask_dsh(question):
+    async def ask_dsh(question, approval=False):
         question_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         context.state["_dsh_question"] = (question_id, future)
@@ -236,9 +236,10 @@ async def _run(
                     "run_id": context.run.run_id,
                     "question_id": question_id,
                     "question": question,
+                    "kind": "approval" if approval else "text",
                 }
             )
-            return await asyncio.wait_for(future, 120)
+            return await asyncio.wait_for(future, 300)
         finally:
             if context.state.get("_dsh_question", (None,))[0] == question_id:
                 context.state.pop("_dsh_question", None)

@@ -716,7 +716,10 @@ CONFIGS = [
         "DeepSeek Harness 设置",
         "transport：desktop 或 sdk，不自动互相回退。"
         "desktop_url：桌面回环 HTTP 地址，留空自动识别；home：DSH home，"
-        "留空使用当前用户 .dsh；timeout：每轮超时；allow_tools：允许符合"
+        "留空使用当前用户 .dsh；timeout：每轮超时，等待人工确认的时间不计入；"
+        "permission：Agent 权限，sandbox 在沙箱内执行，越权操作需超管批准，"
+        "可回复“全部允许”批准本轮后续请求；full 不使用沙箱且不再询问；"
+        "allow_tools：允许符合"
         "当前授权的超管通过 QQ 操作 DSH 原生 Agent，不另加工具白名单。"
         "桌面无需 API Key；sdk_bin 指向已安装 SDK，sdk_home 为独立宿主目录，"
         "sdk_provider 引用已配置的官方 DeepSeek 提供商，"

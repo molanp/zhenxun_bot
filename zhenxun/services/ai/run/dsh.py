@@ -57,7 +57,8 @@ class DshSettings(BaseModel):
     sdk_provider: str = ""
     sdk_model: str = ""
     sdk_thinking: str = ""
-    timeout: int = Field(default=300, ge=10, le=1800)
+    timeout: int = Field(default=900, ge=10, le=3600)
+    permission: Literal["sandbox", "full"] = "sandbox"
     allow_tools: bool = False
     migration_required: bool = Field(default=False, exclude=True)
 
@@ -850,9 +851,9 @@ class DshRuntime:
         cls.record_selection(turn, info["model"])
 
     @classmethod
-    async def prompt(cls, turn: _Turn, content: list[dict], timeout: float):
+    async def prompt(cls, turn: _Turn, content: list[dict]):
         if turn.binding.get("transport") == "sdk":
-            return await turn.client.prompt(turn, content, timeout)
+            return await turn.client.prompt(turn, content)
         from websockets.exceptions import WebSocketException
 
         if not (turn and turn.binding.get("native")) and any(
@@ -957,7 +958,7 @@ class DshRuntime:
                             raise RunInterrupted("DSH 输入接收")
 
         try:
-            return await asyncio.wait_for(collect(), timeout)
+            return await collect()
         except (WebSocketException, OSError, ValueError) as exc:
             raise RunInterrupted("DSH 事件连接") from exc
 
@@ -1205,6 +1206,33 @@ class DshRuntime:
         except Exception as exc:
             turn.context.run.operations["dsh"]["mapping_error"] = type(exc).__name__
             logger.warning("DSH 停止结果未能写入映射，保留原记录等待核验。", LOG_NAME)
+
+    @classmethod
+    def extend(cls, turn, seconds: float) -> None:
+        """延长桌面运行授权的有效期；SDK 运行由宿主心跳维持
+
+        参数:
+            turn: 当前轮次
+            seconds: 延长秒数
+        """
+        if turn.binding.get("transport") == "sdk" or turn.revoked or seconds <= 0:
+            return
+
+        def mutate(lease: dict) -> bool:
+            if lease.get("runId") != turn.context.run.run_id:
+                return False
+            lease["expires"] = float(lease.get("expires", 0)) + seconds
+            return True
+
+        try:
+            mutate_json_locked(
+                DSH_PATH / "leases" / (turn.binding["remote_id"] + ".json"),
+                {},
+                mutate,
+                write_if=bool,
+            )
+        except (OSError, AtomicJsonRecordError):
+            logger.warning("DSH 运行授权延期失败，后续工具调用可能被拒绝。", LOG_NAME)
 
     @classmethod
     async def release(cls, turn):

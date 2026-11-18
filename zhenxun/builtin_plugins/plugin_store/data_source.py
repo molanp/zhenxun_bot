@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import time
@@ -992,6 +993,8 @@ class StoreManager:
     def _dependency_error(error: Exception) -> str:
         """依赖预检错误的提示，涉及具体包时附上包名
 
+        与本体依赖冲突时，从解析输出中取出涉及的本体依赖包名。
+
         参数:
             error: DependencyAnalysisError
 
@@ -1004,6 +1007,21 @@ class StoreManager:
         if code == "orm_dependency_console_required":
             names = [str(item.get("name")) for item in getattr(error, "details", [])]
             return f"{'、'.join(names)}: {code}"
+        if code == "project_dependency_conflict":
+            from packaging.utils import canonicalize_name
+
+            from zhenxun.services.nonebot_store.dependencies import project_closure
+
+            project = set(project_closure())
+            names = []
+            for raw in re.findall(
+                r"([A-Za-z0-9][\w.-]*)(?:\[[^\]]*\])?\s*[<>=!~]", str(error)
+            ):
+                name = canonicalize_name(raw)
+                if name in project and name not in names:
+                    names.append(name)
+            if names:
+                return f"{'、'.join(names)}: {code}"
         return code
 
     @classmethod

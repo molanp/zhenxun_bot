@@ -9,7 +9,7 @@ from typing import Any
 from zhenxun.configs.config import Config
 from zhenxun.models.ai_chat_group import AIChatGroup
 from zhenxun.models.ai_persona import AIPersona
-from zhenxun.services.ai.core.exceptions import LLMException
+from zhenxun.services.ai.core.exceptions import LLMException, ToolFatalError
 from zhenxun.services.ai.core.messages import TextPart
 from zhenxun.services.ai.core.models import CancellationToken
 from zhenxun.services.ai.run.context import RunContext, set_run_context
@@ -28,6 +28,14 @@ from ._data_source import MODULE, AIChatManager, _time_prompt
 
 RUNNERS = {"local": "本地 Agent", "dsh": "DeepSeek Harness"}
 """可选的执行器"""
+APPROVE_ONCE = {"允许", "批准", "allow", "yes"}
+"""批准本次 DSH 请求的回复"""
+APPROVE_ALL = {"全部允许", "一键允许", "allow all"}
+"""批准本轮后续全部 DSH 请求的回复"""
+APPROVE_HINT = (
+    "回复“允许”批准本次；回复“全部允许”批准本轮后续所有请求；其他回答视为拒绝。"
+)
+"""聊天中批准请求的回复说明"""
 
 
 def agent_runner(setting: AIChatGroup | None) -> str:
@@ -126,6 +134,13 @@ async def _run_dsh(
     from ._safety import Safety
 
     session_id = context.session_id or ""
+    timeout = float(dsh_settings().timeout)
+    deadline = 0.0
+    waiting = 0
+    settling = False
+    paused_at = 0.0
+    approval_lock = asyncio.Lock()
+    remote = None
 
     async def approve(tool: str, reason: str) -> bool:
         try:
@@ -133,23 +148,51 @@ async def _run_dsh(
         except (asyncio.CancelledError, asyncio.TimeoutError):
             return False
         allowed = await PermissionUtils.check_superuser(context)
+        how = ""
         if allowed:
-            reply = await ask(
-                f"DSH 请求本次批准：{tool}\n{reason or '未提供说明'}\n"
-                "回复“允许”仅批准本次，其他回答视为拒绝。"
-            )
-            allowed = reply.strip().lower() in {"允许", "批准", "allow", "yes"}
+            async with approval_lock:
+                if dsh_settings().permission == "full":
+                    how = "（完全权限）"
+                elif context.state.get("_dsh_approve_all"):
+                    how = "（本轮全部允许）"
+                else:
+                    try:
+                        reply = await ask(
+                            f"DSH 请求批准：{tool}\n{reason or '未提供说明'}",
+                            approval=True,
+                        )
+                    except (ToolFatalError, asyncio.TimeoutError):
+                        reply = ""
+                    reply = reply.strip().lower()
+                    if reply in APPROVE_ALL:
+                        context.state["_dsh_approve_all"] = True
+                    allowed = reply in APPROVE_ONCE | APPROVE_ALL
+        decision = (f"自动允许{how}" if how else "允许") if allowed else "拒绝"
         logger.info(
-            f"dsh 请求使用 {tool}: " + ("允许" if allowed else "拒绝"),
+            f"dsh 请求使用 {tool}: {decision}",
             MODULE,
             session=context.get_user_id(),
         )
         return allowed
 
-    async def ask(question: str) -> str:
-        if callback := context.state.get("_dsh_ask"):
-            return await callback(question)
-        return await HITLController(context).ask_text(question, timeout=120)
+    async def ask(question: str, approval: bool = False) -> str:
+        nonlocal waiting, paused_at, deadline
+        if not waiting:
+            paused_at = time.monotonic()
+        waiting += 1
+        try:
+            if callback := context.state.get("_dsh_ask"):
+                return await callback(question, approval)
+            if approval:
+                question += f"\n{APPROVE_HINT}"
+            return await HITLController(context).ask_text(question, timeout=300)
+        finally:
+            waiting -= 1
+            if not waiting:
+                paused = time.monotonic() - paused_at
+                deadline += paused
+                if remote:
+                    DshRuntime.extend(remote, paused)
 
     token = context.run.cancellation_token or CancellationToken()
     context.run.cancellation_token = token
@@ -158,15 +201,11 @@ async def _run_dsh(
         session_id, token, exclusive=True, revision=revision
     ):
         await session_manager.phase(context, "running")
-        deadline = time.monotonic() + float(context.run.timeout or 300)
+        deadline = time.monotonic() + timeout
         expired = False
 
-        def expire():
-            nonlocal expired
-            expired = True
-
         async def turn():
-            remote = None
+            nonlocal remote, settling
             binding = context.state.get("_dsh_binding")
             if binding is None:
                 raise LLMException("DSH 会话没有在准入时绑定。")
@@ -220,7 +259,6 @@ async def _run_dsh(
 
                 context.state["_dsh_authorization_check"] = authorization_check
                 DshSessions.for_binding(binding).update(binding, persona=persona_key)
-                context.run.budget["deadline"] = deadline
                 backend = chat_backend(AIChatManager.get_agent(selected).memory_config)
                 history = await backend.get_messages(session_id) if backend else []
                 remote_id = binding["remote_id"]
@@ -271,9 +309,8 @@ async def _run_dsh(
                         **context.state.get("_dsh_input_metadata", {}),
                     }
                     await backend.add_messages(session_id, [user_message])
-                raw, usage, reason = await DshRuntime.prompt(
-                    remote, blocks, settings.timeout
-                )
+                raw, usage, reason = await DshRuntime.prompt(remote, blocks)
+                settling = True
                 text = Safety.filter_output(clean_output(raw))[0]
                 if backend:
                     assistant = LLMMessage.assistant_text_response(text)
@@ -310,6 +347,10 @@ async def _run_dsh(
                     error = asyncio.TimeoutError("本轮执行超时")
                 if isinstance(error, asyncio.TimeoutError):
                     context.run.outcome = "timeout"
+                    context.run.user_notice = (
+                        f"DSH 本轮执行超过 {int(timeout)} 秒，已停止。"
+                        "等待确认的时间不计入，可在 DSH 连接设置中调整单轮超时。"
+                    )
                 elif (
                     isinstance(error, asyncio.CancelledError)
                     and token.reason == "cancelled"
@@ -349,12 +390,25 @@ async def _run_dsh(
             finally:
                 await DshRuntime.release(remote)
 
-        remaining = max(0.001, deadline - time.monotonic())
-        timer = asyncio.get_running_loop().call_later(remaining, expire)
+        task = asyncio.create_task(turn())
         try:
-            return await asyncio.wait_for(turn(), remaining)
+            while not task.done():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 and not waiting and not settling:
+                    expired = True
+                    task.cancel()
+                    break
+                await asyncio.wait({task}, timeout=max(remaining, 1.0))
+            try:
+                return await task
+            except asyncio.CancelledError:
+                if expired and not token.is_cancelled():
+                    raise asyncio.TimeoutError("本轮执行超时") from None
+                raise
         finally:
-            timer.cancel()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
 
 async def run_dsh(

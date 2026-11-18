@@ -21,7 +21,8 @@ import yaml
 
 LIMIT = 8 * 1024 * 1024
 SDK_API_BASE = "https://api.deepseek.com/anthropic"
-SDK_CONNECTION_REVISION = 1
+SDK_CONNECTION_REVISION = 2
+SHELL_TIMEOUT = {"timeoutMs": 300_000, "maxTimeoutMs": 1_800_000}
 
 
 def private_directory(path: Path) -> None:
@@ -63,8 +64,9 @@ def atomic(path: Path, value: dict) -> None:
 
 
 class Worker:
-    def __init__(self, home: Path, mode: str):
+    def __init__(self, home: Path, mode: str, permission: str = "sandbox"):
         self.home, self.mode = home, mode
+        self.permission = permission if mode == "agent" else "sandbox"
         self.process = None
         self.tasks = set()
         self.pending = {}
@@ -153,7 +155,9 @@ class Worker:
                         "config": {"root": str(root), "mode": self.mode},
                     }
                 ]
-            }
+            },
+            {"id": "bash-sandbox", "config": SHELL_TIMEOUT},
+            {"id": "pwsh-sandbox", "config": SHELL_TIMEOUT},
         ]
         patch_path = root / "profile.patch.yml"
         patch_path.write_text(
@@ -165,6 +169,9 @@ class Worker:
             "DEEPSEEK_API_KEY": params["api_key"],
             "DEEPSEEK_BASE_URL": SDK_API_BASE,
             "ZHENXUN_SDK_CONTROL_TOKEN": self.control_token,
+            "DSH_PERMISSION_MODE": "danger-full-access"
+            if self.permission == "full"
+            else "workspace-write",
         }
         command = [str(executable), "--profile", "sdk", "--patch", str(patch_path)]
         if executable.suffix == ".py":
@@ -352,7 +359,7 @@ class Worker:
         try:
             if not run or method not in {"approval/request", "user-question/ask"}:
                 raise ValueError("No active recipient")
-            response = await asyncio.wait_for(answer, 120)
+            response = await asyncio.wait_for(answer, 1800)
             await self.send({"jsonrpc": "2.0", "id": value["id"], "result": response})
         except (ValueError, asyncio.TimeoutError, asyncio.CancelledError):
             with contextlib.suppress(Exception):
@@ -514,6 +521,7 @@ class Host:
                         and bool(w.version),
                         "version": w.version,
                         "api_base": w.api_base,
+                        "permission": w.permission,
                     }
                     for mode, w in self.workers.items()
                 },
@@ -533,7 +541,23 @@ class Host:
         if mode not in {"chat", "agent"}:
             raise ValueError("无效的 SDK 模式。")
         if method == "start":
-            worker = self.workers.setdefault(mode, Worker(self.home / mode, mode))
+            permission = params.get("permission") or "sandbox"
+            worker = self.workers.get(mode)
+            if worker and mode == "agent" and worker.permission != permission:
+                async with worker.lock:
+                    if worker.process and worker.process.returncode is None:
+                        if any(r.get("attached") for r in worker.runs.values()) or any(
+                            row.get("running")
+                            for row in (await worker.control("list"))["items"]
+                        ):
+                            raise ValueError(
+                                "Agent 权限已修改，但 SDK 仍有任务在运行；"
+                                "请等待任务结束后再试。"
+                            )
+                        await worker.close()
+                worker = None
+            if worker is None:
+                worker = self.workers[mode] = Worker(self.home / mode, mode, permission)
             async with worker.lock:
                 await worker.launch(params)
             return await self.dispatch("status", {})

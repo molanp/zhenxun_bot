@@ -76,7 +76,7 @@ IMMUTABLE_PACKAGES = frozenset(
     }
 )
 # 本体代码在 pyproject 声明的整个版本范围内都兼容的包，依赖层可在范围内改用更低版本
-RANGE_PACKAGES = frozenset({"aiofiles", "cryptography", "numpy", "pillow"})
+RANGE_PACKAGES = frozenset({"aiofiles", "cryptography", "numpy", "pillow", "ujson"})
 FORBIDDEN_LAYER_PACKAGES = frozenset({PROJECT_NAME, "pip", "uv"})
 
 
