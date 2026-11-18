@@ -20,6 +20,8 @@ import psutil
 import yaml
 
 LIMIT = 8 * 1024 * 1024
+SDK_API_BASE = "https://api.deepseek.com/anthropic"
+SDK_CONNECTION_REVISION = 1
 
 
 def private_directory(path: Path) -> None:
@@ -93,6 +95,7 @@ class Worker:
         self.transport_closed = False
         self.credential_hash = None
         self.defaults = None
+        self.api_base = None
 
     async def control(self, method, args=None):
         if self.process is None or self.process.returncode is not None:
@@ -160,7 +163,7 @@ class Worker:
             **os.environ,
             "DSH_HOME": str(self.home),
             "DEEPSEEK_API_KEY": params["api_key"],
-            "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
+            "DEEPSEEK_BASE_URL": SDK_API_BASE,
             "ZHENXUN_SDK_CONTROL_TOKEN": self.control_token,
         }
         command = [str(executable), "--profile", "sdk", "--patch", str(patch_path)]
@@ -176,6 +179,7 @@ class Worker:
             limit=LIMIT,
         )
         self.runtime_identity = str(executable)
+        self.api_base = SDK_API_BASE
         self.credential_hash = hashlib.sha256(params["api_key"].encode()).hexdigest()
         self.tasks = {
             asyncio.create_task(self.read()),
@@ -501,6 +505,7 @@ class Host:
                 "boot": self.boot,
                 "pid": os.getpid(),
                 "contract": 1,
+                "connection_revision": SDK_CONNECTION_REVISION,
                 "workers": {
                     mode: {
                         "ready": not w.transport_closed
@@ -508,6 +513,7 @@ class Host:
                         and w.process.returncode is None
                         and bool(w.version),
                         "version": w.version,
+                        "api_base": w.api_base,
                     }
                     for mode, w in self.workers.items()
                 },

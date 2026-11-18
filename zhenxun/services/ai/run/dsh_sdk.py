@@ -17,6 +17,26 @@ from zhenxun.services.ai.core.exceptions import RunInterrupted
 from zhenxun.services.ai.run.dsh_desktop import DshUnavailable
 
 
+def eligible_providers():
+    """返回可供独立 SDK 使用的官方服务商，凭据仅在后端消费。"""
+    from zhenxun.services.ai.llm.manager import get_configured_providers
+
+    providers = []
+    for provider in get_configured_providers():
+        try:
+            address = urlsplit(provider.base_url)
+        except ValueError:
+            continue
+        if (
+            provider.api_keys
+            and address.scheme == "https"
+            and address.hostname == "api.deepseek.com"
+            and any(model.enabled for model in provider.models)
+        ):
+            providers.append(provider)
+    return providers
+
+
 class SdkClient:
     transport = "sdk"
     _starting = asyncio.Lock()
@@ -112,15 +132,10 @@ class SdkClient:
     @classmethod
     def credentials(cls, settings) -> dict:
         """只从已配置的官方 DeepSeek 提供商取密钥，不读取桌面账号。"""
-        from zhenxun.services.ai.llm.manager import get_configured_providers
-
         eligible = [
             p
-            for p in get_configured_providers()
-            if p.api_keys
-            and urlsplit(p.base_url).scheme == "https"
-            and urlsplit(p.base_url).hostname == "api.deepseek.com"
-            and (not settings.sdk_provider or p.name == settings.sdk_provider)
+            for p in eligible_providers()
+            if not settings.sdk_provider or p.name == settings.sdk_provider
         ]
         if len(eligible) != 1:
             raise DshUnavailable(
@@ -145,8 +160,8 @@ class SdkClient:
 
     @classmethod
     async def ensure(cls, settings, mode):
-        parameters = cls.credentials(settings)
         async with cls._starting:
+            parameters = cls.credentials(settings)
             try:
                 client = await cls.open(settings, mode)
             except DshUnavailable:
@@ -183,8 +198,24 @@ class SdkClient:
                         if time.monotonic() >= deadline:
                             raise
                         await asyncio.sleep(0.15)
+            if cls.needs_restart(await client.call("status")):
+                raise DshUnavailable(
+                    "SDK 宿主连接契约不匹配或无法确认。请确认后台任务后，"
+                    "在更多操作中停止 SDK 宿主，再重新连接；不会自动停止任务。"
+                )
             await client.call("start", parameters, timeout=65)
             return client
+
+    @staticmethod
+    def needs_restart(status):
+        """核对当前宿主及已启动 Worker 的连接契约，不自动重启。"""
+        from .dsh_sdk_host import SDK_API_BASE, SDK_CONNECTION_REVISION
+
+        return status.get("connection_revision") != SDK_CONNECTION_REVISION or any(
+            worker.get("api_base") != SDK_API_BASE
+            for worker in status.get("workers", {}).values()
+            if worker.get("ready")
+        )
 
     @classmethod
     async def status(cls, settings):
@@ -204,11 +235,13 @@ class SdkClient:
                 "images": False,
             },
             "retry_policy": {"max_attempts": 5, "delays": [2, 5, 10, 20]},
+            "restart_required": False,
         }
         try:
             client = await cls.open(settings)
             data = await client.call("status")
             workers = data["workers"]
+            restart_required = cls.needs_restart(data)
             result.update(
                 connected=True,
                 host_boot=data["boot"],
@@ -221,6 +254,13 @@ class SdkClient:
                     or "待启动"
                 ),
                 reason="独立宿主保活；Bot 退出只结束原生 Agent 转发，不自动补发。",
+                restart_required=restart_required,
+                restart_reason=(
+                    "SDK 宿主连接契约不匹配或无法确认。请确认没有需要保留的后台任务，"
+                    "再通过更多操作停止 SDK 宿主并重新连接；不会自动重启。"
+                    if restart_required
+                    else ""
+                ),
             )
         except (DshUnavailable, RunInterrupted) as exc:
             result["reason"] = str(exc)

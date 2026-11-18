@@ -5,15 +5,63 @@ import ipaddress
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
+from nonebot import get_driver
 from pydantic import BaseModel, Field
 
-from zhenxun.services.ai.run.dsh import DshRuntime, DshSessions
+from zhenxun.services.ai.run.dsh import DshRuntime, DshSessions, DshSettings
+from zhenxun.services.ai.run.dsh_install import SdkInstallError, sdk_installer
 from zhenxun.services.log import logger
 
 from ....base_model import Result
 from ....utils import authentication
 
 router = APIRouter()
+sdk_installer.bind_lifecycle(get_driver())
+
+
+class DshInstallAction(BaseModel):
+    model_config = {"extra": "forbid"}
+    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    expected_operation: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+
+@router.get("/dsh/sdk", dependencies=[authentication()], response_model=Result)
+async def sdk_install_status() -> Result:
+    """读取独立安装状态及可选模型，不返回凭据或启动宿主。"""
+    from zhenxun.services.ai.run.dsh_sdk import eligible_providers
+
+    providers = [
+        {"name": item.name, "models": [m.name for m in item.models if m.enabled]}
+        for item in eligible_providers()
+    ]
+    return Result.ok({**sdk_installer.status(), "providers": providers})
+
+
+@router.post("/dsh/sdk/install", dependencies=[authentication()], response_model=Result)
+async def install_sdk(payload: DshInstallAction) -> Result:
+    """启动或查询同一次后台 SDK 安装，固定包名、版本和目标目录。"""
+    try:
+        result = sdk_installer.start(payload.operation_id, payload.expected_operation)
+    except (SdkInstallError, OSError, RuntimeError, TimeoutError) as error:
+        raise HTTPException(
+            409,
+            detail={
+                "message": str(error)
+                if isinstance(error, SdkInstallError)
+                else "安装状态无法确认，请刷新后检查。"
+            },
+        ) from error
+    return Result.ok(result)
+
+
+@router.post("/dsh/sdk/cancel", dependencies=[authentication()], response_model=Result)
+async def cancel_sdk_install(payload: DshInstallAction) -> Result:
+    """停止本次安装并等待清理，不停止正常 SDK 或桌面会话。"""
+    try:
+        result = await sdk_installer.cancel(payload.operation_id)
+    except SdkInstallError as error:
+        raise HTTPException(409, detail={"message": str(error)}) from error
+    return Result.ok(result)
 
 
 class DshSessionChoice(BaseModel):
@@ -250,7 +298,7 @@ async def desktop_status() -> Result:
                 "本地转发中"
                 if item["local_running"]
                 else "远端前台结果待核验"
-                if run_id
+                if item.get("inflight")
                 else "前台已停止或已移除（后台另行管理）"
                 if item.get("stop")
                 in {
@@ -261,6 +309,8 @@ async def desktop_status() -> Result:
                 }
                 else "下次对话将重建会话"
                 if item.get("quarantined")
+                else "停止结果待核验"
+                if item.get("stop")
                 else "无登记运行（非远端状态）"
             )
         status["mapping_trusted"] = True
@@ -274,6 +324,7 @@ async def desktop_status() -> Result:
 class DshHostAction(BaseModel):
     mode: Literal["chat", "agent"] = "chat"
     expected_boot: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    expected_settings: DshSettings | None = None
 
 
 @router.post(
@@ -289,6 +340,8 @@ async def sdk_host_action(
     from zhenxun.services.ai.run.dsh_sdk import SdkClient
 
     settings = dsh_settings()
+    if payload.expected_settings is not None and payload.expected_settings != settings:
+        raise HTTPException(409, detail={"message": "连接配置已变化，请刷新后再连接。"})
     if settings.transport != "sdk":
         raise HTTPException(409, detail={"message": "当前未选择 SDK 模式。"})
     try:
