@@ -302,7 +302,7 @@ async def _run_dsh(
                             blocks.append(
                                 {
                                     "type": "text",
-                                    "text": "以下为真寻已确认送达的历史：\n"
+                                    "text": "以下是此前已确认送达的对话历史：\n"
                                     + "\n".join(transcript),
                                 }
                             )

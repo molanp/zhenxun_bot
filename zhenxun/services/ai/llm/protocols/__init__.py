@@ -321,7 +321,8 @@ def native_tool_allowed(route: "Route", type_id: str) -> bool:
     if vendor == "deepseek" and type_id in {"web_search", "url_context"}:
         return type_id in profile.native_tools or (
             detect_preset(route.base_url) == "deepseek"
-            and route.model.name in {"deepseek-flash", "deepseek-v4-flash-vision-exp"}
+            and route.model.name
+            in {"deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"}
         )
     if route.protocol == "openai_chat":
         vendor = detect_preset(route.base_url) or route.provider.preset

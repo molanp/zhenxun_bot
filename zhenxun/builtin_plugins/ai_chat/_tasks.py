@@ -476,8 +476,10 @@ class AITasks:
         persona = await Conversations.persona(snapshot, group_id, user_id)
         agent = AIChatManager.get_agent(persona)
         prompt = (
-            f"任务 #{task_id}「{name}」：{params.prompt}。"
-            f"只输出需要发送的内容，不必发言时输出 {SILENT}。"
+            f"定时任务 #{task_id}「{name}」到了执行时间，任务内容：\n"
+            f"{params.prompt}\n\n"
+            "按任务内容生成要发到当前会话的消息，只输出要发送的内容；"
+            f"这次不需要发言时只输出 {SILENT}。"
         )
         context = RunContext(
             deps=ScheduledDeps(

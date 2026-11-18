@@ -22,10 +22,9 @@ class RestApiToolkit(BaseToolkit):
     """默认仅超级用户可见，实例化时传入 shared_options 可覆盖"""
 
     default_instructions = (
-        "你拥有调用外部 REST API 接口的能力。\n"
-        "1. 使用 `make_request` 工具发起 HTTP 请求。\n"
-        "2. 如果请求失败，请分析返回的错误信息。可能需要调整请求参数 (params) 或请求体 (json_data)。\n"  # noqa: E501
-        "3. 务必根据返回的 JSON 数据，提取对用户有用的信息进行回答。"
+        "## REST API\n"
+        "用 `make_request` 调用外部 HTTP 接口。请求失败时根据错误信息调整 params "
+        "或 json_data 再试；回答时只提取用户需要的信息，不要原样转贴返回的 JSON。"
     )
 
     def __init__(

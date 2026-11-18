@@ -485,6 +485,12 @@ def _large(data: bytes) -> bool:
 class CharacterToolkit(BaseToolkit):
     """AI 聊天的角色识别与资料工具，开启角色识别时提供"""
 
+    default_instructions = (
+        "## 角色识别\n别人问图里的动漫、游戏角色是谁时，先用 `recognize_character` "
+        "识别，不要凭画风猜；结果只是候选，按把握程度说“可能是”。问到角色的作品、"
+        "设定、声优、生日等资料时用 `character_info` 查，不要凭印象回答。"
+    )
+
     async def resolve(self, context: RunContext | None = None) -> ResolvedToolPayload:
         if tier() == "off":
             return ResolvedToolPayload()

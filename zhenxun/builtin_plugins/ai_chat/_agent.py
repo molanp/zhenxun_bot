@@ -43,7 +43,7 @@ SOURCES = {
 follow_up 为接受同一发送者追加的输入"""
 INTERJECT_TOOLS = {
     "web_search",
-    "search_web",
+    "google_search",
     "search_knowledge",
     "recall_memory",
     "find_stickers",
@@ -319,14 +319,8 @@ class AgentCapability(AbstractCapability):
         sensitive = frozenset(context.state[AGENT_TOOLS_KEY])
         payload.instruction_builders.append(
             lambda names: [
-                "## Agent 能力\n当前调用者已通过敏感工具授权；"
-                "仅使用本轮实际提供的工具。"
-                "工具调用会直接执行，有副作用的操作应确认意图。"
-                + (
-                    "意图不明确时先用 `ask_user_for_help` 确认。"
-                    if "ask_user_for_help" in names
-                    else ""
-                )
+                "## Agent 能力\n当前调用者已获授权使用敏感工具。工具调用会直接执行，"
+                "不再经过审批；有副作用的操作在意图不明确时先向用户确认。"
             ]
             if names & sensitive
             else []

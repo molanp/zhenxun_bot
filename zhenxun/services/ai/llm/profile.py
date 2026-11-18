@@ -90,7 +90,7 @@ _HINTS: tuple[tuple[str, dict[str, Any]], ...] = (
         },
     ),
     (r"gemini-3|claude", {"mixed_tools": True}),
-    (r"^deepseek-flash$", {"input_modalities": ["text", "image"]}),
+    (r"^deepseek-(v4-)?flash$", {"input_modalities": ["text", "image"]}),
     (r"vision|-vl\b|-vl-|qvq|omni|pixtral", {"input_modalities": ["text", "image"]}),
 )
 """能力库未收录时按名称推断任务类型与输入模态，同一字段以先匹配的条目为准"""

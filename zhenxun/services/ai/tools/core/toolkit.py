@@ -104,12 +104,4 @@ class BaseToolkit:
         获取工具箱的系统提示词说明。
         """
         text = self._instance_instructions
-        if not text:
-            return None
-        class_name = self.__class__.__name__
-        tag_name = (
-            f"{self.config.prefix}{class_name}_Instructions"
-            if self.config.prefix
-            else f"{class_name}_Instructions"
-        )
-        return f"<{tag_name}>\n{text}\n</{tag_name}>"
+        return text or None

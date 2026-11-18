@@ -46,9 +46,9 @@ class StickerToolkit(BaseToolkit):
     """AI 聊天的表情包工具：收藏、搜索、发送，超级用户还能修改说明、删除与合并"""
 
     manage_instructions = (
-        "当前对话者是超级用户，可以整理表情库：说明不准的用 `update_sticker` 修改，"
-        "重复的用 `merge_stickers` 合并，不好用的用 `delete_stickers` 删除，"
-        "删除前先用 `find_stickers` 确认 id。"
+        "## 表情库整理\n当前对话者是超级用户，可以整理表情库：说明不准的用 "
+        "`update_sticker` 修改，重复的用 `merge_stickers` 合并，不好用的用 "
+        "`delete_stickers` 删除，删除前先用 `find_stickers` 确认 id。"
     )
 
     async def resolve(self, context: RunContext | None = None) -> ResolvedToolPayload:
@@ -87,7 +87,11 @@ class StickerToolkit(BaseToolkit):
         if "send_sticker" not in hidden:
             hint = hints.get(frequency, hints["balanced"])
             payload.instruction_builders.append(
-                lambda names: ["回复末尾可用一个 [表情:#id] 发送本轮候选表情。" + hint]
+                lambda names: [
+                    "## 表情包\n回复末尾可以写一个 [表情:#id] 发送表情，id 是候选表情"
+                    "或 `find_stickers` 结果里 # 后的数字。聊天记录里的 [表情: …]、"
+                    "[表情包: …] 是别人发的表情的文字描述，不要照抄进回复。" + hint
+                ]
                 if "send_sticker" in names
                 else []
             )

@@ -16,10 +16,9 @@ class HITLToolkit(BaseToolkit):
     default_prefix = ""
 
     default_instructions = (
-        "## 人机协同求助系统\n"
-        "你拥有向用户发起提问的权限。当你遇到困难时（例如缺少关键信息、连续执行某个操作出错、找不到文件等），"
-        "可以使用 `ask_user_for_help` 工具请求用户协助。"
-        "用户回答后，你将收到答案并可以继续任务。"
+        "## 向用户确认\n"
+        "缺少关键信息、意图不明确或同一操作反复失败时，用 `ask_user_for_help` "
+        "向当前用户提问，拿到回答后继续；能自己判断的不要问。"
     )
 
     async def resolve(self, context: RunContext | None = None) -> ResolvedToolPayload:
@@ -30,7 +29,7 @@ class HITLToolkit(BaseToolkit):
 
     @tool(
         name="ask_user_for_help",
-        description="向当前对话的用户提出问题以获取信息或指导。当你无法独立完成任务时，请调用此工具。",
+        description="向当前对话的用户提一个问题并等待回答，用于补全关键信息或确认操作意图。",
     )
     async def ask_user_for_help(
         self,

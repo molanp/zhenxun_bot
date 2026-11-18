@@ -79,6 +79,32 @@ async def _with_reply(bot: Bot, event: Event, message: UniMessage) -> UniMessage
         return message
 
 
+async def expects_direct_message(bot: Bot, event: Event, message: UniMessage) -> bool:
+    """供模糊词条判断定向唤醒，不消费补问、不登记消息或触发插话。"""
+    from ._commands import command_text
+
+    deps = NoneBotDeps(bot=bot, event=event)
+    group = ContextUtils.extract_group_id(deps)
+    user = ContextUtils.extract_user_id(deps) or ""
+    if group:
+        if await AIChatManager.blocked(bot, group, user):
+            return False
+        if AtWaiter.pending(bot.self_id, group, user):
+            return True
+    else:
+        from types import SimpleNamespace
+
+        from zhenxun.services.scheduler.engine import _plugin_blocked
+
+        from ._data_source import PLUGIN_MODULE
+
+        if await _plugin_blocked(PLUGIN_MODULE, bot, SimpleNamespace(user_id=user)):
+            return False
+    return command_text(
+        message.extract_plain_text()
+    ) is not None or await AIChatManager.should_reply(event, message, group, bot)
+
+
 async def _rule(bot: Bot, event: Event, message: UniMsg, state: T_State) -> bool:
     if not message:
         return False
