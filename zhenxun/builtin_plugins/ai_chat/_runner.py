@@ -32,9 +32,7 @@ APPROVE_ONCE = {"允许", "批准", "allow", "yes"}
 """批准本次 DSH 请求的回复"""
 APPROVE_ALL = {"全部允许", "一键允许", "allow all"}
 """批准本轮后续全部 DSH 请求的回复"""
-APPROVE_HINT = (
-    "回复“允许”批准本次；回复“全部允许”批准本轮后续所有请求；其他回答视为拒绝。"
-)
+APPROVE_HINT = "允许：仅本次；全部允许：本轮；停止：结束本轮。其他回复拒绝本次。"
 """聊天中批准请求的回复说明"""
 
 
@@ -151,6 +149,7 @@ async def _run_dsh(
         how = ""
         if allowed:
             async with approval_lock:
+                token.raise_if_cancelled()
                 if dsh_settings().permission == "full":
                     how = "（完全权限）"
                 elif context.state.get("_dsh_approve_all"):
@@ -164,6 +163,9 @@ async def _run_dsh(
                     except (ToolFatalError, asyncio.TimeoutError):
                         reply = ""
                     reply = reply.strip().lower()
+                    if reply in {"停止", "stop"}:
+                        token.cancel("cancelled")
+                        raise asyncio.CancelledError
                     if reply in APPROVE_ALL:
                         context.state["_dsh_approve_all"] = True
                     allowed = reply in APPROVE_ONCE | APPROVE_ALL

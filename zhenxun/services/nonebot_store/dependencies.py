@@ -38,7 +38,7 @@ from zhenxun.utils.pythonpath import INSTANCE_ROOT
 
 from .storage import load_manifest
 
-SOLVER_POLICY_VERSION = 12
+SOLVER_POLICY_VERSION = 13
 LOCK_FILE = INSTANCE_ROOT / "uv.lock"
 _REQ_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;]+)")
 _SENSITIVE = re.compile(r"(?i)(authorization|token|password|secret)=?[^\s]*")
@@ -58,7 +58,6 @@ IMMUTABLE_PACKAGES = frozenset(
         "nonebot-plugin-session",
         "nonebot-plugin-uninfo",
         "nonebot-plugin-waiter",
-        "blitz-py",
         "pydantic",
         "pydantic-core",
         "pydantic-settings",
@@ -76,7 +75,9 @@ IMMUTABLE_PACKAGES = frozenset(
     }
 )
 # 本体代码在 pyproject 声明的整个版本范围内都兼容的包，依赖层可在范围内改用更低版本
-RANGE_PACKAGES = frozenset({"aiofiles", "cryptography", "numpy", "pillow", "ujson"})
+RANGE_PACKAGES = frozenset(
+    {"aiofiles", "blitz-py", "cryptography", "numpy", "pillow", "ujson"}
+)
 FORBIDDEN_LAYER_PACKAGES = frozenset({PROJECT_NAME, "pip", "uv"})
 
 
