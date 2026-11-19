@@ -4,7 +4,7 @@ version = "0.2.16"
 description = "基于 Nonebot2 和 go-cqhttp 开发，以 postgresql 作为数据库，非常可爱的绪山真寻bot"
 authors = [{ name = "HibiKier", email = "775757368@qq.com" }]
 license = { text = "AGPL-3.0" }
-requires-python = ">=3.10,<3.15"
+requires-python = ">=3.11,<3.15"
 dependencies = [
     "httpx[socks]>=0.28.1",
     "nonebot-adapter-onebot>=2.3.1",
